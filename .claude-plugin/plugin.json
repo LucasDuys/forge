@@ -1,0 +1,21 @@
+{
+  "name": "forge",
+  "version": "0.1.0",
+  "description": "Autonomous spec-driven development loop for Claude Code. Three commands: brainstorm, plan, execute.",
+  "author": {
+    "name": "Lucas Duys"
+  },
+  "license": "MIT",
+  "keywords": [
+    "autonomous",
+    "spec-driven",
+    "development",
+    "loop",
+    "agent",
+    "tdd"
+  ],
+  "commands": "./commands/",
+  "agents": "./agents/",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}

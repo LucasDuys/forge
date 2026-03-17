@@ -1,0 +1,1304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Forge — Architecture & Design</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --surface-2: #1a1a26;
+    --surface-3: #222232;
+    --border: #2a2a3e;
+    --border-glow: #4a3aff33;
+    --text: #e4e4ef;
+    --text-dim: #8888a4;
+    --text-muted: #5a5a74;
+    --accent: #6c5ce7;
+    --accent-light: #a29bfe;
+    --accent-glow: #6c5ce740;
+    --green: #00cec9;
+    --green-dim: #00cec944;
+    --orange: #fdcb6e;
+    --orange-dim: #fdcb6e33;
+    --red: #ff6b6b;
+    --red-dim: #ff6b6b33;
+    --blue: #74b9ff;
+    --blue-dim: #74b9ff33;
+    --pink: #fd79a8;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+
+  /* Hero */
+  .hero {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .hero::before {
+    content: '';
+    position: absolute;
+    top: -200px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 800px;
+    height: 800px;
+    background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .hero-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    border-radius: 100px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    font-size: 13px;
+    color: var(--accent-light);
+    font-weight: 500;
+    margin-bottom: 32px;
+    letter-spacing: 0.5px;
+  }
+
+  .hero h1 {
+    font-size: clamp(48px, 8vw, 96px);
+    font-weight: 900;
+    letter-spacing: -3px;
+    line-height: 1;
+    margin-bottom: 24px;
+    background: linear-gradient(135deg, #fff 0%, var(--accent-light) 50%, var(--green) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .hero p {
+    font-size: 20px;
+    color: var(--text-dim);
+    max-width: 600px;
+    margin-bottom: 48px;
+    font-weight: 300;
+  }
+
+  .hero-commands {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .hero-cmd {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 24px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 15px;
+    color: var(--green);
+    transition: all 0.3s;
+  }
+
+  .hero-cmd:hover {
+    border-color: var(--accent);
+    box-shadow: 0 0 30px var(--accent-glow);
+    transform: translateY(-2px);
+  }
+
+  .hero-cmd span { color: var(--text-dim); }
+
+  /* Scroll indicator */
+  .scroll-indicator {
+    position: absolute;
+    bottom: 40px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+    animation: bounce 2s infinite;
+  }
+
+  @keyframes bounce {
+    0%, 100% { transform: translateX(-50%) translateY(0); }
+    50% { transform: translateX(-50%) translateY(8px); }
+  }
+
+  /* Sections */
+  section {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 120px 32px;
+  }
+
+  .section-label {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--accent-light);
+    margin-bottom: 16px;
+  }
+
+  section h2 {
+    font-size: 40px;
+    font-weight: 800;
+    letter-spacing: -1.5px;
+    margin-bottom: 16px;
+  }
+
+  section .subtitle {
+    font-size: 18px;
+    color: var(--text-dim);
+    margin-bottom: 48px;
+    max-width: 700px;
+    font-weight: 300;
+  }
+
+  /* Three-layer loop diagram */
+  .loop-diagram {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    margin: 48px 0;
+  }
+
+  .loop-layer {
+    border-radius: 16px;
+    padding: 32px;
+    position: relative;
+  }
+
+  .loop-outer {
+    background: linear-gradient(135deg, var(--accent-glow), transparent);
+    border: 1px solid var(--accent);
+    padding-bottom: 24px;
+  }
+
+  .loop-middle {
+    background: linear-gradient(135deg, var(--green-dim), transparent);
+    border: 1px solid var(--green);
+    margin: 16px;
+    padding-bottom: 24px;
+  }
+
+  .loop-inner {
+    background: linear-gradient(135deg, var(--orange-dim), transparent);
+    border: 1px solid var(--orange);
+    margin: 16px;
+  }
+
+  .loop-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    padding: 4px 12px;
+    border-radius: 6px;
+    display: inline-block;
+    margin-bottom: 12px;
+  }
+
+  .loop-outer .loop-label { background: var(--accent); color: #fff; }
+  .loop-middle .loop-label { background: var(--green); color: #000; }
+  .loop-inner .loop-label { background: var(--orange); color: #000; }
+
+  .loop-layer h3 {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+
+  .loop-layer p {
+    color: var(--text-dim);
+    font-size: 14px;
+  }
+
+  .loop-steps {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+    flex-wrap: wrap;
+  }
+
+  .loop-step {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .loop-step .arrow {
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  /* State machine */
+  .state-machine {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin: 48px 0;
+  }
+
+  .state-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    transition: all 0.3s;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .state-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+  }
+
+  .state-card:nth-child(1)::before { background: var(--accent); }
+  .state-card:nth-child(2)::before { background: var(--green); }
+  .state-card:nth-child(3)::before { background: var(--orange); }
+  .state-card:nth-child(4)::before { background: var(--blue); }
+  .state-card:nth-child(5)::before { background: var(--red); }
+  .state-card:nth-child(6)::before { background: var(--pink); }
+
+  .state-card:hover {
+    border-color: var(--accent);
+    transform: translateY(-4px);
+    box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+  }
+
+  .state-icon {
+    font-size: 28px;
+    margin-bottom: 12px;
+  }
+
+  .state-card h4 {
+    font-size: 16px;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+
+  .state-card p {
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  /* Command flow */
+  .command-flow {
+    display: flex;
+    flex-direction: column;
+    gap: 32px;
+    margin: 48px 0;
+  }
+
+  .cmd-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+    transition: all 0.3s;
+  }
+
+  .cmd-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 0 40px var(--accent-glow);
+  }
+
+  .cmd-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 24px 32px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .cmd-number {
+    width: 48px;
+    height: 48px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 800;
+    font-size: 20px;
+    flex-shrink: 0;
+  }
+
+  .cmd-card:nth-child(1) .cmd-number { background: var(--accent); color: #fff; }
+  .cmd-card:nth-child(2) .cmd-number { background: var(--green); color: #000; }
+  .cmd-card:nth-child(3) .cmd-number { background: var(--orange); color: #000; }
+  .cmd-card:nth-child(4) .cmd-number { background: var(--red); color: #fff; }
+
+  .cmd-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 18px;
+    font-weight: 600;
+  }
+
+  .cmd-desc {
+    font-size: 14px;
+    color: var(--text-dim);
+  }
+
+  .cmd-body {
+    padding: 24px 32px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+  }
+
+  .cmd-body-full {
+    grid-column: 1 / -1;
+  }
+
+  .cmd-feature {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+
+  .cmd-feature-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: var(--surface-3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-size: 16px;
+  }
+
+  .cmd-feature h5 {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+
+  .cmd-feature p {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  /* Token budget viz */
+  .budget-bar {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin: 48px 0;
+  }
+
+  .budget-bar h4 {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 16px;
+  }
+
+  .bar-track {
+    height: 32px;
+    background: var(--surface-3);
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex;
+    position: relative;
+  }
+
+  .bar-segment {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 600;
+    font-family: 'JetBrains Mono', monospace;
+    transition: width 0.5s;
+  }
+
+  .bar-thorough { background: var(--accent); width: 25%; }
+  .bar-standard { background: var(--green); color: #000; width: 45%; }
+  .bar-quick { background: var(--orange); color: #000; width: 20%; }
+  .bar-reserve { background: var(--red-dim); width: 10%; }
+
+  .budget-legend {
+    display: flex;
+    gap: 24px;
+    margin-top: 16px;
+    flex-wrap: wrap;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+  }
+
+  /* File tree */
+  .file-tree {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    line-height: 2;
+    margin: 48px 0;
+    overflow-x: auto;
+  }
+
+  .file-tree .dir { color: var(--accent-light); font-weight: 600; }
+  .file-tree .file { color: var(--text-dim); }
+  .file-tree .comment { color: var(--text-muted); font-style: italic; }
+
+  /* Context reset diagram */
+  .context-diagram {
+    display: flex;
+    gap: 16px;
+    margin: 48px 0;
+    overflow-x: auto;
+    padding-bottom: 16px;
+  }
+
+  .context-session {
+    min-width: 240px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    flex-shrink: 0;
+    position: relative;
+  }
+
+  .context-session h4 {
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .context-bar {
+    height: 8px;
+    background: var(--surface-3);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 8px 0;
+  }
+
+  .context-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 1s;
+  }
+
+  .context-tasks {
+    list-style: none;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .context-tasks li {
+    padding: 4px 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .task-done { color: var(--green); }
+  .task-active { color: var(--orange); }
+  .task-pending { color: var(--text-muted); }
+
+  .context-arrow {
+    display: flex;
+    align-items: center;
+    color: var(--accent-light);
+    font-size: 24px;
+    flex-shrink: 0;
+    align-self: center;
+  }
+
+  /* Capability discovery */
+  .cap-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 16px;
+    margin: 48px 0;
+  }
+
+  .cap-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    transition: all 0.3s;
+  }
+
+  .cap-card:hover {
+    border-color: var(--green);
+    box-shadow: 0 0 20px var(--green-dim);
+  }
+
+  .cap-type {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--green);
+    margin-bottom: 8px;
+  }
+
+  .cap-card h4 { font-size: 15px; margin-bottom: 4px; }
+  .cap-card p { font-size: 12px; color: var(--text-dim); }
+
+  /* Backprop */
+  .backprop-flow {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    margin: 48px 0;
+    position: relative;
+  }
+
+  .backprop-flow::before {
+    content: '';
+    position: absolute;
+    left: 24px;
+    top: 40px;
+    bottom: 40px;
+    width: 2px;
+    background: linear-gradient(to bottom, var(--red), var(--orange), var(--green));
+  }
+
+  .bp-step {
+    display: flex;
+    gap: 20px;
+    padding: 16px 0;
+    position: relative;
+  }
+
+  .bp-dot {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 800;
+    font-size: 16px;
+    flex-shrink: 0;
+    z-index: 1;
+  }
+
+  .bp-step:nth-child(1) .bp-dot { background: var(--red); color: #fff; }
+  .bp-step:nth-child(2) .bp-dot { background: var(--orange); color: #000; }
+  .bp-step:nth-child(3) .bp-dot { background: var(--accent); color: #fff; }
+  .bp-step:nth-child(4) .bp-dot { background: var(--blue); color: #000; }
+  .bp-step:nth-child(5) .bp-dot { background: var(--green); color: #000; }
+
+  .bp-content h4 { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+  .bp-content p { font-size: 13px; color: var(--text-dim); }
+
+  /* Circuit breakers */
+  .breaker-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 16px;
+    margin: 48px 0;
+  }
+
+  .breaker-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+
+  .breaker-card .trigger {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--red);
+    margin-bottom: 8px;
+  }
+
+  .breaker-card .action {
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+
+  .breaker-card .action strong { color: var(--orange); }
+
+  /* Depth comparison */
+  .depth-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    margin: 48px 0;
+    font-size: 14px;
+  }
+
+  .depth-table th {
+    text-align: left;
+    padding: 12px 16px;
+    border-bottom: 2px solid var(--border);
+    color: var(--text-dim);
+    font-weight: 600;
+    font-size: 12px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  .depth-table td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .depth-table tr:hover td { background: var(--surface); }
+
+  .depth-quick { color: var(--green); font-weight: 600; }
+  .depth-standard { color: var(--blue); font-weight: 600; }
+  .depth-thorough { color: var(--accent-light); font-weight: 600; }
+
+  /* Footer */
+  footer {
+    text-align: center;
+    padding: 80px 32px;
+    color: var(--text-muted);
+    font-size: 14px;
+    border-top: 1px solid var(--border);
+  }
+
+  footer a { color: var(--accent-light); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-badge">Claude Code Plugin &middot; Open Source</div>
+  <h1>Forge</h1>
+  <p>Autonomous spec-driven development. Brainstorm ideas into specs. Plan specs into tasks. Execute tasks with smart loops that never stop until the job is done.</p>
+  <div class="hero-commands">
+    <div class="hero-cmd">/forge brainstorm <span>"build X"</span></div>
+    <div class="hero-cmd">/forge plan <span>--depth standard</span></div>
+    <div class="hero-cmd">/forge execute <span>--autonomy full</span></div>
+  </div>
+  <div class="scroll-indicator">
+    scroll to explore
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3v10m0 0l4-4m-4 4L4 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+  </div>
+</div>
+
+<!-- THREE COMMANDS -->
+<section>
+  <div class="section-label">Core Interface</div>
+  <h2>Three Commands. One System.</h2>
+  <p class="subtitle">Each command handles a distinct phase. They chain together seamlessly, or run independently.</p>
+
+  <div class="command-flow">
+    <div class="cmd-card">
+      <div class="cmd-header">
+        <div class="cmd-number">1</div>
+        <div>
+          <div class="cmd-title">/forge brainstorm</div>
+          <div class="cmd-desc">Turn ideas into concrete specs</div>
+        </div>
+      </div>
+      <div class="cmd-body">
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">?</div>
+          <div>
+            <h5>Interactive Q&A</h5>
+            <p>One question at a time, multiple choice preferred. Adapts depth to complexity.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">&lt;/&gt;</div>
+          <div>
+            <h5>--from-code</h5>
+            <p>Analyze existing codebase and generate specs for what exists + gaps.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">R</div>
+          <div>
+            <h5>R-Numbered Requirements</h5>
+            <p>Each requirement gets testable acceptance criteria. Traceable through plan and execution.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">2-3</div>
+          <div>
+            <h5>Approach Proposals</h5>
+            <p>Always proposes 2-3 approaches with trade-offs before committing to a design.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cmd-card">
+      <div class="cmd-header">
+        <div class="cmd-number">2</div>
+        <div>
+          <div class="cmd-title">/forge plan</div>
+          <div class="cmd-desc">Decompose specs into task frontiers</div>
+        </div>
+      </div>
+      <div class="cmd-body">
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">DAG</div>
+          <div>
+            <h5>Dependency Graphs</h5>
+            <p>Tasks linked by dependencies. Grouped into parallelizable tiers.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">$</div>
+          <div>
+            <h5>Token Estimates</h5>
+            <p>Every task gets a token cost estimate. Budget tracked from the start.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">&harr;</div>
+          <div>
+            <h5>Multi-Repo Tags</h5>
+            <p>Tasks tagged with target repo. API tasks execute before frontend.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">~</div>
+          <div>
+            <h5>Adaptive Granularity</h5>
+            <p>Quick: 3-5 big tasks. Standard: 6-12 tasks. Thorough: 12-20 fine-grained tasks.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cmd-card">
+      <div class="cmd-header">
+        <div class="cmd-number">3</div>
+        <div>
+          <div class="cmd-title">/forge execute</div>
+          <div class="cmd-desc">Autonomous implementation with smart loops</div>
+        </div>
+      </div>
+      <div class="cmd-body">
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">&infin;</div>
+          <div>
+            <h5>Three Autonomy Levels</h5>
+            <p>Full (walk away), Gated (pause between phases), Supervised (pause between tasks).</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">&orarr;</div>
+          <div>
+            <h5>Smart Stop Hook</h5>
+            <p>Reads state, routes to next action. Not a dumb re-feed — a state machine.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">TDD</div>
+          <div>
+            <h5>Quality Inner Loop</h5>
+            <p>Implement, test, review, fix — iterates until tests pass and review is clean.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">&circlearrowleft;</div>
+          <div>
+            <h5>Context Resets</h5>
+            <p>At 60% context, saves state and starts fresh. Zero quality degradation.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cmd-card">
+      <div class="cmd-header">
+        <div class="cmd-number">&larr;</div>
+        <div>
+          <div class="cmd-title">/forge backprop</div>
+          <div class="cmd-desc">Trace bugs back to specs. Self-improving.</div>
+        </div>
+      </div>
+      <div class="cmd-body">
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">&#x1F50D;</div>
+          <div>
+            <h5>Spec Tracing</h5>
+            <p>Identifies which requirement missed the bug. Proposes acceptance criteria update.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">&#x1F9EA;</div>
+          <div>
+            <h5>Regression Tests</h5>
+            <p>Auto-generates tests that lock in the fix. Bug can never recur.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">&#x1F4CA;</div>
+          <div>
+            <h5>Pattern Detection</h5>
+            <p>After 3+ similar gaps, suggests systemic prompt changes to prevent the category.</p>
+          </div>
+        </div>
+        <div class="cmd-feature">
+          <div class="cmd-feature-icon">&#x267B;</div>
+          <div>
+            <h5>Verify from Spec</h5>
+            <p>Optionally re-run execution to confirm the fix emerges from specs alone.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SMART LOOP -->
+<section>
+  <div class="section-label">Engine</div>
+  <h2>Three-Layer Smart Loop</h2>
+  <p class="subtitle">Not a dumb prompt re-feed. A state machine that knows exactly what to do next.</p>
+
+  <div class="loop-diagram">
+    <div class="loop-layer loop-outer">
+      <div class="loop-label">Outer Loop &mdash; Phase Progression</div>
+      <h3>Stop Hook Routes Between Phases</h3>
+      <p>Brainstorm &rarr; Plan &rarr; Execute &rarr; Verify &rarr; Next Phase or Done</p>
+      <div class="loop-steps">
+        <div class="loop-step">brainstorm</div>
+        <div class="loop-step arrow">&rarr;</div>
+        <div class="loop-step">plan</div>
+        <div class="loop-step arrow">&rarr;</div>
+        <div class="loop-step">execute</div>
+        <div class="loop-step arrow">&rarr;</div>
+        <div class="loop-step">verify</div>
+        <div class="loop-step arrow">&rarr;</div>
+        <div class="loop-step">next phase</div>
+      </div>
+
+      <div class="loop-layer loop-middle">
+        <div class="loop-label">Middle Loop &mdash; Task Progression</div>
+        <h3>Frontier-Based Task Routing</h3>
+        <p>Read frontier &rarr; Pick next unblocked task &rarr; Execute &rarr; Mark done &rarr; Repeat</p>
+        <div class="loop-steps">
+          <div class="loop-step">read frontier</div>
+          <div class="loop-step arrow">&rarr;</div>
+          <div class="loop-step">next task</div>
+          <div class="loop-step arrow">&rarr;</div>
+          <div class="loop-step">implement</div>
+          <div class="loop-step arrow">&rarr;</div>
+          <div class="loop-step">mark done</div>
+          <div class="loop-step arrow">&rarr;</div>
+          <div class="loop-step">repeat</div>
+        </div>
+
+        <div class="loop-layer loop-inner">
+          <div class="loop-label">Inner Loop &mdash; Quality Iteration</div>
+          <h3>Implement &rarr; Test &rarr; Review &rarr; Fix</h3>
+          <p>Each task iterates until tests pass AND review is clean. Circuit breakers prevent infinite loops.</p>
+          <div class="loop-steps">
+            <div class="loop-step">implement</div>
+            <div class="loop-step arrow">&rarr;</div>
+            <div class="loop-step">test</div>
+            <div class="loop-step arrow">&rarr;</div>
+            <div class="loop-step">review</div>
+            <div class="loop-step arrow">&rarr;</div>
+            <div class="loop-step">fix</div>
+            <div class="loop-step arrow">&rarr;</div>
+            <div class="loop-step">re-test</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- STOP HOOK STATE MACHINE -->
+<section>
+  <div class="section-label">Intelligence</div>
+  <h2>Stop Hook State Machine</h2>
+  <p class="subtitle">Every time Claude tries to exit, the hook reads state and decides: what should happen next?</p>
+
+  <div class="state-machine">
+    <div class="state-card">
+      <div class="state-icon">&gt;_</div>
+      <h4>EXECUTE</h4>
+      <p>Task not yet implemented. Feed implementation prompt with spec requirements and acceptance criteria.</p>
+    </div>
+    <div class="state-card">
+      <div class="state-icon">&#x2713;</div>
+      <h4>TEST</h4>
+      <p>Code written but not tested. Feed "run tests" prompt. On failure, route to FIX.</p>
+    </div>
+    <div class="state-card">
+      <div class="state-icon">&#x1F50D;</div>
+      <h4>REVIEW</h4>
+      <p>Tests pass but not reviewed. Feed review prompt. On issues, route to FIX.</p>
+    </div>
+    <div class="state-card">
+      <div class="state-icon">&#x1F527;</div>
+      <h4>FIX</h4>
+      <p>Issues found (test failures or review). Feed targeted fix prompt. Track attempt count.</p>
+    </div>
+    <div class="state-card">
+      <div class="state-icon">&#x1F41B;</div>
+      <h4>DEBUG</h4>
+      <p>Same failure 3x in a row. Switch to systematic 4-phase debugging. Escalate after 3 debug attempts.</p>
+    </div>
+    <div class="state-card">
+      <div class="state-icon">&#x23ED;</div>
+      <h4>ADVANCE</h4>
+      <p>Task complete. Commit, update frontier, check budget. Route to next task or phase verification.</p>
+    </div>
+  </div>
+</section>
+
+<!-- CONTEXT RESETS -->
+<section>
+  <div class="section-label">Continuity</div>
+  <h2>Context Window Management</h2>
+  <p class="subtitle">At 60% context usage, save everything and start fresh. Quality never degrades.</p>
+
+  <div class="context-diagram">
+    <div class="context-session">
+      <h4>&#x1F7E2; Session 1</h4>
+      <div class="context-bar"><div class="context-fill" style="width:60%;background:linear-gradient(90deg,var(--green),var(--orange))"></div></div>
+      <ul class="context-tasks">
+        <li><span class="task-done">&#x2713;</span> T001: User model</li>
+        <li><span class="task-done">&#x2713;</span> T002: Auth controller</li>
+        <li><span class="task-done">&#x2713;</span> T003: Registration</li>
+        <li><span class="task-active">&#x25CF;</span> T004: Login (in progress)</li>
+        <li><span class="task-pending">&#x25CB;</span> T005-T008 remaining</li>
+      </ul>
+      <p style="font-size:11px;color:var(--orange);margin-top:8px">Context at 60% &rarr; handoff snapshot</p>
+    </div>
+    <div class="context-arrow">&rarr;</div>
+    <div class="context-session">
+      <h4>&#x1F7E2; Session 2</h4>
+      <div class="context-bar"><div class="context-fill" style="width:55%;background:linear-gradient(90deg,var(--green),var(--green))"></div></div>
+      <ul class="context-tasks">
+        <li><span class="task-done">&#x2713;</span> T004: Login (resumed)</li>
+        <li><span class="task-done">&#x2713;</span> T005: JWT middleware</li>
+        <li><span class="task-done">&#x2713;</span> T006: Refresh tokens</li>
+        <li><span class="task-active">&#x25CF;</span> T007: Frontend auth</li>
+        <li><span class="task-pending">&#x25CB;</span> T008 remaining</li>
+      </ul>
+      <p style="font-size:11px;color:var(--orange);margin-top:8px">Context at 55% &rarr; handoff</p>
+    </div>
+    <div class="context-arrow">&rarr;</div>
+    <div class="context-session">
+      <h4>&#x1F7E2; Session 3</h4>
+      <div class="context-bar"><div class="context-fill" style="width:30%;background:var(--green)"></div></div>
+      <ul class="context-tasks">
+        <li><span class="task-done">&#x2713;</span> T008: Login pages</li>
+        <li><span class="task-done">&#x2713;</span> Phase verified</li>
+        <li style="color:var(--green);font-weight:600">&#x2713; COMPLETE</li>
+      </ul>
+      <p style="font-size:11px;color:var(--green);margin-top:8px">All tasks done. Clean exit.</p>
+    </div>
+  </div>
+</section>
+
+<!-- TOKEN BUDGET -->
+<section>
+  <div class="section-label">Efficiency</div>
+  <h2>Adaptive Token Budget</h2>
+  <p class="subtitle">Auto-downgrades depth when budget runs low. Never wastes tokens on unnecessary ceremony.</p>
+
+  <div class="budget-bar">
+    <h4>500,000 token budget &mdash; auto-managed</h4>
+    <div class="bar-track">
+      <div class="bar-segment bar-thorough">thorough</div>
+      <div class="bar-segment bar-standard">standard</div>
+      <div class="bar-segment bar-quick">quick</div>
+      <div class="bar-segment bar-reserve">exit</div>
+    </div>
+    <div class="budget-legend">
+      <div class="legend-item"><div class="legend-dot" style="background:var(--accent)"></div>0-25%: Thorough (full review + TDD)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div>25-70%: Standard (1 review pass)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div>70-90%: Quick (tests only, skip review)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div>90%+: Save state, exit gracefully</div>
+    </div>
+  </div>
+
+  <table class="depth-table">
+    <thead>
+      <tr>
+        <th>Feature</th>
+        <th>Quick</th>
+        <th>Standard</th>
+        <th>Thorough</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Review after task</td>
+        <td class="depth-quick">Skip</td>
+        <td class="depth-standard">1 pass</td>
+        <td class="depth-thorough">Until clean</td>
+      </tr>
+      <tr>
+        <td>TDD enforcement</td>
+        <td class="depth-quick">No</td>
+        <td class="depth-standard">If skill available</td>
+        <td class="depth-thorough">Always</td>
+      </tr>
+      <tr>
+        <td>Phase verification</td>
+        <td class="depth-quick">Skip</td>
+        <td class="depth-standard">Quick check</td>
+        <td class="depth-thorough">Full goal-backward</td>
+      </tr>
+      <tr>
+        <td>Tasks per spec</td>
+        <td class="depth-quick">3-5</td>
+        <td class="depth-standard">6-12</td>
+        <td class="depth-thorough">12-20</td>
+      </tr>
+      <tr>
+        <td>Token cost per task</td>
+        <td class="depth-quick">~3k</td>
+        <td class="depth-standard">~6k</td>
+        <td class="depth-thorough">~12k</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- CAPABILITY DISCOVERY -->
+<section>
+  <div class="section-label">Ecosystem</div>
+  <h2>Capability Discovery</h2>
+  <p class="subtitle">Forge scans your environment and routes work to leverage installed MCP servers and skills.</p>
+
+  <div class="cap-grid">
+    <div class="cap-card">
+      <div class="cap-type">MCP Server</div>
+      <h4>Context7</h4>
+      <p>Library documentation lookup. Used during implementation for API references.</p>
+    </div>
+    <div class="cap-card">
+      <div class="cap-type">MCP Server</div>
+      <h4>Playwright</h4>
+      <p>Browser automation. Used for E2E testing during verification phase.</p>
+    </div>
+    <div class="cap-card">
+      <div class="cap-type">MCP Server</div>
+      <h4>MongoDB</h4>
+      <p>Direct database access. Used for data inspection during debugging.</p>
+    </div>
+    <div class="cap-card">
+      <div class="cap-type">Skill</div>
+      <h4>TDD</h4>
+      <p>Red-green-refactor workflow. Enforced during execution if available.</p>
+    </div>
+    <div class="cap-card">
+      <div class="cap-type">Skill</div>
+      <h4>Systematic Debugging</h4>
+      <p>4-phase root cause analysis. Activated when inner loop hits circuit breaker.</p>
+    </div>
+    <div class="cap-card">
+      <div class="cap-type">Skill</div>
+      <h4>Frontend Design</h4>
+      <p>Production UI generation. Invoked for frontend tasks in multi-repo projects.</p>
+    </div>
+    <div class="cap-card">
+      <div class="cap-type">Plugin</div>
+      <h4>Code Review</h4>
+      <p>Structured review protocol. Powers the review inner loop.</p>
+    </div>
+    <div class="cap-card">
+      <div class="cap-type">Custom</div>
+      <h4>Your MCP Servers</h4>
+      <p>Forge discovers any MCP server you've installed and routes work to it automatically.</p>
+    </div>
+  </div>
+</section>
+
+<!-- BACKPROPAGATION -->
+<section>
+  <div class="section-label">Self-Improvement</div>
+  <h2>Backpropagation</h2>
+  <p class="subtitle">Trace runtime bugs back to the spec gap that missed them. The system learns from its mistakes.</p>
+
+  <div class="backprop-flow">
+    <div class="bp-step">
+      <div class="bp-dot">1</div>
+      <div class="bp-content">
+        <h4>Bug Discovered</h4>
+        <p>Runtime error, failing test, or user report. Run <code>/forge backprop "description"</code></p>
+      </div>
+    </div>
+    <div class="bp-step">
+      <div class="bp-dot">2</div>
+      <div class="bp-content">
+        <h4>Trace to Spec</h4>
+        <p>Identify which requirement and acceptance criterion missed this case. Pinpoint the spec gap.</p>
+      </div>
+    </div>
+    <div class="bp-step">
+      <div class="bp-dot">3</div>
+      <div class="bp-content">
+        <h4>Update Spec</h4>
+        <p>Add or modify acceptance criteria. Fix the root cause in the specification, not just the code.</p>
+      </div>
+    </div>
+    <div class="bp-step">
+      <div class="bp-dot">4</div>
+      <div class="bp-content">
+        <h4>Generate Regression Test</h4>
+        <p>Auto-create a test that would have caught this bug. Locks in the fix permanently.</p>
+      </div>
+    </div>
+    <div class="bp-step">
+      <div class="bp-dot">5</div>
+      <div class="bp-content">
+        <h4>Verify from Spec</h4>
+        <p>Optionally re-run execution to confirm the fix emerges from updated specs alone. System is now smarter.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CIRCUIT BREAKERS -->
+<section>
+  <div class="section-label">Safety</div>
+  <h2>Circuit Breakers</h2>
+  <p class="subtitle">Prevent infinite loops and token waste. The system knows when to stop and ask for help.</p>
+
+  <div class="breaker-grid">
+    <div class="breaker-card">
+      <div class="trigger">Same test fails 3x in a row</div>
+      <div class="action"><strong>Switch to DEBUG mode</strong> &mdash; 4-phase systematic investigation instead of blind retries</div>
+    </div>
+    <div class="breaker-card">
+      <div class="trigger">DEBUG mode > 3 attempts</div>
+      <div class="action"><strong>Pause and ask human</strong> &mdash; save state, explain what was tried, request guidance</div>
+    </div>
+    <div class="breaker-card">
+      <div class="trigger">Review loop > 3 iterations</div>
+      <div class="action"><strong>Accept with warnings</strong> &mdash; log unresolved issues, move to next task</div>
+    </div>
+    <div class="breaker-card">
+      <div class="trigger">No progress for 2 iterations</div>
+      <div class="action"><strong>Stall detection</strong> &mdash; save state, flag blocker, pause for human input</div>
+    </div>
+    <div class="breaker-card">
+      <div class="trigger">Token budget exhausted</div>
+      <div class="action"><strong>Graceful exit</strong> &mdash; save all state, report progress, list remaining tasks</div>
+    </div>
+    <div class="breaker-card">
+      <div class="trigger">Single task > 20% of budget</div>
+      <div class="action"><strong>Force-complete</strong> &mdash; commit what exists, flag for human review, move on</div>
+    </div>
+  </div>
+</section>
+
+<!-- FILE STRUCTURE -->
+<section>
+  <div class="section-label">Architecture</div>
+  <h2>Plugin Structure</h2>
+  <p class="subtitle">Everything in one plugin directory. Zero dependencies. Install and go.</p>
+
+  <div class="file-tree">
+<span class="dir">forge/</span>
+├── <span class="dir">.claude-plugin/</span>
+│   └── <span class="file">plugin.json</span>              <span class="comment"># Plugin manifest</span>
+├── <span class="dir">commands/</span>
+│   ├── <span class="file">brainstorm.md</span>            <span class="comment"># /forge brainstorm</span>
+│   ├── <span class="file">plan.md</span>                  <span class="comment"># /forge plan</span>
+│   ├── <span class="file">execute.md</span>               <span class="comment"># /forge execute</span>
+│   ├── <span class="file">resume.md</span>                <span class="comment"># /forge resume</span>
+│   ├── <span class="file">backprop.md</span>              <span class="comment"># /forge backprop</span>
+│   ├── <span class="file">status.md</span>                <span class="comment"># /forge status</span>
+│   └── <span class="file">help.md</span>                  <span class="comment"># /forge help</span>
+├── <span class="dir">skills/</span>
+│   ├── <span class="dir">brainstorming/</span><span class="file">SKILL.md</span>   <span class="comment"># Spec generation workflow</span>
+│   ├── <span class="dir">planning/</span><span class="file">SKILL.md</span>        <span class="comment"># Task decomposition & DAG</span>
+│   ├── <span class="dir">executing/</span><span class="file">SKILL.md</span>       <span class="comment"># Implementation loop</span>
+│   ├── <span class="dir">backpropagation/</span><span class="file">SKILL.md</span> <span class="comment"># Bug-to-spec tracing</span>
+│   └── <span class="dir">reviewing/</span><span class="file">SKILL.md</span>      <span class="comment"># Claude-on-Claude review</span>
+├── <span class="dir">agents/</span>
+│   ├── <span class="file">forge-speccer.md</span>         <span class="comment"># Writes specs</span>
+│   ├── <span class="file">forge-planner.md</span>         <span class="comment"># Decomposes into tasks</span>
+│   ├── <span class="file">forge-executor.md</span>        <span class="comment"># Implements tasks (TDD)</span>
+│   ├── <span class="file">forge-reviewer.md</span>        <span class="comment"># Code review vs spec</span>
+│   ├── <span class="file">forge-verifier.md</span>        <span class="comment"># Goal-backward verification</span>
+│   └── <span class="file">forge-complexity.md</span>      <span class="comment"># Auto-detect depth</span>
+├── <span class="dir">hooks/</span>
+│   ├── <span class="file">hooks.json</span>               <span class="comment"># Hook registration</span>
+│   ├── <span class="file">stop-hook.sh</span>             <span class="comment"># Smart loop engine</span>
+│   └── <span class="file">token-monitor.sh</span>         <span class="comment"># Usage tracking</span>
+├── <span class="dir">scripts/</span>
+│   ├── <span class="file">forge-tools.cjs</span>          <span class="comment"># State, config, token math</span>
+│   └── <span class="file">setup.sh</span>                 <span class="comment"># Initialize .forge/</span>
+├── <span class="dir">templates/</span>
+│   ├── <span class="file">spec.md</span>                  <span class="comment"># Spec file template</span>
+│   ├── <span class="file">plan.md</span>                  <span class="comment"># Frontier template</span>
+│   ├── <span class="file">state.md</span>                 <span class="comment"># State template</span>
+│   ├── <span class="file">summary.md</span>               <span class="comment"># Execution summary</span>
+│   └── <span class="file">backprop-report.md</span>       <span class="comment"># Backprop trace</span>
+└── <span class="dir">references/</span>
+    ├── <span class="file">token-profiles.md</span>        <span class="comment"># Budget strategies</span>
+    ├── <span class="file">backprop-patterns.md</span>     <span class="comment"># Bug-to-spec tracing</span>
+    ├── <span class="file">multi-repo.md</span>            <span class="comment"># Cross-repo rules</span>
+    ├── <span class="file">complexity-heuristics.md</span> <span class="comment"># Auto-detection scoring</span>
+    └── <span class="file">review-protocol.md</span>       <span class="comment"># Review standards</span>
+  </div>
+</section>
+
+<footer>
+  <p><strong>Forge</strong> &mdash; Autonomous spec-driven development for Claude Code</p>
+  <p style="margin-top:8px">Designed by Lucas Duys &middot; Open Source &middot; MIT License</p>
+</footer>
+
+</body>
+</html>

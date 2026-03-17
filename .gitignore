@@ -1,0 +1,16 @@
+# Forge runtime state (per-project, not part of the plugin)
+.forge/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Node (shouldn't have any, but just in case)
+node_modules/
+
+# Claude Code local settings
+.claude/settings.local.json
