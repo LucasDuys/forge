@@ -13,6 +13,5 @@
     "loop",
     "agent",
     "tdd"
-  ],
-  "hooks": "./hooks/hooks.json"
+  ]
 }
