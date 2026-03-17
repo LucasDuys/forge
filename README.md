@@ -13,40 +13,43 @@ Forge is a Claude Code CLI plugin that turns a single idea into working, tested 
 ## Installation
 
 ```bash
-# From marketplace (coming soon)
-claude plugin install forge
+# 1. Download or clone the forge directory
+# 2. Launch Claude Code with the plugin:
+claude --plugin-dir /path/to/forge
 
-# Local development
-git clone <repo-url>
-claude --plugin-dir ./forge
+# Or add a permanent alias to your shell:
+echo 'alias claude-forge="claude --plugin-dir /path/to/forge"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
 **Requirements:** Claude Code v1.0.33+ (plugin support). No `npm install` needed.
+
+> **Note:** Commands are namespaced as `/forge:brainstorm`, `/forge:plan`, `/forge:execute`, etc.
 
 ## Quick Start
 
 ```bash
 # 1. Brainstorm — interactive Q&A that produces a formal spec
-/forge brainstorm "build a REST API for task management"
+/forge:brainstorm "build a REST API for task management"
 
 # 2. Plan — decomposes the spec into an ordered task DAG
-/forge plan
+/forge:plan
 
 # 3. Execute — autonomous implementation loop
-/forge execute --autonomy gated
+/forge:execute --autonomy gated
 ```
 
 ## Commands
 
 | Command | Description | Key Flags |
 |---------|-------------|-----------|
-| `/forge brainstorm [topic]` | Interactive spec generation from an idea | `--from-code`, `--from-docs path/` |
-| `/forge plan` | Decompose specs into ordered task frontiers | `--filter tag`, `--depth quick\|standard\|thorough` |
-| `/forge execute` | Autonomous implementation loop | `--autonomy full\|gated\|supervised`, `--max-iterations N`, `--token-budget N` |
-| `/forge resume` | Continue after context reset or interruption | — |
-| `/forge backprop [desc]` | Trace a bug back to a spec gap | `--from-test path/` |
-| `/forge status` | Show current progress, budget, blockers | — |
-| `/forge help` | Usage guide for all commands and flags | — |
+| `/forge:brainstorm [topic]` | Interactive spec generation from an idea | `--from-code`, `--from-docs path/` |
+| `/forge:plan` | Decompose specs into ordered task frontiers | `--filter tag`, `--depth quick\|standard\|thorough` |
+| `/forge:execute` | Autonomous implementation loop | `--autonomy full\|gated\|supervised`, `--max-iterations N`, `--token-budget N` |
+| `/forge:resume` | Continue after context reset or interruption | — |
+| `/forge:backprop [desc]` | Trace a bug back to a spec gap | `--from-test path/` |
+| `/forge:status` | Show current progress, budget, blockers | — |
+| `/forge:help` | Usage guide for all commands and flags | — |
 
 ## Features
 
@@ -62,7 +65,7 @@ claude --plugin-dir ./forge
 
 ## Configuration
 
-Forge stores per-project state in `.forge/` (gitignored by default). Initialize it with `/forge brainstorm` or the setup script:
+Forge stores per-project state in `.forge/` (gitignored by default). Initialize it with `/forge:brainstorm` or the setup script:
 
 ```bash
 bash scripts/setup.sh
@@ -123,7 +126,7 @@ forge/
 **How the loop works:**
 
 ```
-User runs /forge execute
+User runs /forge:execute
         │
         v
   ┌─────────────────────────────────────────┐
@@ -145,7 +148,7 @@ User runs /forge execute
 For long-running sessions that may hit context limits, use the wrapper script:
 
 ```bash
-# After /forge execute, if using full autonomy:
+# After /forge:execute, if using full autonomy:
 bash scripts/forge-runner.sh
 ```
 
