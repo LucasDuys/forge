@@ -1,0 +1,26 @@
+{
+  "description": "Forge plugin hooks — autonomous loop engine and token monitoring",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop-hook.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/token-monitor.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
