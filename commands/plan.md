@@ -2,7 +2,6 @@
 description: "Decompose specs into task frontiers with dependency tracking"
 argument-hint: "[--filter NAME] [--depth quick|standard|thorough] [--repos REPO1,REPO2]"
 allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Agent(*)"]
-hide-from-slash-command-tool: "true"
 ---
 
 # Forge Plan

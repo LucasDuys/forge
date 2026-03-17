@@ -2,7 +2,6 @@
 description: "Run the autonomous implementation loop"
 argument-hint: "[--autonomy full|gated|supervised] [--max-iterations N] [--token-budget N] [--depth quick|standard|thorough] [--filter NAME]"
 allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Bash(*)", "Agent(*)"]
-hide-from-slash-command-tool: "true"
 ---
 
 # Forge Execute

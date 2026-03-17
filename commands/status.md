@@ -1,7 +1,6 @@
 ---
 description: "Show Forge progress and status"
 allowed-tools: ["Read(*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)"]
-hide-from-slash-command-tool: "true"
 ---
 
 # Forge Status

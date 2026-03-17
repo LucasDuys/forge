@@ -1,6 +1,5 @@
 ---
 description: "Show Forge usage guide"
-hide-from-slash-command-tool: "true"
 ---
 
 # Forge Help

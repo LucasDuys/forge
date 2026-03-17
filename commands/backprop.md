@@ -2,7 +2,6 @@
 description: "Trace a bug back to a spec gap and generate regression tests"
 argument-hint: "\"DESCRIPTION\" [--from-test PATH]"
 allowed-tools: ["Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Bash(*)", "Agent(*)"]
-hide-from-slash-command-tool: "true"
 ---
 
 # Forge Backprop

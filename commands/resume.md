@@ -1,7 +1,6 @@
 ---
 description: "Continue Forge execution after context reset or interruption"
 allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Bash(*)", "Agent(*)"]
-hide-from-slash-command-tool: "true"
 ---
 
 # Forge Resume

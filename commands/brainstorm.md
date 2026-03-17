@@ -2,7 +2,6 @@
 description: "Turn an idea into concrete specs with testable requirements"
 argument-hint: "[TOPIC] [--from-code] [--from-docs PATH]"
 allowed-tools: ["Bash(${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Agent(*)"]
-hide-from-slash-command-tool: "true"
 ---
 
 # Forge Brainstorm
