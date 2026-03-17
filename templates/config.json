@@ -1,0 +1,36 @@
+{
+  "autonomy": "gated",
+  "depth": "standard",
+  "auto_detect_depth": true,
+  "max_iterations": 100,
+  "token_budget": 500000,
+  "context_reset_threshold": 60,
+  "repos": {},
+  "cross_repo_rules": {
+    "commit_in_source": true,
+    "api_first": true,
+    "shared_specs": true
+  },
+  "loop": {
+    "circuit_breaker_test_fails": 3,
+    "circuit_breaker_debug_attempts": 3,
+    "circuit_breaker_review_iterations": 3,
+    "circuit_breaker_no_progress": 2,
+    "single_task_budget_percent": 20
+  },
+  "review": {
+    "enabled": true,
+    "min_depth": "standard",
+    "model": "claude"
+  },
+  "verification": {
+    "enabled": true,
+    "min_depth": "standard",
+    "stub_detection": true
+  },
+  "backprop": {
+    "auto_generate_regression_tests": true,
+    "re_run_after_spec_update": false
+  },
+  "capability_hints": {}
+}
