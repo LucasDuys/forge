@@ -13,16 +13,17 @@ Forge is a Claude Code CLI plugin that turns a single idea into working, tested 
 ## Installation
 
 ```bash
-# 1. Download or clone the forge directory
-# 2. Launch Claude Code with the plugin:
-claude --plugin-dir /path/to/forge
+# Option 1: Install via marketplace (recommended)
+claude plugin marketplace add LucasDuys/forge
+claude plugin install forge@forge-marketplace
 
-# Or add a permanent alias to your shell:
-echo 'alias claude-forge="claude --plugin-dir /path/to/forge"' >> ~/.bashrc
-source ~/.bashrc
+# Option 2: Load for a single session
+claude --plugin-dir /path/to/forge
 ```
 
 **Requirements:** Claude Code v1.0.33+ (plugin support). No `npm install` needed.
+
+After installing, restart Claude Code. Commands will be available as `/forge:brainstorm`, `/forge:plan`, `/forge:execute`, etc.
 
 > **Note:** Commands are namespaced as `/forge:brainstorm`, `/forge:plan`, `/forge:execute`, etc.
 
