@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "forge-marketplace",
+  "description": "Autonomous spec-driven development loop for Claude Code",
+  "owner": {
+    "name": "Lucas Duys"
+  },
+  "plugins": [
+    {
+      "name": "forge",
+      "description": "Autonomous spec-driven development loop for Claude Code. Three commands: brainstorm, plan, execute.",
+      "source": ".",
+      "category": "development"
+    }
+  ]
+}
