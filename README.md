@@ -1,78 +1,169 @@
-# Forge
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/LucasDuys/forge/main/docs/assets/forge-banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/LucasDuys/forge/main/docs/assets/forge-banner-light.svg">
+    <img alt="Forge" src="https://raw.githubusercontent.com/LucasDuys/forge/main/docs/assets/forge-banner-light.svg" width="600">
+  </picture>
+</p>
 
-**Autonomous spec-driven development for Claude Code.**
+<p align="center">
+  <strong>Turn a one-line idea into a branch with tested, reviewed, committed code.</strong>
+  <br>
+  The brainstorm-to-commit pipeline for Claude Code.
+</p>
 
-<!-- Badges (uncomment when published) -->
-<!-- ![Version](https://img.shields.io/badge/version-0.1.0-blue) -->
-<!-- ![License](https://img.shields.io/badge/license-MIT-green) -->
+<p align="center">
+  <a href="https://github.com/LucasDuys/forge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
+  <a href="https://github.com/LucasDuys/forge/stargazers"><img src="https://img.shields.io/github/stars/LucasDuys/forge?style=flat" alt="Stars"></a>
+  <a href="https://github.com/LucasDuys/forge/issues"><img src="https://img.shields.io/github/issues/LucasDuys/forge" alt="Issues"></a>
+</p>
 
-## What is Forge?
+---
 
-Forge is a Claude Code CLI plugin that turns a single idea into working, tested code through three commands: **brainstorm**, **plan**, and **execute**. It runs a smart loop powered by a state machine that routes between implementation, testing, review, and debugging — all without you pressing Enter. The system self-improves via backpropagation (tracing runtime bugs back to spec gaps), adapts its ceremony level to match task complexity, and manages its own token budget so it can run autonomously for hours.
+## The Problem
 
-## Installation
+Using Claude Code for non-trivial tasks today looks like this:
 
-```bash
-# Option 1: Install via marketplace (recommended)
-claude plugin marketplace add LucasDuys/forge
-claude plugin install forge@forge-marketplace
+1. Describe what you want in a prompt
+2. Manually review the output
+3. Realize it missed half the requirements
+4. Re-prompt with more context
+5. Lose track of what was done vs. what remains
+6. Hit the context window limit
+7. Start over in a new session, losing all progress
 
-# Option 2: Load for a single session
-claude --plugin-dir /path/to/forge
+**Forge replaces that entire loop with three commands.**
+
+## How It Works
+
+```
+  /forge:brainstorm                /forge:plan                    /forge:execute
+
+  "Add real-time collab    --->   Spec decomposed into     --->  Autonomous loop:
+   with conflict resolution       ordered task frontiers          implement, test,
+   and live cursors"              with dependency DAG             review, commit
+
+  Interactive Q&A that            Smart depth detection:          Runs unattended.
+  produces a formal spec          quick | standard | thorough     Handles context resets.
+  with R-numbered requirements    TDD + review scheduling         Self-corrects on failures.
 ```
 
-**Requirements:** Claude Code v1.0.33+ (plugin support). No `npm install` needed.
-
-After installing, restart Claude Code. Commands will be available as `/forge:brainstorm`, `/forge:plan`, `/forge:execute`, etc.
-
-> **Note:** Commands are namespaced as `/forge:brainstorm`, `/forge:plan`, `/forge:execute`, etc.
+One idea in. Working, tested, committed code out. No manual intervention required.
 
 ## Quick Start
 
 ```bash
-# 1. Brainstorm — interactive Q&A that produces a formal spec
-/forge:brainstorm "build a REST API for task management"
-
-# 2. Plan — decomposes the spec into an ordered task DAG
-/forge:plan
-
-# 3. Execute — autonomous implementation loop
-/forge:execute --autonomy gated
+# Install the plugin
+claude plugin marketplace add LucasDuys/forge
+claude plugin install forge@forge-marketplace
 ```
+
+Then, in any Claude Code session:
+
+```bash
+/forge:brainstorm "build a REST API for task management"
+/forge:plan
+/forge:execute
+```
+
+That's it. Forge handles the rest.
+
+> **Requirements:** Claude Code v1.0.33+ with plugin support. No `npm install`, no build step, no dependencies.
+
+## Why Forge?
+
+**Without Forge**, you are the loop. You read, plan, prompt, review, re-prompt, debug, and commit -- manually, for every task. Context resets lose your progress. Complex features require dozens of back-and-forth exchanges.
+
+**With Forge**, Claude becomes an autonomous development agent that follows a structured pipeline:
+
+| Capability | What it does |
+|---|---|
+| **Spec generation** | Interactive brainstorm session produces a formal spec with numbered requirements and acceptance criteria |
+| **Task decomposition** | Specs are broken into an ordered dependency DAG with parallel frontiers |
+| **Autonomous execution** | Three-layer loop (phase / task / quality) runs implement-test-review-fix cycles without intervention |
+| **Adaptive depth** | Auto-detects complexity: `quick` (3-5 tasks), `standard` (6-12), `thorough` (12-20 with TDD + review on every task) |
+| **Context survival** | Monitors context usage, saves handoff snapshots at 60%, resumes cleanly in a new session |
+| **Self-correction** | Circuit breakers catch loops: 3 test fails triggers debug mode, 3 debug attempts escalates to you |
+| **Backpropagation** | Traces runtime bugs back to spec gaps, updates specs, generates regression tests |
+| **Capability discovery** | Detects your MCP servers, plugins, and skills at startup and routes work through them |
 
 ## Commands
 
 | Command | Description | Key Flags |
-|---------|-------------|-----------|
+|---|---|---|
 | `/forge:brainstorm [topic]` | Interactive spec generation from an idea | `--from-code`, `--from-docs path/` |
 | `/forge:plan` | Decompose specs into ordered task frontiers | `--filter tag`, `--depth quick\|standard\|thorough` |
-| `/forge:execute` | Autonomous implementation loop | `--autonomy full\|gated\|supervised`, `--max-iterations N`, `--token-budget N` |
-| `/forge:resume` | Continue after context reset or interruption | — |
+| `/forge:execute` | Autonomous implementation loop | `--autonomy full\|gated\|supervised`, `--max-iterations N` |
+| `/forge:resume` | Continue after context reset or interruption | -- |
 | `/forge:backprop [desc]` | Trace a bug back to a spec gap | `--from-test path/` |
-| `/forge:status` | Show current progress, budget, blockers | — |
-| `/forge:help` | Usage guide for all commands and flags | — |
+| `/forge:status` | Show current progress, budget, blockers | -- |
 
-## Features
+## Autonomy Levels
 
-- **Three-layer smart loop** — Outer loop (phase/spec progression), middle loop (task progression), inner loop (quality iteration: implement, test, review, fix).
-- **Configurable autonomy** — `full` (runs unattended), `gated` (pauses between phases), `supervised` (pauses between tasks).
-- **Adaptive depth** — Auto-detects complexity and scales ceremony: `quick` (3-5 tasks, no review), `standard` (6-12 tasks, reviews on critical paths), `thorough` (12-20 tasks, TDD + review on every task).
-- **Context window management** — Monitors estimated context usage. At 60% threshold, saves a handoff snapshot and exits cleanly so a fresh session can continue.
-- **Token budget tracking** — Tracks cumulative usage across sessions. Auto-downgrades to quick mode at 70%, graceful exit at 90%.
-- **Multi-repo support** — Coordinates work across multiple repositories with API-first ordering. Each task is tagged with its target repo.
-- **Backpropagation** — Traces runtime bugs back to spec gaps, proposes spec updates, generates regression tests. After 3+ similar backprops, suggests systemic spec improvements.
-- **Capability discovery** — Scans your MCP servers, plugins, and skills at startup. Routes work to leverage tools you already have (Playwright for E2E, Context7 for docs, etc.).
-- **Circuit breakers** — Prevents infinite loops. 3 test failures triggers debug mode, 3 debug attempts escalates to human, 2 no-progress iterations flags a blocker.
+Choose how much control you want:
+
+- **`full`** -- Runs completely unattended. Handles context resets automatically via the runner script.
+- **`gated`** -- Pauses between phases for your approval. Recommended for first use.
+- **`supervised`** -- Pauses between individual tasks. Maximum oversight.
+
+```bash
+# Fully autonomous (long-running sessions)
+/forge:execute --autonomy full
+
+# Pause between phases (recommended)
+/forge:execute --autonomy gated
+
+# Pause between tasks
+/forge:execute --autonomy supervised
+```
+
+## Architecture
+
+```
+forge/
+  commands/        Slash commands (brainstorm, plan, execute, resume, backprop, status)
+  skills/          Procedural workflows (brainstorming, planning, executing, reviewing)
+  agents/          Specialized subagents (speccer, planner, executor, reviewer, verifier)
+  hooks/           Smart loop engine (state machine + token monitor)
+  scripts/         Core utilities (state, config, token math, capability discovery)
+  templates/       Output file templates (spec, plan, state, summary)
+  references/      Reference docs (token profiles, patterns, heuristics)
+```
+
+The loop engine is a stop-hook state machine:
+
+```
+/forge:execute
+      |
+      v
+  STOP HOOK fires after each Claude response
+      |
+      +---> Read state + frontier + token budget
+      |
+      +---> Route: implement | test | review | debug | next-task | next-frontier
+      |
+      +---> Return next prompt (loop continues)
+      |         or
+      +---> Clean exit (done / budget exhausted / human needed)
+```
+
+## Fully Autonomous Mode
+
+For sessions that may hit context limits:
+
+```bash
+bash scripts/forge-runner.sh
+```
+
+This wrapper auto-restarts Claude after context resets, reads the handoff snapshot from `.forge/.forge-resume.md`, and continues from the exact point of interruption.
+
+## Platform Support
+
+Works on **macOS**, **Linux**, and **Windows (WSL)**. Pure JavaScript (CommonJS) + Bash. No native dependencies.
 
 ## Configuration
 
-Forge stores per-project state in `.forge/` (gitignored by default). Initialize it with `/forge:brainstorm` or the setup script:
-
-```bash
-bash scripts/setup.sh
-```
-
-Key settings in `.forge/config.json`:
+Forge stores per-project state in `.forge/` (gitignored). Key settings:
 
 ```json
 {
@@ -81,89 +172,11 @@ Key settings in `.forge/config.json`:
   "auto_detect_depth": true,
   "max_iterations": 100,
   "token_budget": 500000,
-  "context_reset_threshold": 60,
-  "repos": { ... },
-  "loop": {
-    "circuit_breaker_test_fails": 3,
-    "circuit_breaker_debug_attempts": 3,
-    "single_task_budget_percent": 20
-  }
+  "context_reset_threshold": 60
 }
 ```
 
-See the [design spec](docs/superpowers/specs/2026-03-17-forge-design.md) for the full config schema.
-
-## Architecture
-
-```
-forge/
-├── .claude-plugin/plugin.json     Plugin manifest
-├── commands/                      Slash commands (brainstorm, plan, execute, resume, backprop, status, help)
-│   └── *.md                       Each command is a markdown prompt
-├── skills/                        Procedural workflows
-│   ├── brainstorming/             Spec generation workflow
-│   ├── planning/                  Task decomposition + DAG
-│   ├── executing/                 Autonomous implementation
-│   ├── backpropagation/           Bug-to-spec tracing
-│   └── reviewing/                 Claude-on-Claude review
-├── agents/                        Specialized subagents
-│   ├── forge-speccer.md           Writes specs from brainstorm output
-│   ├── forge-planner.md           Decomposes specs into tasks
-│   ├── forge-executor.md          Implements tasks (TDD)
-│   ├── forge-reviewer.md          Reviews code against spec
-│   ├── forge-verifier.md          Goal-backward phase verification
-│   └── forge-complexity.md        Recommends depth level
-├── hooks/
-│   ├── hooks.json                 Hook registration
-│   ├── stop-hook.sh               Smart loop engine (state machine)
-│   └── token-monitor.sh           Token usage + context monitoring
-├── scripts/
-│   ├── forge-tools.cjs            Core utility (state, config, token math, capability discovery)
-│   └── setup.sh                   Initialize .forge/ in a project
-├── templates/                     Output file templates (spec, plan, state, summary)
-└── references/                    Reference docs (token profiles, patterns, heuristics)
-```
-
-**How the loop works:**
-
-```
-User runs /forge:execute
-        │
-        v
-  ┌─────────────────────────────────────────┐
-  │  STOP HOOK (fires after each response)  │
-  │                                         │
-  │  1. Read state + frontier + budget      │
-  │  2. Route via state machine             │
-  │  3. Return next prompt OR allow exit    │
-  └─────────────────────────────────────────┘
-        │                         │
-   ┌────┘                         └────┐
-   v                                   v
- "block" + next prompt            clean exit
- (loop continues)                 (done / budget / human needed)
-```
-
-## Fully Autonomous Mode
-
-For long-running sessions that may hit context limits, use the wrapper script:
-
-```bash
-# After /forge:execute, if using full autonomy:
-bash scripts/forge-runner.sh
-```
-
-This script auto-restarts Claude after context resets, reads the handoff snapshot from `.forge/.forge-resume.md`, and continues from the exact point of interruption. It exits when the work is complete or when human intervention is needed.
-
-## Platform Support
-
-| Platform | Status |
-|----------|--------|
-| Windows (WSL) | Primary target |
-| macOS | Supported |
-| Linux | Supported |
-
-No native dependencies. Pure JavaScript (CommonJS) + Bash. No build step, no bundler, no `npm install`.
+See the [design spec](docs/superpowers/specs/2026-03-17-forge-design.md) for the full schema.
 
 ## Contributing
 
@@ -171,7 +184,7 @@ No native dependencies. Pure JavaScript (CommonJS) + Bash. No build step, no bun
 2. Create a feature branch (`git checkout -b feat/your-feature`)
 3. Make your changes
 4. Run tests: `node --test tests/`
-5. Commit with a descriptive message (`feat: add X` / `fix: resolve Y`)
+5. Commit with a descriptive message
 6. Open a pull request
 
 ## License
