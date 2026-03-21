@@ -9,6 +9,9 @@ tokens_budget: 500000
 depth: standard
 autonomy: gated
 handoff_requested: false
+review_iterations: 0
+debug_attempts: 0
+blocked_reason: null
 ---
 
 ## What's Done

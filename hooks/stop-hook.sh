@@ -9,6 +9,8 @@ FORGE_DIR=".forge"
 LOOP_FILE="${FORGE_DIR}/.forge-loop.json"
 STATE_FILE="${FORGE_DIR}/state.md"
 TOOLS_CJS="${PLUGIN_ROOT}/scripts/forge-tools.cjs"
+# Fix #3: Log errors to debug file instead of /dev/null
+DEBUG_LOG="${FORGE_DIR}/.forge-debug.log"
 
 # Read hook input from stdin
 INPUT=$(cat)
@@ -56,18 +58,27 @@ if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
   " 2>/dev/null || echo "")
 
   if echo "$LAST_OUTPUT" | grep -qF "<promise>${COMPLETION_PROMISE}</promise>"; then
+    # Fix #9: Generate summary on completion before exiting
+    node "$TOOLS_CJS" summary --forge-dir "$FORGE_DIR" 2>>"$DEBUG_LOG" || true
     rm -f "$LOOP_FILE"
     exit 0
   fi
 fi
 
 # === ROUTING DECISION ===
-# Call forge-tools.cjs for the smart routing
+# Fix #3: Log stderr to debug file instead of swallowing it.
+# If forge-tools.cjs crashes, the error is preserved for diagnosis
+# instead of silently allowing exit with no error message.
 NEXT_PROMPT=$(node "$TOOLS_CJS" route \
   --forge-dir "$FORGE_DIR" \
   --iteration "$ITERATION" \
   --transcript "$TRANSCRIPT_PATH" \
-  2>/dev/null || echo "")
+  2>>"$DEBUG_LOG") || {
+    ROUTE_EXIT=$?
+    echo "[$(date -Iseconds)] Route failed with exit code $ROUTE_EXIT" >> "$DEBUG_LOG"
+    echo '{"decision":"block","reason":"[Forge] Routing error — check .forge/.forge-debug.log for details. The route script crashed. Run `cat .forge/.forge-debug.log` to see the error, then fix and /forge resume."}'
+    exit 0
+  }
 
 if [ -z "$NEXT_PROMPT" ]; then
   # No routing decision — allow exit

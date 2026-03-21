@@ -9,7 +9,7 @@
     {
       "name": "forge",
       "description": "Autonomous spec-driven development loop for Claude Code. Three commands: brainstorm, plan, execute.",
-      "source": ".",
+      "source": "./",
       "category": "development"
     }
   ]

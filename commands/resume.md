@@ -41,9 +41,11 @@ Read the following files to fully restore execution context:
 
 3. **`.forge/capabilities.json`** — Available MCP servers, skills, and plugins that can enhance execution.
 
-4. **The relevant frontier file from `.forge/plans/`** — Find the frontier file matching the current spec (e.g., `.forge/plans/{spec-domain}-frontier.md`). This contains the task DAG with tiers, dependencies, estimates, and completion status.
+4. **`.forge/task-status.json`** — Programmatic task completion registry. This is the authoritative source for which tasks are complete — more reliable than parsing the markdown in state.md.
 
-5. **The current spec from `.forge/specs/`** — Read `spec-{domain}.md` for the acceptance criteria of what you are implementing.
+5. **The relevant frontier file from `.forge/plans/`** — Find the frontier file matching the current spec (e.g., `.forge/plans/{spec-domain}-frontier.md`). This contains the task DAG with tiers, dependencies, estimates, and completion status.
+
+6. **The current spec from `.forge/specs/`** — Read `spec-{domain}.md` for the acceptance criteria of what you are implementing.
 
 ## Step 4: Re-activate the execution loop
 
@@ -82,8 +84,9 @@ You are now back in the Forge execution loop. Pick up exactly where you left off
 
 After each task completion:
 1. Commit the work with a descriptive message
-2. Update `.forge/state.md` — mark the task done, advance to the next task
-3. Continue to the next unblocked task in the frontier
+2. Update `.forge/task-status.json` — mark the task complete with the commit hash
+3. Update `.forge/state.md` — mark the task done, advance to the next task
+4. Continue to the next unblocked task in the frontier
 
 When all specs are implemented and verified, output the completion promise:
 

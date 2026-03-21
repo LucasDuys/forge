@@ -10,7 +10,8 @@ Read the following files and present a concise status report:
 1. Read `.forge/state.md` — current phase, spec, task, iteration
 2. Read `.forge/token-ledger.json` — token usage vs budget
 3. Read `.forge/config.json` — autonomy mode, depth setting
-4. Read `.forge/capabilities.json` — discovered MCP servers and skills (if exists)
+4. Read `.forge/task-status.json` — task completion registry (if exists)
+5. Read `.forge/capabilities.json` — discovered MCP servers and skills (if exists)
 
 Present the status in this format:
 
@@ -22,6 +23,7 @@ Spec:      {{spec}}
 Task:      {{current_task}} ({{task_status}})
 Iteration: {{iteration}}
 
+Tasks:     {{completed}}/{{total}} complete, {{blocked}} blocked
 Tokens:    {{used}} / {{budget}} ({{percent}}%)
 Depth:     {{depth}}
 Autonomy:  {{autonomy}}
@@ -32,3 +34,7 @@ Capabilities: {{count}} MCP servers, {{count}} skills
 If `.forge/` does not exist, say: "Forge not initialized. Run `/forge brainstorm` to get started."
 
 If `.forge/.forge-loop.json` exists, add: "Loop active (iteration {{N}}/{{max}})"
+
+If `.forge/.forge-debug.log` exists and is non-empty, add: "Debug log has entries — run `cat .forge/.forge-debug.log` to inspect"
+
+If `blocked_reason` is set in state.md, show: "Blocked: {{blocked_reason}}"

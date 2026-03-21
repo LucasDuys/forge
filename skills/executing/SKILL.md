@@ -112,23 +112,27 @@ Once the task passes tests and review (or review is skipped for quick depth):
    Example: `feat: add user registration endpoint (T003, R001)`
 3. **Commit** in the correct repo (if multi-repo, commit in the repo the task targets).
 
-### Step 8: Update State to Complete
+### Step 8: Update State and Task Registry
 
 After committing:
 
-1. Set `task_status: complete` in `.forge/state.md` frontmatter.
-2. Move the task from "In-Flight Work" to "What's Done" with the commit hash:
+1. **Update the task registry** (`.forge/task-status.json`) — this is the authoritative source for task completion. Either:
+   - Run: `node <plugin-root>/scripts/forge-tools.cjs mark-complete --forge-dir .forge --task T003 --commit abc1234`
+   - Or directly edit `.forge/task-status.json` to set the task's status to `"complete"` with the commit hash.
+
+2. Set `task_status: complete` in `.forge/state.md` frontmatter.
+3. Move the task from "In-Flight Work" to "What's Done" with the commit hash:
    ```
    ## What's Done
    - T003: Registration endpoint + tests (complete, committed abc1234)
    ```
-3. Clear the "In-Flight Work" section.
-4. Update "What's Next" to reflect remaining tasks.
-5. Increment `iteration` in the frontmatter.
-6. Update `tokens_used` if you can estimate it (optional — the stop hook also tracks this).
+4. Clear the "In-Flight Work" section.
+5. Update "What's Next" to reflect remaining tasks.
+6. Increment `iteration` in the frontmatter.
 
 The stop hook will then pick up the updated state and either:
 - Feed the next task prompt (full/gated autonomy within a spec)
+- Dispatch multiple same-tier tasks in parallel (if available)
 - Allow exit for human review (supervised autonomy, or gated between specs)
 - Trigger phase verification (if all tasks for the current spec are done)
 
@@ -180,10 +184,23 @@ If `.forge/capabilities.json` lists available tools, use them when relevant:
 
 Do not fail if a capability is listed but unavailable at runtime — fall back to manual approaches.
 
+## Parallel Task Execution
+
+When the stop hook detects multiple unblocked tasks in the same tier, it will instruct you to dispatch them in parallel:
+
+1. **You implement the first task** yourself (following the normal procedure above).
+2. **Dispatch remaining same-tier tasks** as independent subagents using the `Agent` tool with `isolation: "worktree"`.
+3. Each agent receives the spec path, task ID, and depth level.
+4. After all agents complete, **update both** `.forge/state.md` and `.forge/task-status.json` with the results from each agent.
+5. Merge worktree changes if agents made commits in isolated worktrees.
+
+This only applies when the stop hook explicitly instructs parallel execution. Do not attempt parallel dispatch on your own — let the hook decide based on the frontier tier structure.
+
 ## Key Principles
 
 - **Atomic commits**: One commit per task. Never combine multiple tasks in a single commit.
 - **Spec compliance**: Every acceptance criterion must be satisfied. Do not skip criteria.
 - **No stubs**: Every function must be fully implemented. Stubs trigger verification failures.
-- **State is truth**: Always update `.forge/state.md` after significant progress. If the session resets, state.md is how the next session picks up.
-- **Let the hook drive**: Do not try to manage task-to-task progression yourself. Complete your current task, update state, and let the stop hook decide what comes next.
+- **Registry is truth**: Always update `.forge/task-status.json` after completing a task. This is the programmatic source of truth for task completion — more reliable than markdown parsing.
+- **State for context**: Update `.forge/state.md` for human-readable progress and context preservation across session resets.
+- **Let the hook drive**: Do not try to manage task-to-task progression yourself. Complete your current task, update state and registry, and let the stop hook decide what comes next.
