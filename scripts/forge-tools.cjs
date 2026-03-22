@@ -455,8 +455,9 @@ function discoverCapabilities(projectDir, claudeJsonPath) {
 
   // Check if CLI-Anything plugin is available for on-demand CLI generation
   const cliAnythingPaths = [
-    path.join(home, '.claude', 'plugins', 'cli-anything-plugin'),
     path.join(home, '.claude', 'plugins', 'cli-anything'),
+    path.join(home, '.claude', 'plugins', 'cli-anything-plugin'),
+    path.join(home, '.claude', 'plugins', 'cache', 'cli-anything'),
   ];
   caps.cli_anything_available = cliAnythingPaths.some(p => {
     try { return fs.statSync(p).isDirectory(); } catch { return false; }
