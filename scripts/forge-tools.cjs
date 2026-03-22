@@ -433,6 +433,35 @@ function discoverCapabilities(projectDir, claudeJsonPath) {
     } catch (e) { /* tool not installed — skip */ }
   }
 
+  // Discover CLI-Anything generated CLIs (cli-anything-*)
+  caps.generated_clis = {};
+  try {
+    const pathDirs = (process.env.PATH || '').split(path.delimiter);
+    const seen = new Set();
+    for (const dir of pathDirs) {
+      try {
+        const files = fs.readdirSync(dir);
+        for (const f of files) {
+          const name = f.replace(/\.exe$/i, '');
+          if (name.startsWith('cli-anything-') && !seen.has(name)) {
+            seen.add(name);
+            const app = name.replace('cli-anything-', '');
+            caps.generated_clis[app] = { command: name, use_for: `CLI-Anything generated CLI for ${app}` };
+          }
+        }
+      } catch (e) { /* dir not readable */ }
+    }
+  } catch (e) { /* best-effort */ }
+
+  // Check if CLI-Anything plugin is available for on-demand CLI generation
+  const cliAnythingPaths = [
+    path.join(home, '.claude', 'plugins', 'cli-anything-plugin'),
+    path.join(home, '.claude', 'plugins', 'cli-anything'),
+  ];
+  caps.cli_anything_available = cliAnythingPaths.some(p => {
+    try { return fs.statSync(p).isDirectory(); } catch { return false; }
+  });
+
   return caps;
 }
 

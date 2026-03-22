@@ -60,7 +60,19 @@ Read `.forge/capabilities.json` and check both `mcp_servers` and `cli_tools`. Ad
 | **firebase** | `firebase emulators:start` for local testing, `firebase deploy --only functions` |
 | **docker** | Spin up dependencies (databases, message queues) for integration tests |
 
-If a CLI tool would help with the current task but is not available, proceed without it -- CLI tools enhance but are never required.
+**On-demand CLI generation with CLI-Anything:**
+
+If `.forge/capabilities.json` shows `cli_anything_available: true`, you can generate CLIs for desktop applications on the fly. Check `generated_clis` first -- if the app you need already has a generated CLI, use it directly.
+
+If the task requires interacting with a desktop application (e.g., GIMP for image processing, Blender for 3D rendering, LibreOffice for document conversion, Inkscape for SVG manipulation) and no generated CLI exists:
+
+1. **Evaluate need** -- Is a CLI genuinely better than a library/script for this task? Generating a CLI takes time. Only generate when the task clearly requires programmatic control of a desktop app (not for tasks solvable with standard libraries like Pillow, FFmpeg, or Pandoc).
+2. **Generate** -- Run `/cli-anything <app-name>` (or the equivalent command from the CLI-Anything plugin). This produces a `cli-anything-<app>` binary with `--help` and `--json` support.
+3. **Verify** -- Run `cli-anything-<app> --help` to confirm it installed and inspect available commands.
+4. **Use** -- Call the generated CLI with `--json` for structured output the verifier can check.
+5. **Note in status** -- Report DONE_WITH_CONCERNS if a CLI was generated mid-task, so the planner knows it's now available for future tasks.
+
+If CLI-Anything is not available, or the generation fails, fall back to standard approaches (libraries, scripts, manual commands). CLI tools enhance but are never required.
 
 ### 2. Implement
 

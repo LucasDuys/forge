@@ -141,6 +141,26 @@ List the coverage mapping at the bottom of your output (this will be stripped fr
 - R003 -> T005, T006
 ```
 
+### 7. CLI-Anything Tagging
+
+Check `.forge/capabilities.json` for `cli_anything_available` and `generated_clis`.
+
+If a task requires programmatic control of a desktop application (image editing, 3D rendering, video editing, document conversion, diagram generation, etc.), add a `cli:` tag to the task line:
+
+```
+- [T005] Generate promotional thumbnails | est: ~6k tokens | cli: gimp | depends: T003
+- [T008] Render 3D product preview | est: ~8k tokens | cli: blender | depends: T006
+```
+
+The `cli:` tag tells the executor:
+- If `generated_clis` already has this app: use the existing CLI directly
+- If `cli_anything_available` is true but the CLI doesn't exist: generate it first, then use it
+- If CLI-Anything is not available: fall back to libraries or manual approaches
+
+Only tag tasks where a desktop app CLI is genuinely the best approach. Do not tag tasks that are better served by standard libraries (e.g., use Pillow for simple image resizing, FFmpeg for video transcoding -- these are already CLI tools, not desktop apps).
+
+Common `cli:` targets: `gimp`, `blender`, `inkscape`, `libreoffice`, `audacity`, `kdenlive`, `obs-studio`, `drawio`, `mermaid`.
+
 ## Constraints
 
 - Do NOT include tasks for "set up project" or "install dependencies" unless the spec explicitly requires new infrastructure
