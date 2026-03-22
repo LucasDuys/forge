@@ -43,6 +43,25 @@ Before writing any code:
    - Commit message format
 4. **Scan existing code** for patterns. If implementing a new endpoint, find an existing endpoint and follow its structure exactly. If adding a new component, match the existing component patterns.
 
+### 1.5 Check Available Tools
+
+Read `.forge/capabilities.json` and check both `mcp_servers` and `cli_tools`. Adapt your implementation approach based on what is available:
+
+| Tool | When to use |
+|------|-------------|
+| **gh** | Create branches, check CI status after commits, link PRs to issues |
+| **stripe** | `stripe listen --forward-to` for webhook testing, `stripe trigger` for event simulation, `stripe fixtures` for test data |
+| **vercel** | `vercel deploy --prebuilt` for preview deployments, `vercel env pull` for env vars |
+| **ffmpeg** | Any media processing — transcode, thumbnail generation, format conversion, video/audio rendering |
+| **playwright** | E2E tests against running dev server, screenshot comparisons, accessibility checks |
+| **gws** | Read reference docs from Google Drive, pull spreadsheet data for test fixtures |
+| **notebooklm** | Research unfamiliar APIs with grounded, citation-backed answers before implementing |
+| **supabase** | `supabase db push` for migrations, `supabase functions serve` for local edge function testing |
+| **firebase** | `firebase emulators:start` for local testing, `firebase deploy --only functions` |
+| **docker** | Spin up dependencies (databases, message queues) for integration tests |
+
+If a CLI tool would help with the current task but is not available, proceed without it -- CLI tools enhance but are never required.
+
 ### 2. Implement
 
 #### If depth is `thorough`:

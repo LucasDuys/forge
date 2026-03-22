@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, execSync } = require('child_process');
 
 // === YAML Frontmatter Parser (minimal, no dependencies) ===
 
@@ -409,6 +409,30 @@ function discoverCapabilities(projectDir, claudeJsonPath) {
     }
   } catch (e) { /* best-effort */ }
 
+  // Discover CLI tools available on the system
+  const cliToolChecks = [
+    { name: 'gh', check: 'gh --version', use_for: 'GitHub PR/issue management, CI/CD, and API access' },
+    { name: 'vercel', check: 'vercel --version', use_for: 'deployment, preview URLs, and serverless functions' },
+    { name: 'stripe', check: 'stripe --version', use_for: 'payment testing, webhook simulation, and billing' },
+    { name: 'ffmpeg', check: 'ffmpeg -version', use_for: 'video/audio processing, transcoding, and rendering' },
+    { name: 'playwright', check: 'npx playwright --version', use_for: 'browser automation and E2E testing' },
+    { name: 'gws', check: 'gws --version', use_for: 'Google Workspace — Drive, Gmail, Calendar, Sheets, Docs' },
+    { name: 'notebooklm', check: 'notebooklm --version', use_for: 'research with grounded citations from knowledge bases' },
+    { name: 'supabase', check: 'supabase --version', use_for: 'database, auth, edge functions, and realtime' },
+    { name: 'firebase', check: 'firebase --version', use_for: 'app hosting, auth, Firestore, and cloud functions' },
+    { name: 'docker', check: 'docker --version', use_for: 'container management and isolated environments' },
+    { name: 'wrangler', check: 'wrangler --version', use_for: 'Cloudflare Workers deployment and KV management' },
+  ];
+
+  caps.cli_tools = {};
+  for (const tool of cliToolChecks) {
+    try {
+      const output = execSync(tool.check, { stdio: 'pipe', timeout: 5000 }).toString().trim();
+      const version = output.split('\n')[0].replace(/^[^0-9]*/, '').trim();
+      caps.cli_tools[tool.name] = { available: true, use_for: tool.use_for, version: version || 'unknown' };
+    } catch (e) { /* tool not installed — skip */ }
+  }
+
   return caps;
 }
 
@@ -420,6 +444,18 @@ function inferMcpUse(name) {
     langsmith: 'LLM tracing and prompt management',
     firecrawl: 'web research and documentation scraping',
     grafana: 'observability and monitoring',
+    stripe: 'payment testing, webhook simulation, and billing management',
+    github: 'PR management, issue tracking, and CI/CD workflows',
+    vercel: 'deployment, preview URLs, and serverless function management',
+    notebooklm: 'research with grounded citations from knowledge bases',
+    gws: 'Google Workspace — Drive, Gmail, Calendar, Sheets, Docs access',
+    ffmpeg: 'video/audio processing, transcoding, and media pipelines',
+    'cli-anything': 'agent-native CLI generation for desktop software',
+    supabase: 'database management, auth, edge functions, and realtime',
+    firebase: 'app hosting, auth, Firestore, and cloud functions',
+    slack: 'team messaging, channel management, and notifications',
+    linear: 'issue tracking, project management, and sprint workflows',
+    figma: 'design inspection, asset export, and design-to-code',
   };
   const lower = name.toLowerCase();
   for (const [key, use] of Object.entries(map)) {

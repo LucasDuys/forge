@@ -88,6 +88,39 @@ Is the artifact connected to the rest of the system?
 
 A fully implemented module that is never imported or used is effectively dead code. It does not satisfy the spec.
 
+#### Level 4: Runtime (if CLI tools available)
+
+Check `.forge/capabilities.json` for `cli_tools`. If relevant tools are available, perform runtime verification to confirm the code actually works, not just that it exists and is wired:
+
+**If Playwright is available and the spec involves UI:**
+1. Start the dev server (`npm run dev` or equivalent from repo conventions)
+2. Run key user flows via Playwright (`npx playwright test` or targeted commands)
+3. Verify observable behavior matches acceptance criteria (page loads, forms submit, data displays)
+4. Take screenshots as evidence if verification passes
+
+**If Stripe CLI is available and spec involves payments:**
+1. Start `stripe listen --forward-to localhost:{port}/webhooks` in background
+2. Trigger relevant test events via `stripe trigger {event_type}` (e.g., `invoice.paid`, `checkout.session.completed`)
+3. Verify webhook handlers respond correctly (check logs, database state)
+
+**If Vercel CLI is available and spec involves deployment:**
+1. Run `vercel deploy --prebuilt` or `vercel` for preview deployment
+2. Verify the preview URL returns expected responses
+3. Check serverless function endpoints respond correctly
+
+**If FFmpeg is available and spec involves media:**
+1. Verify output files exist and have correct format (`ffprobe` for metadata inspection)
+2. Check duration, resolution, codec match acceptance criteria
+3. Generate thumbnail/preview to confirm media integrity
+
+**If gh CLI is available:**
+1. Verify CI checks pass on the committed code (`gh run list`)
+2. Check that any referenced issues are properly linked
+
+Level 4 failures are always **CRITICAL** — if runtime behavior does not match the spec, the implementation is broken regardless of how clean the code looks.
+
+If no CLI tools are available, skip Level 4 entirely. It is an enhancement, not a requirement.
+
 ### Step 3: Cross-Component Verification
 
 For multi-component or multi-repo specs, verify the integration points:

@@ -80,6 +80,21 @@ When the user runs `--from-docs PATH`:
 - Map document sections to R-numbered requirements
 - Flag any ambiguous or contradictory requirements for user clarification
 
+## Capability-Aware Spec Writing
+
+When `.forge/capabilities.json` is available, read it before writing specs. Available CLI tools should inform how you write acceptance criteria -- making them more concrete and verifiable:
+
+| Available Tool | How it shapes acceptance criteria |
+|---------------|----------------------------------|
+| **playwright** | Write E2E-verifiable criteria: "User can navigate to /dashboard and see their project list" instead of "Dashboard shows projects" |
+| **stripe** | Write payment-testable criteria: "Webhook handler processes `invoice.paid` event and updates subscription status to active" instead of "Handle payment webhooks" |
+| **ffmpeg** | Write media-verifiable criteria: "Output video is 1080p H.264 at 30fps with AAC audio" instead of "Generate video output" |
+| **vercel** | Write deployment-verifiable criteria: "Preview deployment returns 200 on / and /api/health" instead of "App deploys correctly" |
+| **gh** | Write CI-verifiable criteria: "All GitHub Actions checks pass on the feature branch" |
+| **gws** | Reference Google Docs/Sheets as data sources in criteria when relevant |
+
+This does NOT mean every spec needs CLI tools. Only incorporate them when they make criteria more testable. The spec must remain tool-agnostic in its requirements -- tools affect how you phrase verification, not what you require.
+
 ## Quality Checks Before Finishing
 
 Before presenting the final spec, verify:
