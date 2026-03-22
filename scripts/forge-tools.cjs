@@ -417,7 +417,7 @@ function discoverCapabilities(projectDir, claudeJsonPath) {
     { name: 'ffmpeg', check: 'ffmpeg -version', use_for: 'video/audio processing, transcoding, and rendering' },
     { name: 'playwright', check: 'npx playwright --version', use_for: 'browser automation and E2E testing' },
     { name: 'gws', check: 'gws --version', use_for: 'Google Workspace — Drive, Gmail, Calendar, Sheets, Docs' },
-    { name: 'notebooklm', check: 'notebooklm --version', use_for: 'research with grounded citations from knowledge bases' },
+    { name: 'notebooklm', check: 'python -m notebooklm --version', use_for: 'research with grounded citations from knowledge bases' },
     { name: 'supabase', check: 'supabase --version', use_for: 'database, auth, edge functions, and realtime' },
     { name: 'firebase', check: 'firebase --version', use_for: 'app hosting, auth, Firestore, and cloud functions' },
     { name: 'docker', check: 'docker --version', use_for: 'container management and isolated environments' },

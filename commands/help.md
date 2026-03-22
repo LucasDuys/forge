@@ -29,6 +29,8 @@ Display the following help text to the user:
 
 **`/forge status`** — Show current progress and budget
 
+**`/forge setup-tools`** — Detect and install CLI tools that enhance Forge
+
 **`/forge help`** — Show this help text
 
 ## Quick Start
