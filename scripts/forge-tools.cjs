@@ -1024,22 +1024,14 @@ function advanceToNextTask(tasks, state, forgeDir, currentSpec, overrideMessage)
   const unblockedTasks = findAllUnblockedTasks(tasks, forgeDir);
 
   if (unblockedTasks.length === 0) {
-    // All tasks done — route to holistic branch review before verification
-    const depth = state.data.depth || config.depth || 'standard';
-    if (depth !== 'quick') {
-      state.data.phase = 'reviewing_branch';
-    } else {
-      state.data.phase = 'verifying';
-    }
+    // All tasks done — always route to holistic branch review before verification
+    state.data.phase = 'reviewing_branch';
     state.data.current_task = null;
     state.data.task_status = null;
     state.data.review_iterations = 0;
     writeState(forgeDir, state.data, state.content);
     const prefix = overrideMessage ? overrideMessage + '\n\n' : '';
-    if (depth !== 'quick') {
-      return `${prefix}All tasks complete. Before phase verification, run a holistic branch review to catch cross-task integration issues, blast radius problems, and convention drift. Commit your work first, then run the branch review.`;
-    }
-    return `${prefix}All tasks complete. Commit your work, then verify all spec requirements are met. Read .forge/specs/ and check every acceptance criterion. Report PASSED or GAPS_FOUND.`;
+    return `${prefix}All tasks complete. Before phase verification, run a holistic branch review to catch cross-task integration issues, blast radius problems, and convention drift. Commit your work first, then run the branch review.`;
   }
 
   // Supervised mode: pause after every task for human review
