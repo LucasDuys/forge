@@ -79,13 +79,18 @@ That's it. Forge handles the rest.
 | Capability | What it does |
 |---|---|
 | **Spec generation** | Interactive brainstorm session produces a formal spec with numbered requirements and acceptance criteria |
-| **Task decomposition** | Specs are broken into an ordered dependency DAG with parallel frontiers |
+| **Task decomposition** | Specs are broken into an ordered dependency DAG with parallel frontiers and CLI-Anything tagging |
+| **Research before code** | forge-researcher agent queries official docs, academic papers, and codebase conventions before implementation |
 | **Autonomous execution** | Three-layer loop (phase / task / quality) runs implement-test-review-fix cycles without intervention |
 | **Adaptive depth** | Auto-detects complexity: `quick` (3-5 tasks), `standard` (6-12), `thorough` (12-20 with TDD + review on every task) |
+| **Blast radius analysis** | Reviewer checks all dependents of modified files for breaking changes before approving |
+| **Legacy code safe** | Auto-detects conventions from existing code (imports, naming, error handling, tests) -- matches patterns, not just CLAUDE.md |
 | **Context survival** | Monitors context usage, saves handoff snapshots at 60%, resumes cleanly in a new session |
 | **Self-correction** | Circuit breakers catch loops: 3 test fails triggers debug mode, 3 debug attempts escalates to you |
+| **Runtime verification** | 4-level goal-backward verification: existence, substantive, wired, and runtime (Playwright, Stripe, Vercel) |
 | **Backpropagation** | Traces runtime bugs back to spec gaps, updates specs, generates regression tests |
-| **Capability discovery** | Detects your MCP servers, plugins, and skills at startup and routes work through them |
+| **CLI tool ecosystem** | Auto-discovers 11+ CLI tools (gh, stripe, ffmpeg, vercel, gws, etc.) and adapts execution accordingly |
+| **CLI-Anything** | On-demand desktop app CLI generation (GIMP, Blender, LibreOffice) -- planner tags tasks, executor generates and uses |
 
 ## Commands
 
@@ -97,6 +102,7 @@ That's it. Forge handles the rest.
 | `/forge:resume` | Continue after context reset or interruption | -- |
 | `/forge:backprop [desc]` | Trace a bug back to a spec gap | `--from-test path/` |
 | `/forge:status` | Show current progress, budget, blockers | -- |
+| `/forge:setup-tools` | Detect and install CLI tools that enhance Forge | -- |
 
 ## Autonomy Levels
 
@@ -123,7 +129,7 @@ Choose how much control you want:
 forge/
   commands/        Slash commands (brainstorm, plan, execute, resume, backprop, status)
   skills/          Procedural workflows (brainstorming, planning, executing, reviewing)
-  agents/          Specialized subagents (speccer, planner, executor, reviewer, verifier)
+  agents/          Specialized subagents (speccer, planner, executor, reviewer, verifier, researcher, complexity)
   hooks/           Smart loop engine (state machine + token monitor)
   scripts/         Core utilities (state, config, token math, capability discovery)
   templates/       Output file templates (spec, plan, state, summary)
@@ -146,6 +152,83 @@ The loop engine is a stop-hook state machine:
       |         or
       +---> Clean exit (done / budget exhausted / human needed)
 ```
+
+## Enterprise & Legacy Codebase Support
+
+Forge is designed to be safe for large enterprise codebases with legacy code and many contributors.
+
+### Convention Inference
+
+When `CLAUDE.md` is missing or incomplete, the executor auto-detects conventions from existing code:
+
+- **Import style**: scans for `import` vs `require()` patterns
+- **Naming**: detects camelCase vs snake_case for variables, PascalCase vs kebab-case for files
+- **Error handling**: identifies custom error classes, catch patterns, error response shapes
+- **Test framework**: detects jest/mocha/vitest/pytest and test file locations
+- **File organization**: reads directory structure and follows it
+
+**Critical rule:** For legacy codebases, Forge matches existing conventions even if they differ from modern best practices. Consistency within a codebase takes priority over modernity.
+
+### Blast Radius Analysis
+
+The reviewer (Step 2.5) runs dependency impact analysis before approving any task:
+
+1. Finds all files that import from modified modules
+2. Checks for breaking changes in exported signatures
+3. Verifies dependent tests still pass
+4. Flags untested downstream modules
+5. Respects CODEOWNERS for domain-specific review routing
+
+### Research Before Implementation
+
+The `forge-researcher` agent investigates best practices before the executor writes code:
+
+- Queries official framework/library documentation (via Context7 MCP)
+- Searches academic papers (Semantic Scholar, arXiv MCP servers)
+- Scans existing codebase for established patterns
+- Ranks sources by credibility (peer-reviewed > vendor docs > community)
+- Produces a structured research report with citations
+
+Mandatory for security-sensitive and `thorough` depth tasks. Optional for simple tasks.
+
+## CLI Tool Ecosystem
+
+Forge auto-discovers CLI tools on your system and adapts its execution accordingly. Run `/forge:setup-tools` to see what's available and install what's missing.
+
+| Tool | What Forge Uses It For |
+|------|----------------------|
+| `gh` | PR creation, issue linking, CI status checks |
+| `playwright` | E2E browser testing, runtime verification |
+| `stripe` | Payment webhook testing, event simulation |
+| `ffmpeg` | Video/audio processing, media verification |
+| `vercel` | Preview deployments, serverless function testing |
+| `gws` | Google Workspace access (Drive, Gmail, Sheets) |
+| `notebooklm` | Research with grounded, citation-backed answers |
+| `supabase` | Database migrations, edge function testing |
+| `firebase` | Emulator testing, cloud function deployment |
+| `docker` | Containerized dependencies for integration tests |
+
+### CLI-Anything Integration
+
+Forge can generate CLIs for desktop applications on the fly via [CLI-Anything](https://github.com/HKUDS/CLI-Anything):
+
+1. The **planner** tags tasks that need desktop app control: `cli: gimp`, `cli: blender`
+2. The **executor** checks if the CLI exists; if not, generates it automatically
+3. Generated CLIs persist on PATH for reuse by future tasks
+
+Supported apps: GIMP, Blender, Inkscape, LibreOffice, Audacity, Kdenlive, OBS Studio, and more.
+
+## Agents
+
+| Agent | Role |
+|-------|------|
+| **forge-speccer** | Writes R-numbered specs with testable acceptance criteria from brainstorm output |
+| **forge-planner** | Decomposes specs into dependency DAGs with parallel tiers and token estimates |
+| **forge-executor** | Implements tasks with TDD/standard/quick depth, convention inference, and targeted tests |
+| **forge-researcher** | Multi-source research (docs, papers, codebase) before implementation |
+| **forge-reviewer** | Two-pass review (spec compliance + quality) with blast radius analysis |
+| **forge-verifier** | Four-level goal-backward verification: existence, substantive, wired, runtime |
+| **forge-complexity** | Auto-scores task complexity and recommends depth level |
 
 ## Fully Autonomous Mode
 
