@@ -868,6 +868,36 @@ If the issue is not a spec gap (infrastructure, environment, dependency):
       return advanceToNextTask(tasks, state, forgeDir, currentSpec);
     }
 
+    case 'reviewing_branch': {
+      // Holistic branch review runs after all tasks complete, before phase verification.
+      // This catches cross-task integration issues, blast radius problems, and
+      // convention drift that per-task reviews miss.
+      const baseBranch = config.repos?.[Object.keys(config.repos || {})[0]]?.base_branch || 'main';
+      const currentSpec = state.data.spec || 'unknown';
+      const reviewDepth = state.data.depth || config.depth || 'standard';
+
+      state.data.phase = 'verifying';
+      writeState(forgeDir, state.data, state.content);
+
+      return `All tasks for spec "${currentSpec}" are complete. Before phase verification, run a holistic branch review.
+
+Use /forge review-branch with:
+- --base ${baseBranch}
+- --spec .forge/specs/spec-${currentSpec}.md
+- --depth ${reviewDepth}
+
+This reviews the ENTIRE branch diff (not commit-by-commit) for:
+1. Blast radius: check all dependents of modified files for breaking changes
+2. Convention compliance: verify new code matches existing codebase patterns
+3. Spec coverage: every acceptance criterion in the spec is met
+4. Cross-task integration: components from different tasks are properly wired
+
+If CRITICAL issues are found, fix them before verification proceeds.
+If the review passes, proceed to phase verification.
+
+After review, update .forge/state.md phase to "verifying".`;
+    }
+
     case 'verifying': {
       // Autonomy mode: gated pauses between specs/phases
       const effectiveAutonomy = state.data.autonomy || config.autonomy;
@@ -994,13 +1024,21 @@ function advanceToNextTask(tasks, state, forgeDir, currentSpec, overrideMessage)
   const unblockedTasks = findAllUnblockedTasks(tasks, forgeDir);
 
   if (unblockedTasks.length === 0) {
-    // All tasks done — move to verification
-    state.data.phase = 'verifying';
+    // All tasks done — route to holistic branch review before verification
+    const depth = state.data.depth || config.depth || 'standard';
+    if (depth !== 'quick') {
+      state.data.phase = 'reviewing_branch';
+    } else {
+      state.data.phase = 'verifying';
+    }
     state.data.current_task = null;
     state.data.task_status = null;
     state.data.review_iterations = 0;
     writeState(forgeDir, state.data, state.content);
     const prefix = overrideMessage ? overrideMessage + '\n\n' : '';
+    if (depth !== 'quick') {
+      return `${prefix}All tasks complete. Before phase verification, run a holistic branch review to catch cross-task integration issues, blast radius problems, and convention drift. Commit your work first, then run the branch review.`;
+    }
     return `${prefix}All tasks complete. Commit your work, then verify all spec requirements are met. Read .forge/specs/ and check every acceptance criterion. Report PASSED or GAPS_FOUND.`;
   }
 

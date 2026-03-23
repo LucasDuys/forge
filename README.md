@@ -102,6 +102,7 @@ That's it. Forge handles the rest.
 | `/forge:resume` | Continue after context reset or interruption | -- |
 | `/forge:backprop [desc]` | Trace a bug back to a spec gap | `--from-test path/` |
 | `/forge:status` | Show current progress, budget, blockers | -- |
+| `/forge:review-branch` | Review an unmerged branch before merging | `--base main`, `--spec path/`, `--fix`, `--comment` |
 | `/forge:setup-tools` | Detect and install CLI tools that enhance Forge | -- |
 
 ## Autonomy Levels
@@ -178,6 +179,29 @@ The reviewer (Step 2.5) runs dependency impact analysis before approving any tas
 3. Verifies dependent tests still pass
 4. Flags untested downstream modules
 5. Respects CODEOWNERS for domain-specific review routing
+
+### Branch Review (Pre-Merge Verification)
+
+Review existing branches before merging -- works both standalone and inside the execution loop:
+
+```bash
+# Standalone: review your current branch against main
+/forge:review-branch --base main
+
+# With spec compliance check
+/forge:review-branch --base main --spec .forge/specs/spec-auth.md
+
+# Auto-fix critical issues and post to PR
+/forge:review-branch --base main --fix --comment
+```
+
+Dispatches 4 parallel review agents (following Anthropic's multi-agent code review architecture):
+1. **Spec compliance** -- verifies every acceptance criterion is met
+2. **Blast radius** -- checks all dependents of modified files for breaking changes
+3. **Convention & quality** -- validates code matches existing codebase patterns
+4. **Research validation** (thorough depth) -- verifies approaches against official docs
+
+**Inside the execution loop:** Automatically runs after all tasks in a spec complete, before phase verification. Catches cross-task integration issues that per-task reviews miss.
 
 ### Research Before Implementation
 
