@@ -486,6 +486,9 @@ function inferMcpUse(name) {
     slack: 'team messaging, channel management, and notifications',
     linear: 'issue tracking, project management, and sprint workflows',
     figma: 'design inspection, asset export, and design-to-code',
+    'semantic-scholar': 'academic paper search, citations, and research discovery',
+    arxiv: 'academic pre-print search, download, and analysis',
+    rfc: 'IETF RFC document retrieval and search',
   };
   const lower = name.toLowerCase();
   for (const [key, use] of Object.entries(map)) {

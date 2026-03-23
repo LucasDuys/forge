@@ -35,15 +35,51 @@ Before writing any code:
 
 1. **Read the spec** for the R-numbered requirements this task covers. Extract the exact acceptance criteria checkboxes.
 2. **Read the frontier** to understand dependencies — what prior tasks produced, what files they created or modified.
-3. **Read repo conventions** — find CLAUDE.md, .editorconfig, linting config, test config. Note:
-   - Import style (relative vs. absolute, CommonJS vs. ESM)
-   - Naming conventions (camelCase, snake_case, BEM for CSS)
-   - Error handling patterns (custom error classes, error codes)
-   - Test framework and test file location conventions
-   - Commit message format
-4. **Scan existing code** for patterns. If implementing a new endpoint, find an existing endpoint and follow its structure exactly. If adding a new component, match the existing component patterns.
+3. **Read repo conventions** — find CLAUDE.md, .editorconfig, linting config, test config.
+4. **Auto-detect conventions** (critical for legacy codebases). Even if CLAUDE.md exists, verify it matches reality. If CLAUDE.md is absent, this step is mandatory:
 
-### 1.5 Check Available Tools
+   **Import style**: grep for `import.*from` vs `require(` in 10 recent src/ files. Use whichever is dominant.
+   **Naming**: Sample 5-10 files. Check variables (camelCase vs snake_case), files (kebab-case vs PascalCase), constants (UPPER_CASE vs camelCase).
+   **Error handling**: grep for `throw new`, custom error classes, `catch` patterns. Follow the existing approach.
+   **Test location**: Find test files -- check for `__tests__/`, `.test.ts`, `.spec.ts`, `tests/` directory. Match the existing pattern.
+   **Test framework**: Read test imports -- jest, mocha, vitest, pytest. Never switch frameworks mid-project.
+   **File organization**: Run `ls src/` to understand structure. Models together? Co-located with routes? Follow it.
+
+   **Critical rule for legacy code:** If the codebase uses patterns that differ from modern best practices (callbacks instead of async/await, var instead of const, jQuery instead of React), **follow the existing conventions**. Consistency within a codebase is more important than modernity. Only modernize if the spec explicitly requires it. Document any convention conflicts in state.md under "Key Decisions."
+
+5. **Scan existing code** for patterns. If implementing a new endpoint, find an existing endpoint and follow its structure exactly. If adding a new component, match the existing component patterns.
+
+### 1.6 Research Before Implementing (complex/unfamiliar tasks)
+
+For tasks involving unfamiliar technology, security-sensitive code, or integration with external services, dispatch the **forge-researcher** agent before writing code:
+
+```
+Dispatch forge-researcher with:
+- Task description and acceptance criteria
+- Tech stack and frameworks from codebase scan
+- Available MCP servers (Context7, Semantic Scholar, arXiv if configured)
+```
+
+The researcher returns a structured report with:
+- Official documentation findings (highest trust)
+- Established best practice patterns
+- Codebase convention analysis
+- Security considerations
+- Recommended approach with citations
+
+**When to skip research:**
+- Simple CRUD in a familiar framework
+- Test-only or documentation tasks
+- Tasks where the spec provides explicit implementation guidance
+- Quick depth (research adds overhead inappropriate for quick tasks)
+
+**When research is mandatory:**
+- Security-sensitive code (auth, crypto, payments, user data)
+- Depth is `thorough`
+- Task involves technology not previously used in the codebase
+- Task touches shared infrastructure (databases, message queues, caching)
+
+### 1.7 Check Available Tools
 
 Read `.forge/capabilities.json` and check both `mcp_servers` and `cli_tools`. Adapt your implementation approach based on what is available:
 
@@ -111,8 +147,46 @@ Before declaring the task done, verify:
 - [ ] **No stubs** — every function has a real implementation, no `// TODO`, no `throw new Error('not implemented')`
 - [ ] **No over-engineering** — only what the spec requires, nothing more
 - [ ] **Conventions followed** — matches the repo's existing patterns for naming, imports, error handling, file structure
-- [ ] **Tests pass** — all tests (new and existing) pass
+- [ ] **Tests pass** — targeted tests and full suite both pass (see test strategy below)
 - [ ] **No unintended side effects** — changes are scoped to this task only
+- [ ] **No downstream breakage** — dependents of modified files still work (see dependency check below)
+
+### 3.5 Targeted Test Strategy
+
+For fast feedback during implementation, use a two-phase test approach:
+
+**Phase 1 (fast -- during implementation loop):**
+Run only tests that import from your modified files:
+```
+grep -r "from.*{your-module}" {test-dir}/ -> find related test files
+Run only those test files
+```
+For JavaScript: `jest --findRelatedTests {changed-files}`
+For Python: `pytest {related-test-files}`
+
+**Phase 2 (comprehensive -- before committing):**
+Run the full test suite to catch regressions in untested dependency chains:
+```
+npm test    (or equivalent full suite command)
+```
+
+If Phase 1 passes but Phase 2 fails, the failure is in a dependent module -- investigate the dependency, do not blindly fix code outside your task scope. Report as DONE_WITH_CONCERNS if the failure is in unrelated code.
+
+### 3.6 Dependency Impact Verification
+
+Before committing, verify you haven't broken dependents of files you modified:
+
+1. For each file you modified that exports functions/classes/types:
+   ```
+   grep -r "import.*from.*{modified-file}" src/
+   grep -r "require.*{modified-file}" src/
+   ```
+2. For each dependent found:
+   - Check if the import still resolves (no removed/renamed exports)
+   - If the dependent has tests, verify they pass
+   - If no tests exist for a dependent that uses a changed export, flag it in your status report
+3. If you changed a function signature (parameters, return type), check ALL callers match the new signature
+4. Document downstream impact in commit message: "No downstream impact" or "Dependents verified: {file1}, {file2}"
 
 ### 4. Commit
 

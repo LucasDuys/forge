@@ -41,9 +41,55 @@ Flag these problems:
 - **Wrong implementation**: Code does something different from what the criterion specifies.
 - **Over-engineering**: Code implements features, fields, endpoints, or logic not required by the spec. This is wasteful and introduces unnecessary maintenance burden. Flag it.
 
+### Step 2.5: Blast Radius Analysis
+
+Before reviewing code quality, verify that changes do not break code outside the task's scope. This is critical for enterprise codebases where 100+ developers depend on shared modules.
+
+**For each file modified that exports functions, classes, types, or constants:**
+
+1. **Find all dependents:**
+   ```
+   grep -r "from.*{modified-file}" src/ --include="*.{js,ts,jsx,tsx,py}"
+   grep -r "require.*{modified-file}" src/ --include="*.{js,ts,jsx,tsx}"
+   ```
+
+2. **Check for breaking changes in exports:**
+   - Did any exported function signature change? (parameters added, removed, reordered, or type changed)
+   - Did any exported type, interface, or class shape change?
+   - Did the return type or return shape of any public function change?
+   - Was any previously-exported symbol removed or renamed?
+
+3. **Verify dependents still work:**
+   - For each dependent file found, check if it uses the changed export correctly
+   - If the dependent has tests, note whether those tests should be re-run
+   - If no tests exist for a dependent that uses a changed export: flag as IMPORTANT
+
+4. **Flag blast radius issues:**
+   - **CRITICAL**: Exported function signature changed in a way that breaks existing callers
+   - **CRITICAL**: Previously-exported symbol removed without updating all import sites
+   - **IMPORTANT**: Public API behavior changed in a way that could surprise downstream callers (even if signature is unchanged)
+   - **IMPORTANT**: Modified shared utility has no tests for dependent modules
+
+**Enterprise-specific checks:**
+- If a CODEOWNERS file exists, check if modified files fall under a different owner than the task's scope -- flag for domain owner review
+- If the codebase uses contract tests (Pact, Specmatic), verify contracts are not violated
+- If modified files are in a shared library or utils directory, increase scrutiny -- these have the widest blast radius
+
+**Output format (add to ISSUES section):**
+```
+BLAST RADIUS:
+- Dependents of {file}: {count} files
+  - {dependent1}: uses {export} -- {SAFE|BREAKING|NEEDS_TEST}
+  - {dependent2}: uses {export} -- {SAFE|BREAKING|NEEDS_TEST}
+- Breaking changes: {count}
+- Untested dependents: {count}
+```
+
+If no files export anything (purely internal to the task), skip this step.
+
 ### Step 3: Code Quality Review
 
-Only proceed to this step if there are no CRITICAL issues from Step 2. If there are CRITICAL spec compliance issues, return those first — no point reviewing code quality on code that does not meet requirements.
+Only proceed to this step if there are no CRITICAL issues from Step 2 or Step 2.5. If there are CRITICAL spec compliance or blast radius issues, return those first — no point reviewing code quality on code that breaks existing functionality.
 
 Check each area:
 
