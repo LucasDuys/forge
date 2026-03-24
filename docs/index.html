@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Forge -- Autonomous Coding System</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { colors: {
+      'forge-amber': '#F59E0B', 'forge-gold': '#FBBF24', 'forge-coral': '#F97316',
+    }, fontFamily: { 'inter': ['Inter','sans-serif'], 'mono': ['JetBrains Mono','monospace'] }}}};
+  </script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/ScrollTrigger.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/ScrollToPlugin.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #FDF6EC; color: #3D2E1F; font-family: 'Inter',sans-serif; overflow-x: hidden; }
+    ::-webkit-scrollbar { width: 8px; }
+    ::-webkit-scrollbar-track { background: #F5E6D0; }
+    ::-webkit-scrollbar-thumb { background: #D4A574; border-radius: 4px; }
+    .code-block { background: #1A1410; border: 1px solid #3D2E1F; border-radius: 8px; padding: 16px; font-family: 'JetBrains Mono',monospace; font-size: 14px; line-height: 1.6; color: #FEF3C7; overflow-x: auto; }
+    .box-glow-amber { box-shadow: 0 0 16px rgba(245,158,11,0.2); }
+    .box-glow-gold { box-shadow: 0 0 16px rgba(251,191,36,0.2); }
+    .chapter { width: 100vw; min-height: 100vh; display: flex; align-items: center; justify-content: center; position: relative; padding: 60px 0; background: #FDF6EC; }
+    .chapter:nth-child(even) { background: #F8EFE0; }
+    .anim { opacity: 0; transform: translateY(24px); transition: opacity 0.45s ease, transform 0.45s ease; }
+    .anim.visible { opacity: 1; transform: translateY(0); }
+    .syn-keyword { color: #F59E0B; } .syn-string { color: #FBBF24; } .syn-function { color: #F97316; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+gsap.registerPlugin(ScrollTrigger, ScrollToPlugin);
+
+const CHAPTERS = [
+  'Forge','Brainstorm','Complexity','Capabilities','Planning','Three-Layer Loop',
+  'Execution','Research','Stop Hook','Review','Circuit Breakers','Context Reset',
+  'Token Budget','Verification','Backpropagation','Multi-Repo','Complete'
+];
+
+// ── Reusable hook: animate children with staggered delays on scroll ──
+function useStagger(ref, selector, { delay = 0, stagger = 0.07, y = 24 } = {}) {
+  useEffect(() => {
+    if (!ref.current) return;
+    const els = ref.current.querySelectorAll(selector);
+    const ctx = gsap.context(() => {
+      gsap.from(els, {
+        opacity: 0, y, duration: 0.4, stagger, delay,
+        ease: 'power2.out',
+        scrollTrigger: { trigger: ref.current, start: 'top 80%', toggleActions: 'play none none none' },
+      });
+    }, ref);
+    return () => ctx.revert();
+  }, []);
+}
+
+// ── Section title ──
+const Title = ({ children, sub }) => (
+  <div className="s-title" style={{ marginBottom: 24 }}>
+    <h2 style={{ fontFamily: 'Inter', fontWeight: 700, fontSize: 44, color: '#92400E', lineHeight: 1.1 }}>{children}</h2>
+    {sub && <p style={{ fontFamily: 'JetBrains Mono', fontSize: 13, color: '#B8864A', marginTop: 4 }}>{sub}</p>}
+  </div>
+);
+
+// ── Navigation ──
+function Nav() {
+  const [progress, setProgress] = useState(0);
+  const [active, setActive] = useState(0);
+
+  useEffect(() => {
+    const onScroll = () => {
+      const p = window.scrollY / (document.documentElement.scrollHeight - window.innerHeight);
+      setProgress(p);
+      const sections = document.querySelectorAll('.chapter');
+      let cur = 0;
+      sections.forEach((s, i) => { if (s.getBoundingClientRect().top <= window.innerHeight / 2) cur = i; });
+      setActive(cur);
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  const go = useCallback((i) => {
+    const el = document.querySelectorAll('.chapter')[i];
+    if (el) gsap.to(window, { scrollTo: { y: el, offsetY: 0 }, duration: 0.5, ease: 'power2.inOut' });
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      if (e.code === 'ArrowDown' || e.code === 'ArrowRight') { e.preventDefault(); setActive(p => { const n = Math.min(p+1, CHAPTERS.length-1); go(n); return n; }); }
+      if (e.code === 'ArrowUp' || e.code === 'ArrowLeft') { e.preventDefault(); setActive(p => { const n = Math.max(p-1, 0); go(n); return n; }); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [go]);
+
+  return (
+    <div style={{ position:'fixed', top:0, left:0, width:'100%', height:'100%', zIndex:9999, pointerEvents:'none' }}>
+      <div style={{ position:'absolute', top:0, left:0, width:'100%', height:3, background:'#E8D5BC' }}>
+        <div style={{ height:'100%', width:`${progress*100}%`, background:'#F59E0B' }} />
+      </div>
+      <div style={{ position:'absolute', right:20, top:'50%', transform:'translateY(-50%)', display:'flex', flexDirection:'column', gap:8, alignItems:'center', pointerEvents:'auto' }}>
+        {CHAPTERS.map((name, i) => (
+          <button key={i} onClick={() => { go(i); setActive(i); }} title={name} style={{
+            width: 8, height: 8, borderRadius: '50%', border: 'none', cursor: 'pointer', padding: 0,
+            background: i === active ? '#F59E0B' : '#D4A574',
+            boxShadow: i === active ? '0 0 6px rgba(245,158,11,0.5)' : 'none',
+            transition: 'all 0.2s',
+          }} />
+        ))}
+        <span style={{ fontFamily:'Inter', fontSize:11, color:'#92400E', marginTop:6 }}>{String(active+1).padStart(2,'0')} / {String(CHAPTERS.length).padStart(2,'0')}</span>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CHAPTERS - all use trigger-on-enter, NO pinning, NO scrub
+// ═══════════════════════════════════════════════════════════════════════
+
+function HeroChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.08, y: 30 });
+  return (
+    <div ref={ref} className="chapter" style={{ background:'#FDF6EC' }}>
+      <div style={{ textAlign:'center' }}>
+        <div className="s-item" style={{ display:'flex', justifyContent:'center', gap:4 }}>
+          {'FORGE'.split('').map((l,i) => (
+            <span key={i} style={{ fontFamily:'Inter', fontWeight:900, fontSize:96, color:'#3D2E1F', letterSpacing:'-0.02em' }}>{l}</span>
+          ))}
+        </div>
+        <p className="s-item" style={{ fontFamily:'Inter', fontWeight:500, fontSize:24, color:'#92400E', marginTop:16 }}>Autonomous Coding System</p>
+        <p className="s-item" style={{ fontFamily:'Inter', fontSize:18, color:'#B8864A', marginTop:8 }}>Building a Real-Time Chat App</p>
+        <div className="s-item" style={{ marginTop:48 }}>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" style={{ animation:'bounce 2s ease-in-out infinite' }}>
+            <path d="M6 9L12 15L18 9" stroke="#92400E" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+          <style>{`@keyframes bounce { 0%,100%{transform:translateY(0)} 50%{transform:translateY(8px)} }`}</style>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BrainstormChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.06 });
+  const qa = [
+    ['What transport protocol?', 'WebSocket with fallback to SSE'],
+    ['Authentication method?', 'JWT with refresh token rotation'],
+    ['Message persistence?', 'PostgreSQL via Supabase'],
+    ['Real-time features?', 'Typing indicators, presence, read receipts'],
+  ];
+  const specs = ['R001: WebSocket Connection Management','R002: JWT Authentication Flow','R003: Message Persistence Layer','R004: Real-Time Presence System'];
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:1100, width:'90%', display:'flex', gap:40 }}>
+        <div style={{ flex:1 }}>
+          <div className="s-item"><Title sub="forge-speccer">Brainstorm</Title></div>
+          <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+            {qa.map(([q,a],i) => (
+              <React.Fragment key={i}>
+                <div className="s-item" style={{ background:'#F5E6D0', borderLeft:'3px solid #F59E0B', borderRadius:'0 8px 8px 0', padding:'10px 14px', maxWidth:'88%', fontSize:14 }}>{q}</div>
+                <div className="s-item" style={{ background:'#EDE0D0', borderRight:'3px solid #FBBF24', borderRadius:'8px 0 0 8px', padding:'10px 14px', maxWidth:'88%', alignSelf:'flex-end', fontSize:14, color:'#92400E', fontWeight:500 }}>{a}</div>
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+        <div className="s-item" style={{ flex:1 }}>
+          <div className="code-block" style={{ minHeight:300 }}>
+            <p style={{ color:'#92400E', fontSize:11, fontFamily:'JetBrains Mono', marginBottom:14, textTransform:'uppercase', letterSpacing:'0.08em' }}>Generated Spec</p>
+            {specs.map((s,i) => { const [r,...rest] = s.split(': '); return (
+              <div key={i} style={{ fontFamily:'JetBrains Mono', fontSize:13, lineHeight:1.9 }}>
+                <span style={{ color:'#F59E0B' }}>{r}:</span> <span style={{ color:'#FEF3C7' }}>{rest.join(': ')}</span>
+              </div>
+            ); })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ComplexityChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.08 });
+  const factors = ['Multi-file changes: YES','External integrations: 3 (WebSocket, Supabase, JWT)','Test complexity: HIGH','Cross-cutting concerns: Auth, Real-time, Persistence'];
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:700, width:'90%', textAlign:'center' }}>
+        <div className="s-item"><Title sub="forge-complexity">Complexity Detection</Title></div>
+        <div className="s-item" style={{ display:'flex', justifyContent:'center', marginBottom:24 }}>
+          <svg viewBox="0 0 300 180" style={{ maxWidth:340, width:'100%' }}>
+            <path d="M 40 150 A 110 110 0 0 1 120 42" stroke="#D4A574" strokeWidth="18" fill="none" strokeLinecap="round"/>
+            <path d="M 125 40 A 110 110 0 0 1 175 40" stroke="#B8864A" strokeWidth="18" fill="none" strokeLinecap="round"/>
+            <path d="M 180 42 A 110 110 0 0 1 260 150" stroke="#F59E0B" strokeWidth="18" fill="none" strokeLinecap="round"/>
+            <text x="55" y="170" fill="#D4A574" fontFamily="Inter" fontSize="11" fontWeight="600">quick</text>
+            <text x="127" y="25" fill="#B8864A" fontFamily="Inter" fontSize="11" fontWeight="600" textAnchor="middle">standard</text>
+            <text x="240" y="170" fill="#F59E0B" fontFamily="Inter" fontSize="11" fontWeight="600">thorough</text>
+            <line x1="150" y1="150" x2="230" y2="80" stroke="#3D2E1F" strokeWidth="3" strokeLinecap="round"/>
+            <circle cx="150" cy="150" r="5" fill="#3D2E1F"/>
+          </svg>
+        </div>
+        <div style={{ textAlign:'left', maxWidth:460, margin:'0 auto' }}>
+          {factors.map((f,i) => (
+            <div key={i} className="s-item" style={{ display:'flex', alignItems:'center', gap:8, fontSize:14, padding:'6px 0' }}>
+              <svg width="15" height="15" viewBox="0 0 15 15"><path d="M3 7.5L6 10.5L12 4" stroke="#F59E0B" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              {f}
+            </div>
+          ))}
+        </div>
+        <div className="s-item box-glow-amber" style={{ background:'#F5E6D0', border:'1px solid #F59E0B', borderRadius:10, padding:'14px 28px', display:'inline-block', marginTop:20, fontFamily:'Inter', fontWeight:700, fontSize:22, color:'#92400E' }}>
+          Recommended: THOROUGH
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CapabilityChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.04 });
+  const caps = {
+    mcp: [{n:'supabase',r:1},{n:'firebase',r:0},{n:'playwright',r:1},{n:'context7',r:1}],
+    cli: [{n:'gh',r:1},{n:'vercel',r:0},{n:'docker',r:0},{n:'ffmpeg',r:0},{n:'stripe',r:0}],
+    skills: [{n:'webapp-testing',r:1},{n:'playwright',r:1},{n:'frontend-design',r:0}],
+  };
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:700, width:'90%' }}>
+        <div className="s-item"><Title>Capability Discovery</Title></div>
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:20 }}>
+          {[
+            { title:'MCP Servers', items:caps.mcp, color:'#F97316' },
+            { title:'CLI Tools', items:caps.cli, color:'#F59E0B' },
+            { title:'Skills', items:caps.skills, color:'#92400E' },
+          ].map((sec, si) => (
+            <div key={si}>
+              <div className="s-item" style={{ fontFamily:'Inter', fontWeight:600, fontSize:12, color:sec.color, marginBottom:8, textTransform:'uppercase', letterSpacing:'0.06em' }}>{sec.title}</div>
+              {sec.items.map((it,i) => (
+                <div key={i} className="s-item" style={{ background: it.r ? '#F5E6D0' : '#EDE0D0', border:`1px solid ${it.r ? sec.color : '#D4A574'}`, borderRadius:6, padding:'6px 12px', fontFamily:'JetBrains Mono', fontSize:12, color: it.r ? sec.color : '#B8864A', opacity: it.r ? 1 : 0.5, marginBottom:6 }}>
+                  {it.n}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlanningChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.05 });
+  const tiers = [
+    { label:'Foundation', tasks:['Database Schema','Auth Module','Project Scaffold'], color:'#F97316' },
+    { label:'Core', tasks:['WebSocket Server','Message Service','Presence Engine'], color:'#F59E0B' },
+    { label:'Integration', tasks:['Chat UI Components','E2E Test Suite','Deploy Pipeline'], color:'#D4A017' },
+  ];
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:800, width:'90%' }}>
+        <div className="s-item"><Title sub="forge-planner">Planning</Title></div>
+        {tiers.map((tier,ti) => (
+          <div key={ti} className="s-item" style={{ marginBottom:16 }}>
+            <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:12, color:tier.color, marginBottom:8, textTransform:'uppercase', letterSpacing:'0.06em' }}>Tier {ti+1}: {tier.label}</div>
+            <div style={{ display:'flex', gap:10 }}>
+              {tier.tasks.map((t,ni) => (
+                <div key={ni} style={{ flex:1, background:'#F5E6D0', border:'1px solid #D4A574', borderRadius:8, padding:'12px 16px', textAlign:'center', fontSize:13, fontWeight:500 }}>{t}</div>
+              ))}
+            </div>
+          </div>
+        ))}
+        <p className="s-item" style={{ fontSize:14, color:'#92400E', marginTop:8 }}>9 tasks across 3 tiers with dependency ordering</p>
+      </div>
+    </div>
+  );
+}
+
+function LoopChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.1 });
+  const Ring = ({label, desc, color, items, size}) => (
+    <div className="s-item" style={{ border:`2px solid ${color}`, borderRadius:16, padding:20, textAlign:'center', maxWidth:size, margin:'0 auto', marginBottom:16 }}>
+      <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:15, color, marginBottom:4 }}>{label}</div>
+      <div style={{ fontSize:12, color:'#92400E', marginBottom:6 }}>{desc}</div>
+      <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#B8864A' }}>{items}</div>
+    </div>
+  );
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:600, width:'90%', textAlign:'center' }}>
+        <div className="s-item"><Title>The Three-Layer Loop</Title></div>
+        <Ring label="Phase Loop" desc="Outermost -- runs once per spec" color="#F97316" items="Brainstorm > Plan > Execute > Verify" size={520}/>
+        <Ring label="Task Loop" desc="Middle -- runs once per task" color="#F59E0B" items="Pick Task > Implement > Test > Review" size={420}/>
+        <Ring label="Quality Loop" desc="Innermost -- runs until pass" color="#D4A017" items="Write > Run Tests > Fix > Pass" size={320}/>
+        <div className="s-item" style={{ display:'flex', justifyContent:'center', gap:20, marginTop:12, fontSize:12, color:'#92400E' }}>
+          <span><b style={{color:'#F97316'}}>Outer</b>: per-phase</span>
+          <span><b style={{color:'#F59E0B'}}>Middle</b>: per-task</span>
+          <span><b style={{color:'#D4A017'}}>Inner</b>: per-quality-check</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExecutionChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.1 });
+  const Panel = ({title, color, code, result, resultColor}) => (
+    <div className="s-item" style={{ flex:1, minWidth:260 }}>
+      <div style={{ fontFamily:'Inter', fontWeight:700, fontSize:16, color, marginBottom:8 }}>{title}</div>
+      <div className="code-block" style={{ fontSize:12, marginBottom:8, whiteSpace:'pre-wrap' }}><code style={{color:'#FEF3C7'}}>{code}</code></div>
+      <div style={{ fontFamily:'JetBrains Mono', fontSize:12, background:'#1A1410', borderRadius:6, padding:'6px 10px', color: resultColor }}>{result}</div>
+    </div>
+  );
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:1000, width:'90%' }}>
+        <div className="s-item"><Title sub="forge-executor -- TDD Cycle">Execution</Title></div>
+        <div className="s-item" style={{ display:'inline-block', background:'#F5E6D0', borderRadius:16, padding:'5px 14px', fontSize:13, color:'#92400E', fontWeight:500, marginBottom:20 }}>Task: WebSocket Server</div>
+        <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
+          <Panel title="RED: Write Test" color="#F97316"
+            code={`test('client connects via\n  WebSocket', async () => {\n  const ws = new WebSocket(url);\n  expect(ws.readyState)\n    .toBe(CONNECTING);\n});`}
+            result="FAIL: 1 test failed" resultColor="#F97316"/>
+          <Panel title="GREEN: Implement" color="#F59E0B"
+            code={`const wss = new WebSocketServer({\n  port: config.WS_PORT\n});\nwss.on('connection', (ws) => {\n  ws.send('connected');\n});`}
+            result="PASS: 1 test passed" resultColor="#FBBF24"/>
+          <Panel title="REFACTOR" color="#D4A017"
+            code={`export function createWSServer(\n  config: ServerConfig\n): WebSocketServer {\n  return new WebSocketServer({\n    port: config.WS_PORT,\n  });\n}`}
+            result="PASS: 1 test, 0 warnings" resultColor="#FBBF24"/>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ResearchChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.06 });
+  const tiers = [
+    { label:'Tier 1: Official Docs', detail:'supabase.com/docs/auth', color:'#F59E0B', found:'Supabase Auth v2 guide' },
+    { label:'Tier 2: Context7 / MCP', detail:'Framework documentation', color:'#B8864A', found:null },
+    { label:'Tier 3: Semantic Scholar', detail:'Academic literature', color:'#D4A574', found:null },
+    { label:'Tier 4: Web Search', detail:'Fallback only', color:'#D4A574', found:null },
+  ];
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:900, width:'90%' }}>
+        <div className="s-item"><Title sub="forge-researcher">Research</Title></div>
+        <div className="s-item" style={{ background:'#F5E6D0', borderLeft:'3px solid #F97316', borderRadius:'0 8px 8px 0', padding:'10px 14px', marginBottom:20, fontSize:14 }}>
+          Task "JWT Auth Flow" requires implementation pattern research
+        </div>
+        <div style={{ display:'flex', gap:28 }}>
+          <div style={{ flex:1, display:'flex', flexDirection:'column', gap:8 }}>
+            {tiers.map((t,i) => (
+              <div key={i} className="s-item" style={{ background:'#F5E6D0', border:'1px solid #D4A574', borderRadius:8, padding:'10px 14px', opacity: i > 0 ? 0.4 : 1 }}>
+                <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:13, color:t.color }}>{t.label}</div>
+                <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#92400E', marginTop:2 }}>{t.detail}</div>
+                {t.found && <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#F59E0B', marginTop:4 }}>Found: {t.found}</div>}
+              </div>
+            ))}
+          </div>
+          <div className="s-item" style={{ flex:1 }}>
+            <div className="code-block" style={{ height:'100%' }}>
+              <p style={{ color:'#92400E', fontSize:11, fontFamily:'JetBrains Mono', marginBottom:10, textTransform:'uppercase', letterSpacing:'0.08em' }}>Research Result</p>
+              <div style={{ fontFamily:'JetBrains Mono', fontSize:12, color:'#FEF3C7', lineHeight:1.9 }}>
+                <div><span style={{color:'#F59E0B'}}>Pattern:</span> PKCE flow with</div>
+                <div>  refresh token rotation</div>
+                <div style={{marginTop:6}}><span style={{color:'#F59E0B'}}>Source:</span> Supabase Auth v2</div>
+                <div><span style={{color:'#F59E0B'}}>Confidence:</span> <span style={{color:'#FBBF24'}}>HIGH</span></div>
+                <div style={{marginTop:6}}><span style={{color:'#F59E0B'}}>Security:</span> Use PKCE, not</div>
+                <div>  implicit grant flow</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StopHookChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.06 });
+  const states = [
+    { label:'RUNNING', color:'#F59E0B' }, { label:'TESTS_FAILING', color:'#F97316' },
+    { label:'NEEDS_REVIEW', color:'#FBBF24' }, { label:'NEEDS_DEBUG', color:'#F97316' },
+    { label:'BLOCKED', color:'#92400E' }, { label:'COMPLETE', color:'#D4A017' },
+  ];
+  const transitions = [
+    'RUNNING --test failure--> TESTS_FAILING',
+    'TESTS_FAILING --fix applied--> RUNNING',
+    'TESTS_FAILING --3 failures--> NEEDS_DEBUG',
+    'RUNNING --impl complete--> NEEDS_REVIEW',
+    'NEEDS_REVIEW --review issues--> RUNNING',
+    'NEEDS_REVIEW --review PASS--> COMPLETE',
+    'NEEDS_DEBUG --3 debug attempts--> BLOCKED',
+    'BLOCKED --human intervention--> RUNNING',
+  ];
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:800, width:'90%' }}>
+        <div className="s-item"><Title>Stop Hook State Machine</Title></div>
+        <div style={{ display:'flex', flexWrap:'wrap', gap:10, marginBottom:20 }}>
+          {states.map((s,i) => (
+            <div key={i} className="s-item" style={{ background:'#F5E6D0', border:`1px solid ${s.color}`, borderRadius:8, padding:'8px 16px', fontFamily:'JetBrains Mono', fontSize:12, color:s.color, fontWeight:600 }}>{s.label}</div>
+          ))}
+        </div>
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          {transitions.map((t,i) => (
+            <div key={i} className="s-item" style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#92400E', padding:'3px 0' }}>{t}</div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ReviewChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.07 });
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:900, width:'90%' }}>
+        <div className="s-item"><Title sub="forge-reviewer">Review</Title></div>
+        <div style={{ display:'flex', gap:24 }}>
+          <div className="s-item" style={{ flex:1 }}>
+            <div className="code-block" style={{ fontSize:12 }}>
+              <div style={{ color:'#92400E', fontSize:11, marginBottom:6 }}>websocket-server.ts</div>
+              {['export class WebSocketServer {','  private connections: Map<string, WS>;','','  constructor(config: ServerConfig) {','    this.connections = new Map();','    this.wss = new WSS({ port: config.port });','  }','','  onConnection(ws: WS, req: Request) {','    const userId = req.headers["x-user-id"];','    this.connections.set(userId, ws);','  }','}'].map((line,i) => (
+                <div key={i} style={{ fontFamily:'JetBrains Mono', lineHeight:1.5, color:'#FEF3C7' }}>
+                  <span style={{ color:'#78350F', marginRight:10, fontSize:10 }}>{String(i+1).padStart(2,' ')}</span>{line || '\u00A0'}
+                </div>
+              ))}
+            </div>
+          </div>
+          <div style={{ flex:1, display:'flex', flexDirection:'column', gap:12 }}>
+            <div className="s-item" style={{ fontFamily:'Inter', fontWeight:700, fontSize:20, color:'#F97316' }}>ISSUES</div>
+            <div className="s-item" style={{ background:'#F5E6D0', borderRadius:8, padding:12, borderLeft:'3px solid #F97316' }}>
+              <span style={{ background:'#F97316', color:'#fff', fontFamily:'JetBrains Mono', fontSize:10, padding:'2px 6px', borderRadius:4, fontWeight:700 }}>HIGH</span>
+              <p style={{ fontSize:13, marginTop:5 }}>Missing rate limiting on connection handler</p>
+            </div>
+            <div className="s-item" style={{ background:'#F5E6D0', borderRadius:8, padding:12, borderLeft:'3px solid #D4A574' }}>
+              <span style={{ background:'#D4A574', color:'#fff', fontFamily:'JetBrains Mono', fontSize:10, padding:'2px 6px', borderRadius:4, fontWeight:700 }}>LOW</span>
+              <p style={{ fontSize:13, marginTop:5 }}>No graceful shutdown logic</p>
+            </div>
+            <div className="s-item" style={{ textAlign:'center', fontSize:14, color:'#B8864A', padding:8 }}>After fixes...</div>
+            <div className="s-item box-glow-gold" style={{ background:'#F5E6D0', border:'1px solid #FBBF24', borderRadius:10, padding:20, textAlign:'center' }}>
+              <div style={{ fontFamily:'Inter', fontWeight:700, fontSize:24, color:'#D4A017' }}>PASS</div>
+              <p style={{ fontSize:13, color:'#92400E', marginTop:4 }}>All acceptance criteria verified</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CircuitBreakerChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.06 });
+  const Slot = ({label, color}) => (
+    <div className="s-item" style={{ background:'#F5E6D0', border:`1px solid ${color}`, borderRadius:8, padding:'8px 14px', fontFamily:'JetBrains Mono', fontSize:12, color, display:'flex', alignItems:'center', gap:8 }}>
+      <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 2L10 10M10 2L2 10" stroke={color} strokeWidth="2" strokeLinecap="round"/></svg>
+      {label}
+    </div>
+  );
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:550, width:'90%' }}>
+        <div className="s-item"><Title>Circuit Breakers</Title></div>
+        <div style={{ display:'flex', flexDirection:'column', gap:6, marginBottom:12 }}>
+          <Slot label="FAIL #1 -- assertion error in ws.test.ts:24" color="#F97316"/>
+          <Slot label="FAIL #2 -- timeout waiting for connection" color="#F97316"/>
+          <Slot label="FAIL #3 -- port already in use" color="#F97316"/>
+        </div>
+        <div className="s-item" style={{ textAlign:'center', fontFamily:'Inter', fontWeight:800, fontSize:18, color:'#F97316', padding:10, letterSpacing:'0.08em' }}>CIRCUIT BREAK</div>
+        <div className="s-item" style={{ display:'flex', justifyContent:'center', gap:10, alignItems:'center', margin:'8px 0 12px', fontSize:13 }}>
+          <span style={{ color:'#B8864A', textDecoration:'line-through' }}>EXECUTE</span>
+          <span style={{ color:'#F97316' }}>--></span>
+          <span style={{ color:'#F97316', fontWeight:700 }}>DEBUG</span>
+        </div>
+        <div style={{ display:'flex', flexDirection:'column', gap:6, marginBottom:12 }}>
+          <Slot label="DEBUG #1 -- hypothesis: race condition" color="#F97316"/>
+          <Slot label="DEBUG #2 -- hypothesis: missing cleanup" color="#F97316"/>
+          <Slot label="DEBUG #3 -- hypothesis: config mismatch" color="#F97316"/>
+        </div>
+        <div className="s-item box-glow-amber" style={{ background:'#F5E6D0', border:'2px solid #F59E0B', borderRadius:10, padding:18, textAlign:'center' }}>
+          <div style={{ fontFamily:'Inter', fontWeight:700, fontSize:18, color:'#3D2E1F', marginBottom:4 }}>HUMAN INTERVENTION REQUIRED</div>
+          <p style={{ fontSize:13, color:'#92400E' }}>Forge pauses and waits for human guidance</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ContextResetChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.08 });
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:700, width:'90%' }}>
+        <div className="s-item"><Title>Context Reset</Title></div>
+        <div className="s-item" style={{ position:'relative', marginBottom:20 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', fontFamily:'JetBrains Mono', fontSize:10, color:'#B8864A', marginBottom:4 }}>
+            {['0%','20%','40%','60%','80%','100%'].map(l => <span key={l}>{l}</span>)}
+          </div>
+          <div style={{ height:20, background:'#E8D5BC', borderRadius:6, overflow:'hidden', position:'relative' }}>
+            <div style={{ height:'100%', width:'60%', background:'linear-gradient(90deg,#F59E0B,#F97316)', borderRadius:6 }}/>
+          </div>
+          <div style={{ position:'absolute', left:'60%', top:16, bottom:-6, borderLeft:'2px dashed #F97316' }}>
+            <span style={{ position:'absolute', top:-14, left:6, fontFamily:'JetBrains Mono', fontSize:10, color:'#F97316' }}>Threshold</span>
+          </div>
+        </div>
+        <div className="s-item code-block" style={{ marginBottom:18, fontSize:12 }}>
+          <div style={{ color:'#92400E', fontSize:10, marginBottom:6, textTransform:'uppercase', letterSpacing:'0.08em' }}>Handoff Summary</div>
+          <div style={{ color:'#FEF3C7', lineHeight:1.8 }}>
+            <div>Completed: Tasks 1-5 of 9</div>
+            <div>Current: Task 6 (WebSocket Server) -- 40% done</div>
+            <div>Blockers: None</div>
+            <div>Key Decisions: PKCE auth flow, Supabase realtime</div>
+          </div>
+        </div>
+        <div className="s-item" style={{ textAlign:'center' }}>
+          <div style={{ display:'flex', gap:5, justifyContent:'center', marginBottom:10 }}>
+            {[1,2,3,4,5,6,7,8,9].map(i => (
+              <div key={i} style={{ width:18, height:18, borderRadius:'50%', background: i<=5 ? '#D4A017' : 'transparent', border: i<=5 ? 'none' : '1.5px solid #D4A574' }}/>
+            ))}
+          </div>
+          <p style={{ fontFamily:'JetBrains Mono', fontSize:12, color:'#92400E' }}>Resumed from handoff -- continuing Task 6</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TokenBudgetChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.08 });
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:600, width:'90%' }}>
+        <div className="s-item"><Title>Token Budget</Title></div>
+        <div style={{ display:'flex', gap:24 }}>
+          <div className="s-item" style={{ width:36 }}>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#92400E', marginBottom:6, textAlign:'center' }}>500K</div>
+            <div style={{ height:240, background:'#E8D5BC', borderRadius:6, overflow:'hidden', position:'relative' }}>
+              <div style={{ position:'absolute', bottom:0, width:'100%', height:'18%', background:'linear-gradient(to top,#F97316,#F59E0B)', borderRadius:6 }}/>
+              <div style={{ position:'absolute', bottom:'20%', width:'100%', borderTop:'1px dashed #3D2E1F' }}/>
+            </div>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:9, color:'#B8864A', marginTop:3, textAlign:'center' }}>Per-task cap</div>
+          </div>
+          <div style={{ flex:1, display:'flex', flexDirection:'column', gap:12, justifyContent:'center' }}>
+            {[['Database Schema','15,000 tokens'],['Auth Module','45,000 tokens'],['WebSocket Server','80,000 tokens (thorough)']].map(([name,tok],i) => (
+              <div key={i} className="s-item" style={{ display:'flex', justifyContent:'space-between', fontSize:13, padding:'8px 12px', background:'#F5E6D0', borderRadius:8 }}>
+                <span>{name}</span>
+                <span style={{ color: i===2 ? '#F97316' : '#92400E', fontFamily:'JetBrains Mono', fontSize:12 }}>{tok}</span>
+              </div>
+            ))}
+            <div className="s-item" style={{ background:'#F5E6D0', borderLeft:'3px solid #F97316', borderRadius:'0 8px 8px 0', padding:'10px 14px', marginTop:6 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:3 }}>
+                <span style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#F59E0B', textDecoration:'line-through' }}>thorough</span>
+                <span style={{ color:'#92400E' }}>--></span>
+                <span style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#92400E', fontWeight:600 }}>quick</span>
+              </div>
+              <p style={{ fontSize:12, color:'#92400E' }}>Budget low -- switching to quick mode</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VerificationChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.08 });
+  const levels = [
+    { title:'Existence', desc:'Do the files exist?', checks:['src/websocket-server.ts EXISTS','src/auth/jwt.ts EXISTS','tests/ws.test.ts EXISTS'] },
+    { title:'Substantive', desc:'Real code, not stubs?', checks:['websocket-server.ts: 247 lines','jwt.ts: 89 lines, 4 exports'] },
+    { title:'Wired', desc:'Are modules connected?', checks:['server.ts imports websocket-server','app.ts registers auth middleware'] },
+    { title:'Runtime', desc:'Does it actually run?', checks:['npm start exits code 0','Health check returns 200'] },
+  ];
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:650, width:'90%' }}>
+        <div className="s-item"><Title sub="forge-verifier">Phase Verification</Title></div>
+        <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:18 }}>
+          {levels.map((lv,i) => (
+            <div key={i} className="s-item" style={{ background:'#F5E6D0', borderRadius:8, padding:14, border:'1px solid #D4A574' }}>
+              <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6 }}>
+                <span style={{ fontWeight:600, fontSize:15 }}>{lv.title}</span>
+                <span style={{ fontSize:12, color:'#92400E' }}>{lv.desc}</span>
+              </div>
+              {lv.checks.map((c,ci) => (
+                <div key={ci} style={{ display:'flex', alignItems:'center', gap:6, fontFamily:'JetBrains Mono', fontSize:11, color:'#3D2E1F', padding:'2px 0' }}>
+                  <svg width="13" height="13" viewBox="0 0 13 13"><path d="M2 6.5L5 9.5L11 3.5" stroke="#F59E0B" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                  {c}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+        <div className="s-item box-glow-gold" style={{ textAlign:'center', background:'#F5E6D0', border:'2px solid #FBBF24', borderRadius:10, padding:14 }}>
+          <span style={{ fontFamily:'Inter', fontWeight:800, fontSize:22, color:'#D4A017' }}>PHASE VERIFIED</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BackpropChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.07 });
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:750, width:'90%' }}>
+        <div className="s-item"><Title>Backpropagation</Title></div>
+        <div className="s-item" style={{ background:'#F5E6D0', borderLeft:'3px solid #F97316', borderRadius:'0 8px 8px 0', padding:'12px 14px', marginBottom:16 }}>
+          <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#F97316', marginBottom:3 }}>Bug Detected</div>
+          <div style={{ fontFamily:'JetBrains Mono', fontSize:12 }}>TypeError: Cannot read property 'userId' of undefined<br/><span style={{color:'#92400E'}}>in presence-engine.ts:42</span></div>
+        </div>
+        <div className="s-item" style={{ display:'flex', alignItems:'center', gap:8, marginBottom:16, flexWrap:'wrap' }}>
+          <span style={{ background:'#EDE0D0', borderRadius:6, padding:'6px 12px', fontFamily:'JetBrains Mono', fontSize:11 }}>presence-engine.ts</span>
+          <span style={{ color:'#F59E0B' }}>--></span>
+          <span style={{ background:'#EDE0D0', borderRadius:6, padding:'6px 12px', fontFamily:'JetBrains Mono', fontSize:11 }}>auth module</span>
+          <span style={{ color:'#F59E0B' }}>--></span>
+          <span style={{ background:'#92400E', color:'#FBBF24', borderRadius:6, padding:'6px 12px', fontFamily:'JetBrains Mono', fontSize:11, fontWeight:600 }}>Spec R004</span>
+        </div>
+        <div className="s-item" style={{ background:'#F5E6D0', borderRadius:8, padding:12, border:'1px solid #D4A574', marginBottom:10 }}>
+          <div style={{ fontWeight:600, fontSize:13, color:'#F97316', marginBottom:4 }}>Spec Gap Identified</div>
+          <p style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#92400E' }}>No requirement for unauthenticated user handling in presence</p>
+        </div>
+        <div className="s-item code-block" style={{ marginBottom:12, fontSize:12 }}>
+          <div style={{ color:'#92400E', fontSize:10, marginBottom:4 }}>spec-chat.md (updated)</div>
+          <div style={{ color:'#FBBF24' }}>+ R004-A: Presence engine MUST validate user session before tracking</div>
+        </div>
+        <div className="s-item" style={{ background:'#F5E6D0', borderRadius:8, padding:12, border:'1px solid #D4A574' }}>
+          <div style={{ fontWeight:600, fontSize:13, color:'#D4A017', marginBottom:6 }}>Regression Test Generated</div>
+          <div className="code-block" style={{ fontSize:11, marginBottom:6 }}><code style={{color:'#FEF3C7'}}>{`test('presence rejects unauth users',\n  () => { expect(() => track(null))\n    .toThrow('Unauthorized'); });`}</code></div>
+          <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#D4A017' }}>PASS -- Added to suite</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MultiRepoChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.06 });
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:850, width:'90%' }}>
+        <div className="s-item"><Title>Multi-Repo</Title></div>
+        <div className="s-item" style={{ display:'flex', alignItems:'center', gap:8, marginBottom:18, fontSize:12, color:'#92400E' }}>
+          <span style={{ color:'#F97316', fontWeight:600 }}>chat-api</span>
+          <span>-- API contract defined first --></span>
+          <span style={{ color:'#D4A017', fontWeight:600 }}>chat-web</span>
+        </div>
+        <div style={{ display:'flex', gap:16, marginBottom:20 }}>
+          <div className="s-item" style={{ flex:1, background:'#F5E6D0', borderRadius:10, borderTop:'3px solid #F97316', padding:14 }}>
+            <div style={{ fontWeight:600, fontSize:14, color:'#F97316', marginBottom:10 }}>chat-api</div>
+            {['POST /api/messages','GET /api/messages/:channelId','WS /api/realtime'].map((ep,i) => (
+              <div key={i} style={{ display:'flex', alignItems:'center', gap:6, fontFamily:'JetBrains Mono', fontSize:11, padding:'3px 0' }}>
+                <svg width="11" height="11" viewBox="0 0 11 11"><path d="M2 5.5L4 7.5L9 3" stroke="#F59E0B" strokeWidth="1.5" fill="none" strokeLinecap="round"/></svg>
+                {ep}
+              </div>
+            ))}
+          </div>
+          <div className="s-item" style={{ flex:1, background:'#F5E6D0', borderRadius:10, borderTop:'3px solid #D4A017', padding:14 }}>
+            <div style={{ fontWeight:600, fontSize:14, color:'#D4A017', marginBottom:10 }}>chat-web</div>
+            <div className="code-block" style={{ fontSize:11 }}><code style={{color:'#FEF3C7'}}>{`const { data } = useMessages(\n  channelId\n);\nconst ws = useRealtime(\n  '/api/realtime'\n);`}</code></div>
+          </div>
+        </div>
+        <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+          {[
+            {label:'feat(api): add message endpoints', color:'#F97316'},
+            {label:'feat(api): add WebSocket realtime', color:'#F97316'},
+            {label:'feat(web): integrate message API', color:'#D4A017'},
+            {label:'feat(web): add realtime updates', color:'#D4A017'},
+          ].map((c,i) => (
+            <React.Fragment key={i}>
+              <div className="s-item" style={{ display:'flex', alignItems:'center', gap:5 }}>
+                <div style={{ width:8, height:8, borderRadius:'50%', background:c.color, flexShrink:0 }}/>
+                <span style={{ fontFamily:'JetBrains Mono', fontSize:10, color:'#92400E', whiteSpace:'nowrap' }}>{c.label}</span>
+              </div>
+              {i<3 && <div style={{ width:12, height:1, background:'#D4A574' }}/>}
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CompletionChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.06 });
+  const tasks = ['Database Schema','Auth Module','Project Scaffold','WebSocket Server','Message Service','Presence Engine','Chat UI','E2E Tests','Deploy'];
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:700, width:'90%', textAlign:'center' }}>
+        <div className="s-item"><h2 style={{ fontFamily:'Inter', fontWeight:800, fontSize:64, color:'#D4A017' }}>Complete</h2></div>
+        <div style={{ display:'flex', flexWrap:'wrap', gap:8, justifyContent:'center', marginBottom:28 }}>
+          {tasks.map((t,i) => (
+            <div key={i} className="s-item" style={{ background:'#D4A017', borderRadius:8, padding:'8px 14px', fontSize:12, fontWeight:500, color:'#fff' }}>{t}</div>
+          ))}
+        </div>
+        <div className="s-item" style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10, maxWidth:500, margin:'0 auto 28px' }}>
+          {[
+            {l:'Tasks',v:'9/9',c:'#D4A017'},{l:'Tests',v:'47/47',c:'#D4A017'},{l:'Review',v:'PASS',c:'#D4A017'},
+            {l:'Tokens',v:'312K/500K',c:'#F59E0B'},{l:'Resets',v:'1',c:'#92400E'},{l:'Breakers',v:'0',c:'#92400E'},
+          ].map((s,i) => (
+            <div key={i} style={{ background:'#F5E6D0', borderRadius:8, padding:10, textAlign:'center' }}>
+              <div style={{ fontFamily:'JetBrains Mono', fontSize:16, fontWeight:700, color:s.c }}>{s.v}</div>
+              <div style={{ fontSize:10, color:'#92400E', marginTop:2 }}>{s.l}</div>
+            </div>
+          ))}
+        </div>
+        <p className="s-item" style={{ fontFamily:'Inter', fontWeight:600, fontSize:22, color:'#3D2E1F' }}>From spec to shipped. Autonomously.</p>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <React.Fragment>
+      <Nav/>
+      <HeroChapter/>
+      <BrainstormChapter/>
+      <ComplexityChapter/>
+      <CapabilityChapter/>
+      <PlanningChapter/>
+      <LoopChapter/>
+      <ExecutionChapter/>
+      <ResearchChapter/>
+      <StopHookChapter/>
+      <ReviewChapter/>
+      <CircuitBreakerChapter/>
+      <ContextResetChapter/>
+      <TokenBudgetChapter/>
+      <VerificationChapter/>
+      <BackpropChapter/>
+      <MultiRepoChapter/>
+      <CompletionChapter/>
+    </React.Fragment>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
