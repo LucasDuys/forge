@@ -1,5 +1,5 @@
 {
-  "description": "Forge plugin hooks — autonomous loop engine and token monitoring",
+  "description": "Forge plugin hooks — autonomous loop engine, token monitoring, progress tracking, test filtering, and tool caching",
   "hooks": {
     "Stop": [
       {
@@ -11,12 +11,53 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Grep|Glob|Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/tool-cache.js",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/token-monitor.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/test-output-filter.js",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|Grep|Glob|Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/tool-cache-store.js",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/progress-tracker.js",
             "timeout": 5
           }
         ]
