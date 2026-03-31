@@ -44,7 +44,9 @@ gsap.registerPlugin(ScrollTrigger, ScrollToPlugin);
 const CHAPTERS = [
   'Forge','Brainstorm','Complexity','Capabilities','Planning','Three-Layer Loop',
   'Execution','Research','Stop Hook','Review','Circuit Breakers','Context Reset',
-  'Token Budget','Verification','Backpropagation','Multi-Repo','Complete'
+  'Token Budget','Verification','Backpropagation','Multi-Repo',
+  'Streaming DAG','Artifact Contracts','Model Routing','Codex Hybrid',
+  'Token-Saving Hooks','Re-Decomposition','Complete'
 ];
 
 // ── Reusable hook: animate children with staggered delays on scroll ──
@@ -705,6 +707,384 @@ function MultiRepoChapter() {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// V2 CHAPTERS
+// ═══════════════════════════════════════════════════════════════════════
+
+function StreamingDAGChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.06 });
+  const waveTasks = [
+    { id:'A', tier:1, start:0, dur:3 },
+    { id:'B', tier:1, start:0, dur:2 },
+    { id:'C', tier:1, start:0, dur:4 },
+    { id:'D', tier:2, start:4, dur:2 },
+    { id:'E', tier:2, start:4, dur:3 },
+    { id:'F', tier:3, start:7, dur:2 },
+  ];
+  const streamTasks = [
+    { id:'A', start:0, dur:3 },
+    { id:'B', start:0, dur:2 },
+    { id:'C', start:0, dur:4 },
+    { id:'D', start:2, dur:2, dep:'B' },
+    { id:'E', start:3, dur:3, dep:'A' },
+    { id:'F', start:4, dur:2, dep:'D' },
+  ];
+  const unit = 38;
+  const barH = 22;
+  const gap = 6;
+  const labelW = 30;
+  const Timeline = ({title, tasks, total, color, tagline}) => (
+    <div className="s-item" style={{ marginBottom:24 }}>
+      <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:14, color, marginBottom:8 }}>{title}</div>
+      <svg viewBox={`0 0 ${labelW + total*unit + 10} ${tasks.length*(barH+gap)+20}`} style={{ width:'100%', maxWidth:500 }}>
+        {tasks.map((t,i) => (
+          <React.Fragment key={i}>
+            <text x={0} y={i*(barH+gap)+barH/2+4} fill="#92400E" fontFamily="JetBrains Mono" fontSize="11" fontWeight="600">{t.id}</text>
+            <rect x={labelW + t.start*unit} y={i*(barH+gap)} width={t.dur*unit} height={barH} rx={4} fill={color} opacity={0.85}/>
+            <text x={labelW + t.start*unit + t.dur*unit/2} y={i*(barH+gap)+barH/2+4} fill="#fff" fontFamily="JetBrains Mono" fontSize="9" textAnchor="middle">{t.dur} units</text>
+          </React.Fragment>
+        ))}
+        {/* time axis */}
+        <line x1={labelW} y1={tasks.length*(barH+gap)+6} x2={labelW+total*unit} y2={tasks.length*(barH+gap)+6} stroke="#D4A574" strokeWidth="1"/>
+        <text x={labelW+total*unit+2} y={tasks.length*(barH+gap)+10} fill="#92400E" fontFamily="JetBrains Mono" fontSize="9">t={total}</text>
+      </svg>
+      <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#B8864A', marginTop:4 }}>{tagline}</div>
+    </div>
+  );
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:900, width:'90%' }}>
+        <div className="s-item"><Title sub="v2 -- streaming execution">Streaming DAG Execution</Title></div>
+        <div style={{ display:'flex', gap:32, flexWrap:'wrap' }}>
+          <div style={{ flex:1, minWidth:280 }}>
+            <Timeline title="V1: Wave-Gated" tasks={waveTasks} total={9} color="#D4A574" tagline="Tasks wait for entire tier to finish"/>
+          </div>
+          <div style={{ flex:1, minWidth:280 }}>
+            <Timeline title="V2: Streaming" tasks={streamTasks} total={7} color="#F59E0B" tagline="Tasks start when their deps complete"/>
+          </div>
+        </div>
+        <div className="s-item" style={{ display:'flex', gap:16, marginTop:8 }}>
+          <div style={{ background:'#F5E6D0', borderRadius:8, padding:'10px 16px', flex:1, textAlign:'center' }}>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:20, fontWeight:700, color:'#F97316' }}>22%</div>
+            <div style={{ fontSize:11, color:'#92400E' }}>Faster wall-clock time</div>
+          </div>
+          <div style={{ background:'#F5E6D0', borderRadius:8, padding:'10px 16px', flex:1, textAlign:'center' }}>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:20, fontWeight:700, color:'#F59E0B' }}>0</div>
+            <div style={{ fontSize:11, color:'#92400E' }}>Idle wait between tiers</div>
+          </div>
+          <div style={{ background:'#F5E6D0', borderRadius:8, padding:'10px 16px', flex:1, textAlign:'center' }}>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:20, fontWeight:700, color:'#D4A017' }}>DAG</div>
+            <div style={{ fontSize:11, color:'#92400E' }}>Dependency-driven ordering</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ArtifactContractsChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.06 });
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:900, width:'90%' }}>
+        <div className="s-item"><Title sub="v2 -- artifact contracts">Artifact Contracts</Title></div>
+        <div style={{ display:'flex', gap:24, flexWrap:'wrap', marginBottom:20 }}>
+          {/* Task A: provides */}
+          <div className="s-item" style={{ flex:1, minWidth:260 }}>
+            <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:14, color:'#F97316', marginBottom:8 }}>Task A: Auth Module</div>
+            <div className="code-block" style={{ fontSize:11 }}>
+              <div style={{ color:'#92400E', fontSize:10, marginBottom:6, textTransform:'uppercase', letterSpacing:'0.08em' }}>provides: auth-schema</div>
+              <div style={{ color:'#FEF3C7', lineHeight:1.8 }}>
+                <div>{'{'}</div>
+                <div>{'  '}<span className="syn-keyword">"artifact"</span>: <span className="syn-string">"auth-schema"</span>,</div>
+                <div>{'  '}<span className="syn-keyword">"exports"</span>: {'['}</div>
+                <div>{'    '}<span className="syn-string">"User"</span>, <span className="syn-string">"Session"</span>,</div>
+                <div>{'    '}<span className="syn-string">"AuthConfig"</span></div>
+                <div>{'  ],'}</div>
+                <div>{'  '}<span className="syn-keyword">"path"</span>: <span className="syn-string">"src/auth/types.ts"</span></div>
+                <div>{'}'}</div>
+              </div>
+            </div>
+          </div>
+          {/* Arrow */}
+          <div className="s-item" style={{ display:'flex', alignItems:'center', justifyContent:'center', minWidth:60 }}>
+            <svg width="60" height="40" viewBox="0 0 60 40">
+              <path d="M5 20 L45 20" stroke="#F59E0B" strokeWidth="2" strokeDasharray="4 3"/>
+              <path d="M40 14 L50 20 L40 26" stroke="#F59E0B" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+              <text x="25" y="12" fill="#B8864A" fontFamily="JetBrains Mono" fontSize="8" textAnchor="middle">JSON</text>
+            </svg>
+          </div>
+          {/* Task B: consumes */}
+          <div className="s-item" style={{ flex:1, minWidth:260 }}>
+            <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:14, color:'#D4A017', marginBottom:8 }}>Task B: Presence Engine</div>
+            <div className="code-block" style={{ fontSize:11 }}>
+              <div style={{ color:'#92400E', fontSize:10, marginBottom:6, textTransform:'uppercase', letterSpacing:'0.08em' }}>consumes: auth-schema</div>
+              <div style={{ color:'#FEF3C7', lineHeight:1.8 }}>
+                <div><span className="syn-keyword">// reads 2-line summary, not full file</span></div>
+                <div><span className="syn-function">import</span> {'{ '}<span className="syn-string">User</span>, <span className="syn-string">Session</span>{' }'}</div>
+                <div>{'  '}<span className="syn-function">from</span> <span className="syn-string">"auth-schema"</span>;</div>
+                <div style={{marginTop:8}}><span className="syn-keyword">// No need to read 247 lines</span></div>
+                <div><span className="syn-keyword">// Contract provides the interface</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="s-item" style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
+          <div style={{ background:'#F5E6D0', borderRadius:8, padding:'10px 16px', flex:1, textAlign:'center', border:'1px solid #D4A574' }}>
+            <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:12, color:'#F97316', marginBottom:4 }}>Without Contracts</div>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:12, color:'#92400E' }}>Task B reads full 247-line file</div>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:14, fontWeight:700, color:'#F97316', marginTop:4 }}>~2,400 tokens</div>
+          </div>
+          <div style={{ background:'#F5E6D0', borderRadius:8, padding:'10px 16px', flex:1, textAlign:'center', border:'1px solid #F59E0B' }}>
+            <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:12, color:'#D4A017', marginBottom:4 }}>With Contracts</div>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:12, color:'#92400E' }}>Task B reads 2-line artifact summary</div>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:14, fontWeight:700, color:'#D4A017', marginTop:4 }}>~120 tokens</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ModelRoutingChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.05 });
+  const roles = [
+    { role:'Scaffold / boilerplate', baseline:3, model:'Haiku', color:'#D4A574' },
+    { role:'Standard implementation', baseline:8, model:'Haiku', color:'#D4A574' },
+    { role:'Business logic', baseline:12, model:'Sonnet', color:'#F59E0B' },
+    { role:'Architecture decisions', baseline:15, model:'Sonnet', color:'#F59E0B' },
+    { role:'Security-critical code', baseline:18, model:'Opus', color:'#F97316' },
+    { role:'Complex debugging', baseline:20, model:'Opus', color:'#F97316' },
+  ];
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:800, width:'90%' }}>
+        <div className="s-item"><Title sub="v2 -- model routing">Model Routing</Title></div>
+        <div className="s-item" style={{ marginBottom:20 }}>
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:12, flexWrap:'wrap' }}>
+            <div style={{ background:'#1A1410', borderRadius:6, padding:'4px 12px', fontFamily:'JetBrains Mono', fontSize:12, color:'#FEF3C7' }}>
+              score = <span style={{color:'#F59E0B'}}>role_baseline</span> + <span style={{color:'#FBBF24'}}>complexity_delta</span> + <span style={{color:'#F97316'}}>risk_delta</span>
+            </div>
+          </div>
+          <div style={{ display:'flex', gap:10, marginBottom:16 }}>
+            <div style={{ background:'#D4A574', borderRadius:6, padding:'6px 14px', color:'#fff', fontFamily:'JetBrains Mono', fontSize:11, fontWeight:600 }}>0-8: Haiku</div>
+            <div style={{ background:'#F59E0B', borderRadius:6, padding:'6px 14px', color:'#fff', fontFamily:'JetBrains Mono', fontSize:11, fontWeight:600 }}>9-15: Sonnet</div>
+            <div style={{ background:'#F97316', borderRadius:6, padding:'6px 14px', color:'#fff', fontFamily:'JetBrains Mono', fontSize:11, fontWeight:600 }}>16-20: Opus</div>
+          </div>
+        </div>
+        {/* Role baseline table */}
+        <div style={{ marginBottom:20 }}>
+          <div className="s-item" style={{ display:'grid', gridTemplateColumns:'2fr 1fr 1fr', gap:0 }}>
+            <div style={{ background:'#92400E', color:'#FEF3C7', padding:'8px 12px', fontFamily:'Inter', fontWeight:600, fontSize:12, borderRadius:'8px 0 0 0' }}>Role</div>
+            <div style={{ background:'#92400E', color:'#FEF3C7', padding:'8px 12px', fontFamily:'Inter', fontWeight:600, fontSize:12, textAlign:'center' }}>Baseline</div>
+            <div style={{ background:'#92400E', color:'#FEF3C7', padding:'8px 12px', fontFamily:'Inter', fontWeight:600, fontSize:12, textAlign:'center', borderRadius:'0 8px 0 0' }}>Model</div>
+          </div>
+          {roles.map((r,i) => (
+            <div key={i} className="s-item" style={{ display:'grid', gridTemplateColumns:'2fr 1fr 1fr', gap:0, background: i%2===0 ? '#F5E6D0' : '#F8EFE0' }}>
+              <div style={{ padding:'8px 12px', fontFamily:'JetBrains Mono', fontSize:12, color:'#3D2E1F' }}>{r.role}</div>
+              <div style={{ padding:'8px 12px', fontFamily:'JetBrains Mono', fontSize:12, color:r.color, textAlign:'center', fontWeight:700 }}>{r.baseline}</div>
+              <div style={{ padding:'8px 12px', fontFamily:'JetBrains Mono', fontSize:12, color:r.color, textAlign:'center', fontWeight:600 }}>{r.model}</div>
+            </div>
+          ))}
+        </div>
+        <div className="s-item box-glow-amber" style={{ background:'#F5E6D0', border:'1px solid #F59E0B', borderRadius:10, padding:'14px 20px', textAlign:'center' }}>
+          <div style={{ fontFamily:'JetBrains Mono', fontSize:22, fontWeight:800, color:'#D4A017' }}>30-40% Cost Savings</div>
+          <p style={{ fontSize:13, color:'#92400E', marginTop:4 }}>Haiku handles boilerplate, Opus handles what matters</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CodexHybridChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.06 });
+  const reviewSteps = [
+    { label:'Implementation', sub:'Claude executor writes code', color:'#D4A574' },
+    { label:'Claude Review', sub:'forge-reviewer checks quality', color:'#F59E0B' },
+    { label:'Codex Adversarial', sub:'Codex challenges assumptions', color:'#F97316' },
+    { label:'Merge / Fix', sub:'Issues resolved, code merged', color:'#D4A017' },
+  ];
+  const debugSteps = [
+    { label:'Test Failure', sub:'3x circuit break triggered', color:'#F97316' },
+    { label:'Claude Debug', sub:'Standard debug attempts', color:'#F59E0B' },
+    { label:'Codex Rescue', sub:'Fresh perspective on the bug', color:'#F97316' },
+    { label:'Resolution', sub:'Fix applied, tests pass', color:'#D4A017' },
+  ];
+  const Pipeline = ({title, steps, color}) => (
+    <div className="s-item" style={{ flex:1, minWidth:280 }}>
+      <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:14, color, marginBottom:12 }}>{title}</div>
+      <div style={{ display:'flex', flexDirection:'column', gap:0 }}>
+        {steps.map((s,i) => (
+          <React.Fragment key={i}>
+            <div style={{ background:'#F5E6D0', borderLeft:`3px solid ${s.color}`, borderRadius:'0 8px 8px 0', padding:'10px 14px' }}>
+              <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:13, color:s.color }}>{s.label}</div>
+              <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#92400E', marginTop:2 }}>{s.sub}</div>
+            </div>
+            {i < steps.length-1 && (
+              <div style={{ display:'flex', justifyContent:'center', padding:'4px 0' }}>
+                <svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0 L6 12 M2 8 L6 14 L10 8" stroke="#D4A574" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              </div>
+            )}
+          </React.Fragment>
+        ))}
+      </div>
+    </div>
+  );
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:900, width:'90%' }}>
+        <div className="s-item"><Title sub="v2 -- codex integration">Codex Hybrid</Title></div>
+        <div style={{ display:'flex', gap:32, flexWrap:'wrap' }}>
+          <Pipeline title="Adversarial Review Gate" steps={reviewSteps} color="#F97316"/>
+          <Pipeline title="Debug Rescue Escalation" steps={debugSteps} color="#F59E0B"/>
+        </div>
+        <div className="s-item" style={{ marginTop:20, background:'#F5E6D0', borderRadius:10, padding:'14px 20px', border:'1px solid #D4A574' }}>
+          <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:13, color:'#92400E', marginBottom:6 }}>Two Integration Points</div>
+          <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#F97316' }}>1. Post-review adversarial challenge -- catches blind spots Claude misses</div>
+            <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#F59E0B' }}>2. Debug rescue -- fresh model breaks out of stuck loops</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TokenSavingHooksChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.07 });
+  const hooks = [
+    {
+      name:'Test Filter Hook',
+      desc:'Strips passing test output, surfaces only failures',
+      before:'Full test suite output: 847 lines',
+      after:'Filtered to 12 relevant failure lines',
+      saving:'~8,000 tokens/run',
+      color:'#F97316',
+    },
+    {
+      name:'Tool Cache Hook',
+      desc:'Caches repeated tool calls (file reads, ls) across iterations',
+      before:'Re-read same file 6 times during debug loop',
+      after:'Cached after first read, served from memory',
+      saving:'~5,000 tokens/task',
+      color:'#F59E0B',
+    },
+    {
+      name:'Progress Tracker Hook',
+      desc:'Compresses progress updates into single-line summaries',
+      before:'Verbose step-by-step narration in context',
+      after:'Compact progress line: [6/9] Auth -- PASS',
+      saving:'~3,000 tokens/phase',
+      color:'#D4A017',
+    },
+  ];
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:800, width:'90%' }}>
+        <div className="s-item"><Title sub="v2 -- token efficiency">Token-Saving Hooks</Title></div>
+        <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+          {hooks.map((h,i) => (
+            <div key={i} className="s-item" style={{ background:'#F5E6D0', borderRadius:10, padding:16, border:`1px solid ${h.color}` }}>
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8, flexWrap:'wrap', gap:8 }}>
+                <div style={{ fontFamily:'Inter', fontWeight:600, fontSize:15, color:h.color }}>{h.name}</div>
+                <div style={{ background:h.color, color:'#fff', fontFamily:'JetBrains Mono', fontSize:11, padding:'3px 10px', borderRadius:6, fontWeight:700 }}>{h.saving}</div>
+              </div>
+              <div style={{ fontFamily:'JetBrains Mono', fontSize:12, color:'#92400E', marginBottom:8 }}>{h.desc}</div>
+              <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
+                <div style={{ flex:1, minWidth:200, background:'#1A1410', borderRadius:6, padding:'8px 12px' }}>
+                  <div style={{ fontFamily:'JetBrains Mono', fontSize:9, color:'#F97316', marginBottom:3, textTransform:'uppercase' }}>Before</div>
+                  <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#FEF3C7' }}>{h.before}</div>
+                </div>
+                <div style={{ flex:1, minWidth:200, background:'#1A1410', borderRadius:6, padding:'8px 12px' }}>
+                  <div style={{ fontFamily:'JetBrains Mono', fontSize:9, color:'#D4A017', marginBottom:3, textTransform:'uppercase' }}>After</div>
+                  <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#FEF3C7' }}>{h.after}</div>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="s-item box-glow-gold" style={{ textAlign:'center', marginTop:16, background:'#F5E6D0', border:'2px solid #FBBF24', borderRadius:10, padding:14 }}>
+          <div style={{ fontFamily:'JetBrains Mono', fontSize:20, fontWeight:800, color:'#D4A017' }}>~16,000 tokens saved per phase</div>
+          <p style={{ fontSize:12, color:'#92400E', marginTop:4 }}>More budget for the work that matters</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ReDecompositionChapter() {
+  const ref = useRef(null);
+  useStagger(ref, '.s-item', { stagger: 0.06 });
+  const original = { id:'Task 3', name:'WebSocket Server', status:'FAILED' };
+  const subs = [
+    { id:'3.1', name:'Connection handler', status:'PASS' },
+    { id:'3.2', name:'Message routing', status:'PASS' },
+    { id:'3.3', name:'Heartbeat/reconnect', status:'PASS' },
+  ];
+  return (
+    <div ref={ref} className="chapter">
+      <div style={{ maxWidth:700, width:'90%' }}>
+        <div className="s-item"><Title sub="v2 -- adaptive recovery">Re-Decomposition</Title></div>
+        {/* Original failed task */}
+        <div className="s-item" style={{ background:'#F5E6D0', borderLeft:'3px solid #F97316', borderRadius:'0 8px 8px 0', padding:'12px 16px', marginBottom:8 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+            <div>
+              <span style={{ fontFamily:'JetBrains Mono', fontSize:12, color:'#F97316', fontWeight:600 }}>{original.id}</span>
+              <span style={{ fontFamily:'Inter', fontSize:14, color:'#3D2E1F', marginLeft:10 }}>{original.name}</span>
+            </div>
+            <span style={{ background:'#F97316', color:'#fff', fontFamily:'JetBrains Mono', fontSize:10, padding:'2px 8px', borderRadius:4, fontWeight:700 }}>FAILED</span>
+          </div>
+        </div>
+        {/* Decomposition arrow */}
+        <div className="s-item" style={{ textAlign:'center', padding:'8px 0' }}>
+          <svg width="200" height="40" viewBox="0 0 200 40">
+            <path d="M100 0 L100 20" stroke="#F59E0B" strokeWidth="2"/>
+            <path d="M100 20 L30 35" stroke="#F59E0B" strokeWidth="1.5"/>
+            <path d="M100 20 L100 35" stroke="#F59E0B" strokeWidth="1.5"/>
+            <path d="M100 20 L170 35" stroke="#F59E0B" strokeWidth="1.5"/>
+            <circle cx="30" cy="35" r="3" fill="#F59E0B"/>
+            <circle cx="100" cy="35" r="3" fill="#F59E0B"/>
+            <circle cx="170" cy="35" r="3" fill="#F59E0B"/>
+          </svg>
+          <div style={{ fontFamily:'JetBrains Mono', fontSize:11, color:'#F59E0B', fontWeight:600 }}>Re-decompose into sub-tasks</div>
+        </div>
+        {/* Sub-tasks */}
+        <div style={{ display:'flex', flexDirection:'column', gap:6, marginBottom:16 }}>
+          {subs.map((s,i) => (
+            <div key={i} className="s-item" style={{ background:'#F5E6D0', borderLeft:'3px solid #D4A017', borderRadius:'0 8px 8px 0', padding:'10px 16px' }}>
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                <div>
+                  <span style={{ fontFamily:'JetBrains Mono', fontSize:12, color:'#D4A017', fontWeight:600 }}>{s.id}</span>
+                  <span style={{ fontFamily:'Inter', fontSize:13, color:'#3D2E1F', marginLeft:10 }}>{s.name}</span>
+                </div>
+                <span style={{ background:'#D4A017', color:'#fff', fontFamily:'JetBrains Mono', fontSize:10, padding:'2px 8px', borderRadius:4, fontWeight:700 }}>{s.status}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+        {/* Flow explanation */}
+        <div className="s-item" style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap', marginBottom:16, fontFamily:'JetBrains Mono', fontSize:11, color:'#92400E' }}>
+          <span style={{ background:'#F97316', color:'#fff', padding:'2px 8px', borderRadius:4, fontSize:10, fontWeight:600 }}>Task fails</span>
+          <span style={{ color:'#F59E0B' }}>--></span>
+          <span style={{ background:'#F59E0B', color:'#fff', padding:'2px 8px', borderRadius:4, fontSize:10, fontWeight:600 }}>Break into 3.1, 3.2, 3.3</span>
+          <span style={{ color:'#F59E0B' }}>--></span>
+          <span style={{ background:'#D4A017', color:'#fff', padding:'2px 8px', borderRadius:4, fontSize:10, fontWeight:600 }}>Solve smaller pieces</span>
+          <span style={{ color:'#F59E0B' }}>--></span>
+          <span style={{ background:'#92400E', color:'#FBBF24', padding:'2px 8px', borderRadius:4, fontSize:10, fontWeight:600 }}>Still stuck? Human</span>
+        </div>
+        <div className="s-item" style={{ background:'#F5E6D0', borderRadius:8, padding:12, border:'1px solid #D4A574' }}>
+          <div style={{ fontFamily:'JetBrains Mono', fontSize:12, color:'#92400E' }}>Decimal IDs (3.1, 3.2, 3.3) preserve the original task ordering while making the decomposition hierarchy explicit. Sub-tasks inherit the parent's deps and spec references.</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CompletionChapter() {
   const ref = useRef(null);
   useStagger(ref, '.s-item', { stagger: 0.06 });
@@ -755,6 +1135,12 @@ function App() {
       <VerificationChapter/>
       <BackpropChapter/>
       <MultiRepoChapter/>
+      <StreamingDAGChapter/>
+      <ArtifactContractsChapter/>
+      <ModelRoutingChapter/>
+      <CodexHybridChapter/>
+      <TokenSavingHooksChapter/>
+      <ReDecompositionChapter/>
       <CompletionChapter/>
     </React.Fragment>
   );
