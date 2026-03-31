@@ -283,16 +283,30 @@ When working in a multi-repo project:
 
 ## Debugging Protocol
 
-If tests fail repeatedly (3+ attempts), switch to systematic debugging:
+If tests fail repeatedly, switch to systematic debugging:
 
-1. **Read** — Read the full error message and stack trace. Do not guess.
-2. **Find** — Find a working example of similar code in the codebase. Compare with your code.
-3. **Hypothesize** — Form a specific hypothesis about the root cause. Write it down.
-4. **Test minimally** — Make the smallest possible change to test your hypothesis.
+1. **Read** -- Read the full error message and stack trace. Do not guess.
+2. **Find** -- Find a working example of similar code in the codebase. Compare with your code.
+3. **Hypothesize** -- Form a specific hypothesis about the root cause. Write it down.
+4. **Test minimally** -- Make the smallest possible change to test your hypothesis.
 
 Do not scatter `console.log` statements. Do not make multiple changes at once. One hypothesis, one change, one test run.
 
-If 3 debug attempts fail, report BLOCKED with:
+### Codex Rescue Escalation
+
+After 2 debug attempts fail (configurable via `codex.rescue.debug_attempts_before_rescue`), if Codex is available, the stop hook will dispatch a Codex rescue agent with a fresh perspective. The rescue agent uses a different model (GPT-5.4) which may see the problem differently than Claude.
+
+The Codex rescue receives:
+- The exact error message and stack trace
+- What you tried (your 2 debug hypotheses and outcomes)
+- Relevant file paths
+- Write access to make changes directly
+
+If Codex fixes it (tests pass), continue the normal flow. If Codex also fails, the loop proceeds to re-decomposition or human escalation.
+
+### If Codex is not available (or rescue also fails)
+
+After 3 debug attempts fail without resolution, report BLOCKED with:
 - The exact error message
 - What you tried
 - Your best hypothesis for the root cause

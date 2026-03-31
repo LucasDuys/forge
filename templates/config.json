@@ -67,5 +67,19 @@
   "redecomposition": {
     "enabled": true,
     "max_expansion_depth": 1
+  },
+  "codex": {
+    "enabled": true,
+    "review": {
+      "enabled": true,
+      "depth_threshold": "standard",
+      "model": "gpt-5.4-mini",
+      "sensitive_tags": ["security", "shared", "api-export"]
+    },
+    "rescue": {
+      "enabled": true,
+      "debug_attempts_before_rescue": 2,
+      "model": null
+    }
   }
 }

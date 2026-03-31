@@ -77,7 +77,21 @@ const DEFAULT_CONFIG = {
   },
   hooks_config: { test_filter: true, progress_tracker: true, tool_cache: true, tool_cache_ttl: 120 },
   replanning: { enabled: true, concern_threshold: 0.3 },
-  redecomposition: { enabled: true, max_expansion_depth: 1 }
+  redecomposition: { enabled: true, max_expansion_depth: 1 },
+  codex: {
+    enabled: true,
+    review: {
+      enabled: true,
+      depth_threshold: 'standard',
+      model: 'gpt-5.4-mini',
+      sensitive_tags: ['security', 'shared', 'api-export']
+    },
+    rescue: {
+      enabled: true,
+      debug_attempts_before_rescue: 2,
+      model: null
+    }
+  }
 };
 
 function loadConfig(projectDir) {
@@ -588,6 +602,60 @@ function discoverCapabilities(projectDir, claudeJsonPath) {
     try { return fs.statSync(p).isDirectory(); } catch { return false; }
   });
 
+  // Detect Codex CLI and plugin availability
+  caps.codex = { available: false, reason: 'not checked' };
+  try {
+    // Check Codex CLI
+    let codexVersion = null;
+    try {
+      codexVersion = execFileSync('codex', ['--version'], {
+        encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
+      }).trim();
+    } catch (e) {
+      caps.codex = { available: false, reason: 'Codex CLI not installed' };
+      return caps;
+    }
+
+    // Check codex-companion.mjs in plugin cache
+    let pluginRoot = null;
+    const pluginSearchPaths = [
+      path.join(home, '.claude', 'plugins', 'cache', 'openai-codex'),
+      path.join(home, '.claude', 'plugins', 'marketplaces', 'openai-codex'),
+    ];
+    for (const searchPath of pluginSearchPaths) {
+      try {
+        const walkDir = (dir, depth) => {
+          if (depth > 3) return null;
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          for (const e of entries) {
+            if (e.name === 'codex-companion.mjs') return dir;
+            if (e.isDirectory()) {
+              const found = walkDir(path.join(dir, e.name), depth + 1);
+              if (found) return found;
+            }
+          }
+          return null;
+        };
+        const found = walkDir(searchPath, 0);
+        if (found) { pluginRoot = found; break; }
+      } catch (e) { /* path not found */ }
+    }
+
+    if (!pluginRoot) {
+      caps.codex = { available: false, version: codexVersion, reason: 'Codex plugin not installed' };
+    } else {
+      caps.codex = {
+        available: true,
+        version: codexVersion,
+        pluginRoot,
+        companionPath: path.join(pluginRoot, 'codex-companion.mjs'),
+        reason: null
+      };
+    }
+  } catch (e) {
+    caps.codex = { available: false, reason: 'Detection failed: ' + e.message };
+  }
+
   return caps;
 }
 
@@ -859,6 +927,104 @@ function hasFileOverlap(task, registry) {
   return false;
 }
 
+// === Codex Integration ===
+// Checks whether Codex adversarial review or rescue should run for a given task.
+
+function shouldRunCodexReview(task, depth, forgeDir) {
+  const config = loadConfig(path.dirname(forgeDir));
+  const codexConfig = config.codex || {};
+  if (codexConfig.enabled === false) return false;
+  const reviewConfig = codexConfig.review || {};
+  if (reviewConfig.enabled === false) return false;
+
+  // Check capability
+  let caps;
+  try {
+    caps = JSON.parse(fs.readFileSync(path.join(forgeDir, '..', '.forge', 'capabilities.json'), 'utf8'));
+  } catch (e) {
+    try {
+      caps = JSON.parse(fs.readFileSync(path.join(forgeDir, 'capabilities.json'), 'utf8'));
+    } catch (e2) { return false; }
+  }
+  if (!caps.codex || !caps.codex.available) return false;
+
+  // Depth gating
+  if (depth === 'quick') return false;
+  if (depth === 'thorough') return true;
+
+  // Standard depth: only sensitive tasks
+  const sensitiveTags = reviewConfig.sensitive_tags || ['security', 'shared', 'api-export'];
+  const taskName = (task.name || '').toLowerCase();
+  return sensitiveTags.some(tag => taskName.includes(tag));
+}
+
+function shouldRunCodexRescue(forgeDir, debugAttempts) {
+  const config = loadConfig(path.dirname(forgeDir));
+  const codexConfig = config.codex || {};
+  if (codexConfig.enabled === false) return false;
+  const rescueConfig = codexConfig.rescue || {};
+  if (rescueConfig.enabled === false) return false;
+
+  const threshold = rescueConfig.debug_attempts_before_rescue || 2;
+  if (debugAttempts < threshold) return false;
+
+  // Check capability
+  let caps;
+  try {
+    caps = JSON.parse(fs.readFileSync(path.join(forgeDir, 'capabilities.json'), 'utf8'));
+  } catch (e) { return false; }
+  return caps.codex && caps.codex.available;
+}
+
+function buildCodexReviewPrompt(task, forgeDir) {
+  const config = loadConfig(path.dirname(forgeDir));
+  const model = (config.codex || {}).review?.model || 'gpt-5.4-mini';
+
+  return `Run Codex adversarial review on the uncommitted changes for task ${task.id}: ${task.name}.
+
+Dispatch the codex:codex-rescue subagent (or invoke codex-companion.mjs directly) with:
+
+\`\`\`bash
+node "\${CLAUDE_PLUGIN_ROOT_CODEX}/scripts/codex-companion.mjs" review --scope working-tree --model ${model}
+\`\`\`
+
+If Codex is not available via the companion script, use the Agent tool with subagent_type "codex:codex-rescue" and prompt:
+"Review the uncommitted changes in the working tree. Focus on: race conditions, edge cases, hidden assumptions, security issues. Return findings with severity (CRITICAL/IMPORTANT/MINOR) and file:line references."
+
+After receiving results:
+- CRITICAL issues: fix them, re-run tests, update state.md task_status to "fixing"
+- IMPORTANT/MINOR issues: log in state.md under "Key Decisions", proceed to commit
+- No issues: proceed to commit
+
+Update state.md task_status to "codex-reviewed" when done.`;
+}
+
+function buildCodexRescuePrompt(task, errorContext, debugAttempts) {
+  return `Task ${task.id} is stuck after ${debugAttempts} debug attempts. Escalate to Codex rescue for a fresh perspective.
+
+Dispatch the codex:codex-rescue subagent with this prompt:
+
+<task>
+Diagnose why tests are failing for "${task.name}" in this repository.
+Claude Code attempted ${debugAttempts} fixes that didn't work.
+Error context: ${errorContext}
+</task>
+
+<compact_output_contract>
+Return: 1. most likely root cause, 2. evidence from the code, 3. smallest safe fix
+</compact_output_contract>
+
+<default_follow_through_policy>
+Default to the most reasonable interpretation. Apply the fix directly (--write mode).
+</default_follow_through_policy>
+
+Use the --write flag so Codex can make changes directly.
+
+After Codex returns:
+- If tests pass with Codex's fix: update state.md task_status to "testing", continue
+- If Codex also fails: update state.md task_status to "blocked", the loop will handle re-decomposition or human escalation`;
+}
+
 // === Adaptive Replanning ===
 // After a wave of tasks completes, check if replanning is warranted.
 
@@ -1025,6 +1191,18 @@ function routeDecision(forgeDir, iteration, transcriptPath) {
           return advanceToNextTask(tasks, state, forgeDir, currentSpec,
             `Review circuit breaker triggered (${reviewCount}/${maxReviews} iterations). Accepting current implementation with warnings. Commit and move on.`);
         }
+        // Check if Codex adversarial review should run before committing
+        const currentTaskObj = tasks.find(t => t.id === currentTask);
+        if (currentTaskObj && shouldRunCodexReview(currentTaskObj, depth, forgeDir)) {
+          state.data.task_status = 'codex-reviewing';
+          writeState(forgeDir, state.data, state.content);
+          return buildCodexReviewPrompt(currentTaskObj, forgeDir);
+        }
+        return advanceToNextTask(tasks, state, forgeDir, currentSpec);
+      }
+
+      if (effectiveTaskStatus === 'codex-reviewing' || effectiveTaskStatus === 'codex-reviewed') {
+        // Codex review done, proceed to commit
         return advanceToNextTask(tasks, state, forgeDir, currentSpec);
       }
 
@@ -1032,8 +1210,25 @@ function routeDecision(forgeDir, iteration, transcriptPath) {
         return `Fix the issues identified in review for ${currentTask}, then re-run tests to confirm they still pass. Update .forge/state.md task_status to "testing" when done.`;
       }
 
+      if (effectiveTaskStatus === 'codex-rescuing') {
+        // Codex rescue completed -- check if it worked
+        return `Codex rescue for ${currentTask} has been dispatched. Check if tests pass now. If yes, update state.md task_status to "testing" and continue. If still failing, update to "blocked".`;
+      }
+
       if (effectiveTaskStatus === 'debugging') {
         const debugAttempts = state.data.debug_attempts || 0;
+
+        // Codex rescue: try before exhausting debug circuit breaker
+        if (shouldRunCodexRescue(forgeDir, debugAttempts)) {
+          const currentTaskObj = tasks.find(t => t.id === currentTask);
+          if (currentTaskObj) {
+            state.data.task_status = 'codex-rescuing';
+            writeState(forgeDir, state.data, state.content);
+            const errorContext = state.data.blocked_reason || state.content.match(/error[:\s](.{0,200})/i)?.[1] || 'unknown';
+            return buildCodexRescuePrompt(currentTaskObj, errorContext, debugAttempts);
+          }
+        }
+
         if (debugAttempts >= config.loop.circuit_breaker_debug_attempts) {
           // --- Fix #10: Auto-invoke backprop before giving up ---
           // Instead of immediately blocking, give Claude one chance to trace
@@ -1441,6 +1636,8 @@ module.exports = {
   discoverCapabilities, generateResumePrompt, generateSummary, inferMcpUse,
   routeDecision, findNextUnblockedTask, findAllUnblockedTasks,
   getReadyTasks, hasFileOverlap, shouldReplan,
+  shouldRunCodexReview, shouldRunCodexRescue,
+  buildCodexReviewPrompt, buildCodexRescuePrompt,
   writeArtifact, readArtifact, buildArtifactSummary,
   buildContextBundle, cleanupContextBundle,
   buildTaskPrompt, advanceToNextTask,
