@@ -395,6 +395,109 @@ function parseFrontier(text) {
   return tasks;
 }
 
+// === Artifact Contracts ===
+// Typed artifact output from task executors. Each completed task writes
+// an artifact JSON file that downstream tasks can consume for context.
+
+function writeArtifact(forgeDir, taskId, artifact) {
+  const artifactsDir = path.join(forgeDir, 'artifacts');
+  try { fs.mkdirSync(artifactsDir, { recursive: true }); } catch (e) {}
+  const data = {
+    task_id: taskId,
+    status: artifact.status || 'complete',
+    commit: artifact.commit || null,
+    artifacts: artifact.artifacts || {},
+    files_created: artifact.files_created || [],
+    files_modified: artifact.files_modified || [],
+    key_decisions: artifact.key_decisions || [],
+    completed_at: new Date().toISOString()
+  };
+  fs.writeFileSync(path.join(artifactsDir, `${taskId}.json`), JSON.stringify(data, null, 2));
+  return data;
+}
+
+function readArtifact(forgeDir, taskId) {
+  try {
+    const filePath = path.join(forgeDir, 'artifacts', `${taskId}.json`);
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+function buildArtifactSummary(forgeDir, taskIds) {
+  const lines = [];
+  for (const taskId of taskIds) {
+    const artifact = readArtifact(forgeDir, taskId);
+    if (!artifact) continue;
+    const artNames = Object.keys(artifact.artifacts);
+    const artDetails = artNames.map(name => {
+      const desc = artifact.artifacts[name];
+      return `${name} (${desc})`;
+    }).join(', ');
+    const files = [...artifact.files_created, ...artifact.files_modified];
+    const fileStr = files.length > 0 ? ` | files: ${files.slice(0, 5).join(', ')}` : '';
+    lines.push(`- ${taskId}: ${artDetails || 'no named artifacts'}${fileStr}`);
+    if (artifact.key_decisions.length > 0) {
+      for (const decision of artifact.key_decisions.slice(0, 2)) {
+        lines.push(`  decision: ${decision}`);
+      }
+    }
+  }
+  return lines.length > 0 ? 'Dependency artifacts:\n' + lines.join('\n') : '';
+}
+
+// Build a context bundle file for a task, assembling only relevant context
+function buildContextBundle(forgeDir, task, specContent, frontierTasks) {
+  const bundleDir = path.join(forgeDir, 'context-bundles');
+  try { fs.mkdirSync(bundleDir, { recursive: true }); } catch (e) {}
+
+  const sections = [];
+  sections.push(`# Context for ${task.id}: ${task.name}\n`);
+
+  // Extract relevant spec requirements (match R-numbers from task name/description)
+  if (specContent) {
+    const reqBlocks = [];
+    const reqMatches = specContent.match(/### R\d+:[\s\S]*?(?=### R\d+:|## Future|$)/g);
+    if (reqMatches) {
+      // Include requirements referenced in task consumes or all if none specified
+      for (const block of reqMatches) {
+        reqBlocks.push(block.trim());
+      }
+    }
+    if (reqBlocks.length > 0) {
+      sections.push('## Relevant Requirements\n' + reqBlocks.join('\n\n'));
+    }
+  }
+
+  // Artifact summaries from dependencies
+  if (task.depends.length > 0) {
+    const summary = buildArtifactSummary(forgeDir, task.depends);
+    if (summary) sections.push('## ' + summary);
+  }
+
+  // Remaining frontier overview (compact)
+  if (frontierTasks) {
+    const remaining = frontierTasks.filter(t => t.id !== task.id && t.status !== 'complete');
+    if (remaining.length > 0) {
+      const overview = remaining.slice(0, 10).map(t =>
+        `- ${t.id}: ${t.name}${t.depends.length ? ` (depends: ${t.depends.join(', ')})` : ''}`
+      ).join('\n');
+      sections.push(`## Remaining Tasks (${remaining.length} total)\n${overview}`);
+    }
+  }
+
+  const bundlePath = path.join(bundleDir, `${task.id}.md`);
+  fs.writeFileSync(bundlePath, sections.join('\n\n'));
+  return bundlePath;
+}
+
+function cleanupContextBundle(forgeDir, taskId) {
+  try {
+    fs.unlinkSync(path.join(forgeDir, 'context-bundles', `${taskId}.md`));
+  } catch (e) { /* already cleaned or never created */ }
+}
+
 // === Capability Discovery ===
 
 function discoverCapabilities(projectDir, claudeJsonPath) {
@@ -756,6 +859,32 @@ function hasFileOverlap(task, registry) {
   return false;
 }
 
+// === Adaptive Replanning ===
+// After a wave of tasks completes, check if replanning is warranted.
+
+function shouldReplan(forgeDir, completedTaskIds) {
+  const config = loadConfig(path.dirname(forgeDir));
+  const replanConfig = config.replanning || {};
+  if (replanConfig.enabled === false) return false;
+
+  const threshold = replanConfig.concern_threshold || 0.3;
+  const registry = readTaskRegistry(forgeDir);
+
+  let concernCount = 0;
+  let totalChecked = 0;
+  for (const id of completedTaskIds) {
+    const info = registry.tasks[id];
+    if (!info) continue;
+    totalChecked++;
+    if (info.status === 'complete_with_concerns' || info.concerns) {
+      concernCount++;
+    }
+  }
+
+  if (totalChecked === 0) return false;
+  return (concernCount / totalChecked) >= threshold;
+}
+
 // === CLI: Route Command (called by stop-hook.sh) ===
 
 function routeDecision(forgeDir, iteration, transcriptPath) {
@@ -935,6 +1064,31 @@ If the issue is not a spec gap (infrastructure, environment, dependency):
       }
 
       if (effectiveTaskStatus === 'blocked') {
+        // Attempt re-decomposition before giving up to human
+        const redecompConfig = config.redecomposition || {};
+        if (redecompConfig.enabled !== false) {
+          const expansionDepth = state.data.expansion_depth || 0;
+          const maxDepth = redecompConfig.max_expansion_depth || 1;
+          if (expansionDepth < maxDepth) {
+            state.data.task_status = 'redecomposing';
+            state.data.expansion_depth = expansionDepth + 1;
+            writeState(forgeDir, state.data, state.content);
+            const reason = state.data.blocked_reason || 'unknown';
+            return `Task ${currentTask} is blocked after exhausting debug attempts. Before escalating to human, attempt to re-decompose this task into 2-3 smaller sub-tasks.
+
+Use the Agent tool to dispatch a forge-planner agent with:
+- The failed task description and blocked reason: "${reason}"
+- The spec file for context
+- Instructions to break ${currentTask} into sub-tasks with decimal IDs (e.g., ${currentTask}.1, ${currentTask}.2)
+
+Sub-tasks should:
+- Inherit ${currentTask}'s dependencies
+- Each tackle a smaller, more isolated piece of the problem
+- Be written to the frontier file as new entries
+
+After creating sub-tasks, update .forge/task-status.json to mark ${currentTask} as "redecomposed" and add the new sub-task entries as "pending". Then update state.md task_status to "complete" so the loop advances to the next ready task.`;
+          }
+        }
         return ''; // Allow exit — needs human
       }
 
@@ -1059,9 +1213,35 @@ function buildTaskPrompt(task, forgeDir, depth) {
     }
   } catch (e) { /* no specs dir */ }
 
-  let prompt = `Implement task ${task.id}: ${task.name}\n\n${specInfo}\n\n`;
+  let prompt = `Implement task ${task.id}: ${task.name}\n\n`;
+
+  // Context bundle (pre-assembled, curated context)
+  const bundlePath = path.join(forgeDir, 'context-bundles', `${task.id}.md`);
+  if (fs.existsSync(bundlePath)) {
+    prompt += `Read the context bundle at .forge/context-bundles/${task.id}.md for curated context (spec requirements, dependency artifacts, conventions).\n\n`;
+  } else {
+    prompt += `${specInfo}\n\n`;
+  }
+
+  // Artifact summaries from dependencies
+  if (task.depends && task.depends.length > 0) {
+    const summary = buildArtifactSummary(forgeDir, task.depends);
+    if (summary) prompt += `${summary}\n\n`;
+  }
 
   if (task.repo) prompt += `This task targets the "${task.repo}" repo.\n`;
+
+  // Model advisory (from router)
+  try {
+    const config = loadConfig(path.dirname(forgeDir));
+    if (config.model_routing && config.model_routing.enabled !== false) {
+      const router = require('./forge-router.cjs');
+      const budget = require('./forge-budget.cjs');
+      const budgetState = budget.getBudgetState(forgeDir, config);
+      const advisory = router.buildModelAdvisory(task, 'forge-executor', config, budgetState);
+      prompt += `\n## Model Advisory\n${advisory.advisory}\n`;
+    }
+  } catch (e) { /* router not available, skip */ }
 
   if (depth === 'thorough') {
     prompt += `Use TDD: write failing test first, then implement, then verify tests pass.\n`;
@@ -1073,6 +1253,11 @@ function buildTaskPrompt(task, forgeDir, depth) {
 
   prompt += `\nAfter completing, update .forge/state.md: set task_status to "testing" and describe what you implemented under "In-Flight Work".`;
   prompt += `\nAlso update .forge/task-status.json to track this task's completion status.`;
+
+  // Artifact writing instruction
+  if (task.provides && task.provides.length > 0) {
+    prompt += `\n\nThis task provides artifacts: ${task.provides.join(', ')}. After committing, write an artifact file to .forge/artifacts/${task.id}.json with the artifact names as keys and descriptions of what was produced as values.`;
+  }
 
   return prompt;
 }
@@ -1255,7 +1440,9 @@ module.exports = {
   updateTokenLedger, parseFrontier,
   discoverCapabilities, generateResumePrompt, generateSummary, inferMcpUse,
   routeDecision, findNextUnblockedTask, findAllUnblockedTasks,
-  getReadyTasks, hasFileOverlap,
+  getReadyTasks, hasFileOverlap, shouldReplan,
+  writeArtifact, readArtifact, buildArtifactSummary,
+  buildContextBundle, cleanupContextBundle,
   buildTaskPrompt, advanceToNextTask,
   readTaskRegistry, writeTaskRegistry, markTaskComplete, initTaskRegistry,
   getProgressSnapshot, checkProgress, getNoProgressCount,

@@ -1,0 +1,12 @@
+{
+  "task_id": "T001",
+  "status": "complete",
+  "commit": null,
+  "artifacts": {
+    "artifact_name": "path/to/file.ts -- brief description of what was produced"
+  },
+  "files_created": [],
+  "files_modified": [],
+  "key_decisions": [],
+  "completed_at": "2026-01-01T00:00:00.000Z"
+}
