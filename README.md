@@ -12,7 +12,11 @@
   <a href="https://github.com/LucasDuys/forge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
   <a href="https://github.com/LucasDuys/forge/stargazers"><img src="https://img.shields.io/github/stars/LucasDuys/forge?style=flat" alt="Stars"></a>
   <a href="https://github.com/LucasDuys/forge/releases"><img src="https://img.shields.io/badge/version-2.0-green" alt="Version"></a>
-  <a href="https://github.com/LucasDuys/forge/issues"><img src="https://img.shields.io/github/issues/LucasDuys/forge" alt="Issues"></a>
+  <a href="https://lucasduys.github.io/forge/"><img src="https://img.shields.io/badge/docs-architecture_video-orange" alt="Docs"></a>
+</p>
+
+<p align="center">
+  <a href="https://lucasduys.github.io/forge/">Watch the architecture video</a>
 </p>
 
 ---
@@ -23,338 +27,216 @@ Claude Code is powerful, but for non-trivial features you become the glue: promp
 
 **Forge replaces that entire loop with three commands.**
 
-## The Pipeline
-
 ```
-/forge:brainstorm                 /forge:plan                        /forge:execute
-
-"Add real-time collab       -->   Dependency DAG with            --> Streaming execution:
- with conflict resolution          typed artifact contracts,         tasks launch the instant
- and live cursors"                 model routing, context             deps complete. Implement,
-                                   bundles per task                   test, review, commit.
-
-Interactive Q&A that               Smart depth detection:            Runs unattended.
-produces a formal spec             quick | standard | thorough       Self-corrects on failures.
-with R-numbered requirements       Token budget per task             Handles context resets.
+/forge brainstorm "your feature idea"
+/forge plan
+/forge execute --autonomy full
 ```
 
-## Quick Start
+No `npm install`, no build step, no dependencies. Requires Claude Code v1.0.33+.
 
 ```bash
 claude plugin marketplace add LucasDuys/forge
 claude plugin install forge@forge-marketplace
 ```
 
-```bash
-/forge:brainstorm "build a REST API for task management"
-/forge:plan
-/forge:execute
-```
-
-That is it. No `npm install`, no build step, no dependencies. Requires Claude Code v1.0.33+.
-
----
-
-## Before and After
-
-| | Without Forge | With Forge |
-|---|---|---|
-| **Planning** | You decompose features mentally, forget edge cases | Formal spec with numbered requirements + acceptance criteria |
-| **Execution** | Prompt, review, re-prompt, lose context, repeat | Autonomous DAG execution across sessions |
-| **Testing** | "Can you add tests?" after the fact | TDD built into every task cycle |
-| **Review** | You eyeball the diff | Blast radius analysis + spec compliance + convention matching |
-| **Context resets** | Start over, lose progress | Auto-save at 60% usage, seamless resume |
-| **Cost** | Every agent runs on the same model | Intelligent routing: haiku for simple tasks, opus only when needed |
-
----
-
-## What's New in V2
-
-### Streaming DAG Execution
-
-V1 waited for an entire tier of tasks to finish before starting the next tier. V2 launches each task the instant its specific dependencies complete.
-
-- **20-40% faster wall-clock time** on standard and thorough depth plans
-- Configurable concurrency: `max_concurrent_agents` (default: 3)
-- Automatic file overlap detection prevents conflicts between parallel tasks
-
-### Typed Artifact Contracts
-
-Tasks declare what they `provides:` and what they `consumes:`. Executors write structured artifact JSON. Downstream agents receive 2-3 line summaries instead of re-reading source files.
-
-- **5-15K token savings per execution** from eliminated redundant file reads
-- Catches missing integration points at plan time, not at runtime
-- Artifacts are typed (schema, endpoint, component, config) for precise routing
-
-### Intelligent Model Routing
-
-Every task is scored 0-20 across 5 complexity dimensions, then mapped to the right model.
-
-| Model | Cost Weight | Used For |
-|-------|------------|----------|
-| Haiku | 1x | Simple implementations, config changes, boilerplate |
-| Sonnet | 5x | Standard features, all reviews (minimum baseline) |
-| Opus | 25x | Complex architecture, security-critical code |
-
-Role baselines ensure reviewers never drop below Sonnet. **30-40% cost reduction** compared to running everything on the same model.
-
-### Codex Hybrid Integration
-
-Forge optionally integrates [OpenAI Codex CLI](https://github.com/openai/codex) as a second AI model at two critical points in the execution loop. The core insight: **using a different model for review than for implementation eliminates correlated blind spots**.
-
-**Adversarial Review Gate** -- After Claude's forge-reviewer passes a task, Codex (GPT-5.4-mini) reviews the same diff looking specifically for race conditions, edge cases, and hidden assumptions. Claude is strong at spec compliance; Codex catches what a single-model pipeline misses. Adds ~6% cost at standard depth.
-
-**Debug Rescue Escalation** -- When Claude is stuck after 2 debug attempts, Forge dispatches a Codex rescue agent with a structured diagnosis prompt. A different model often sees the root cause immediately because it reasons differently. One rescue call ($0.50) is cheaper than 3 more Claude attempts (~$1.50+) with diminishing returns.
-
-```
-Claude implements --> Claude reviews --> Codex adversarial review --> commit
-                                              |
-Claude debugging (2 attempts) ------> Codex rescue ------> re-decompose or human
-```
-
-**Setup** (optional -- Forge works without Codex):
-
-```bash
-npm install -g @openai/codex        # install Codex CLI
-codex login                          # authenticate
-/codex:setup                         # verify in Claude Code
-```
-
-**Configuration:**
-
-```jsonc
-{
-  "codex": {
-    "enabled": true,
-    "review": {
-      "enabled": true,
-      "depth_threshold": "standard",   // never at quick, always at thorough
-      "model": "gpt-5.4-mini",         // cheap + catches edge cases
-      "sensitive_tags": ["security", "shared", "api-export"]
-    },
-    "rescue": {
-      "enabled": true,
-      "debug_attempts_before_rescue": 2,
-      "model": null                     // uses Codex default
-    }
-  }
-}
-```
-
-When Codex CLI is not installed, all integration points are silently skipped. No errors, no warnings, no behavior change.
-
-### Token-Saving Hooks
-
-| Hook | What It Does | Savings |
-|------|-------------|---------|
-| Test output filter | Shows only failures, suppresses passing test noise | 22-26K tokens/session |
-| Tool call cache | 2-minute TTL on idempotent calls (file reads, directory listings) | 2-4.5K tokens/session |
-| Zero-context progress tracker | Writes progress to stderr only | Zero token cost |
-
-### Task Re-Decomposition
-
-When a task fails, Forge auto-breaks it into smaller sub-tasks (T003.1, T003.2) before escalating to human. This adds a recovery layer between the circuit breaker and human intervention, resolving most failures without your input.
-
-### Context Bundles
-
-Each task gets a pre-assembled context file: the relevant spec requirements, upstream artifacts, convention snippets, and dependency signatures in one curated document. Replaces 4-5 separate file reads with 1 targeted read.
-
-### Adaptive Replanning
-
-After wave boundaries, if 30%+ of completed tasks had reviewer concerns, the planner re-evaluates remaining tasks. It can reorder, merge, or split tasks based on what was learned during execution.
-
 ---
 
 ## Architecture
 
+### The Three-Tiered Loop
+
+Forge runs three nested loops. Each has its own circuit breakers and progression logic.
+
+**Outer loop: Phase progression** -- Controls which spec is active and which phase runs next. Phases: `idle` > `executing` > `reviewing_branch` > `verifying` > `idle`. Driven by the stop hook state machine.
+
+**Middle loop: Task progression** -- Within a spec, tasks advance through the dependency DAG. Streaming topological dispatch: tasks start the instant their specific dependencies complete, not when the entire tier finishes. 20-40% faster than tier-gated waves.
+
+**Inner loop: Quality iteration** -- Each task cycles through `implement > test > fix (max 3) > debug > Codex rescue > redecompose > blocked`. Circuit breakers at every transition prevent infinite loops.
+
+### The Self-Prompting Engine
+
+The stop hook (`hooks/stop-hook.sh`) intercepts every Claude exit. It reads state from `.forge/.forge-loop.json`, calls `routeDecision()` in `forge-tools.cjs` (a 200+ line state machine), and either blocks exit with the next prompt or allows it. Claude never needs a human to tell it what to do next.
+
 ```
-forge/
-  commands/        Slash commands (brainstorm, plan, execute, resume, backprop, status)
-  skills/          Procedural workflows (brainstorming, planning, executing, reviewing)
-  agents/          Specialized subagents with model routing + artifact contracts
-  hooks/           Loop engine (state machine + token monitor + tool cache)
-  scripts/         Core utilities (state, config, token math, capability discovery)
-  templates/       Output + config templates (spec, plan, state, artifacts, config)
-  references/      Reference docs (token profiles, patterns, heuristics)
+Claude acts > attempts exit > stop hook fires > routeDecision() > block with next prompt > repeat
 ```
+
+Completion signal: Claude outputs `<promise>FORGE_COMPLETE</promise>` only when all tasks are complete and verified. The hook detects it, generates a summary, deletes the loop file, and allows exit.
 
 ### Execution Flow
 
 ```
-/forge:execute
+/forge execute
       |
-      v
   LOAD plan DAG + artifact contracts
       |
-      v
   STREAMING SCHEDULER -----> picks tasks whose deps are satisfied
       |                       scores complexity (0-20)
       |                       routes to haiku / sonnet / opus
       |                       assembles context bundle
       |
-      +---> EXECUTOR: implement + test
+      +---> RESEARCHER: deep research (official docs, papers, codebase conventions)
       |         |
-      |         v
+      +---> EXECUTOR: implement + test (TDD at thorough depth)
+      |         |
       |     REVIEWER: spec compliance + blast radius + conventions
       |         |
-      |         v
       |     (optional) CODEX REVIEW: adversarial cross-model check
       |         |
-      |         v
       |     ARTIFACT WRITE: structured output for downstream consumers
       |         |
       |         +---> Pass: atomic commit, unlock dependents
-      |         +---> Fail: re-decompose into sub-tasks or escalate
-      |
-      +---> WAVE BOUNDARY: adaptive replanning if concern_threshold hit
+      |         +---> Fail: debug > Codex rescue > re-decompose > block
       |
       +---> CONTEXT MONITOR: save handoff at 60%, resume in new session
       |
       v
+  VERIFIER: goal-backward verification (existence > substantive > wired > runtime)
+      |
   DONE: all tasks committed, branch ready
 ```
 
-## Commands
+### Deep Research Before Execution
 
-| Command | Description | Key Flags |
-|---|---|---|
-| `/forge:brainstorm [topic]` | Interactive spec generation from an idea | `--from-code`, `--from-docs path/` |
-| `/forge:plan` | Decompose specs into streaming DAG with artifact contracts | `--filter tag`, `--depth quick\|standard\|thorough` |
-| `/forge:execute` | Autonomous implementation loop | `--autonomy full\|gated\|supervised`, `--max-iterations N` |
-| `/forge:resume` | Continue after context reset or interruption | -- |
-| `/forge:backprop [desc]` | Trace a bug back to a spec gap | `--from-test path/` |
-| `/forge:status` | Show current progress, budget, blockers | -- |
-| `/forge:review-branch` | Review an unmerged branch before merging | `--base main`, `--spec path/`, `--fix`, `--comment` |
-| `/forge:setup-tools` | Detect and install CLI tools that enhance Forge | -- |
+The forge-researcher agent investigates before the executor touches code. Dispatched for unfamiliar tech, security-sensitive code, and external integrations. Follows a tiered source hierarchy:
 
-## Autonomy Levels
+| Tier | Source | Trust |
+|------|--------|-------|
+| 1 | Official docs (Context7, WebFetch) | Highest |
+| 2 | Peer-reviewed papers, RFCs (Semantic Scholar) | High |
+| 3 | Vendor blogs (Anthropic, Stripe, Vercel) | Medium |
+| 4 | Community (GitHub discussions, Stack Overflow) | Medium |
+| 5 | Blog posts (only with Tier 1-3 corroboration) | Low |
 
-| Level | Behavior | Best For |
-|---|---|---|
-| `full` | Runs completely unattended, handles context resets automatically | Long-running features, overnight runs |
-| `gated` | Pauses between phases for approval | Recommended for first use |
-| `supervised` | Pauses between individual tasks | Maximum oversight, learning how Forge works |
+The researcher also infers codebase conventions: import style (ESM vs CJS), naming (camelCase vs snake_case), error handling patterns, and test framework. Legacy patterns are documented and followed for consistency.
 
-```bash
-/forge:execute --autonomy full        # hands-off
-/forge:execute --autonomy gated       # approve each phase
-/forge:execute --autonomy supervised  # approve each task
-```
+### Seven Specialized Agents
 
-## Agent Roles
+| Agent | Role | Min Model | Key Constraint |
+|-------|------|-----------|----------------|
+| forge-speccer | Writes R-numbered specs with testable criteria | sonnet | One question at a time, capability-aware criteria |
+| forge-planner | Decomposes specs into streaming DAGs | sonnet | Coverage verification, no gold-plating |
+| forge-executor | Implements tasks with TDD + convention inference | haiku | Follow existing patterns, no scope creep |
+| forge-researcher | Multi-source research before implementation | haiku | Produces reports only, never writes code |
+| forge-reviewer | Two-pass review: spec compliance + blast radius | sonnet | Reads actual code, never trusts executor reports |
+| forge-verifier | Four-level goal-backward verification | sonnet | Checks observable truths, not task checkboxes |
+| forge-complexity | Scores task difficulty across 5 dimensions | haiku | Lightweight, runs on every command startup |
 
-| Agent | Role | Model Range |
-|-------|------|-------------|
-| **forge-speccer** | Writes R-numbered specs with testable acceptance criteria | sonnet - opus |
-| **forge-planner** | Decomposes specs into streaming DAGs with artifact contracts | sonnet - opus |
-| **forge-executor** | Implements tasks with TDD, convention inference, targeted tests | haiku - opus |
-| **forge-researcher** | Multi-source research (docs, papers, codebase) before implementation | haiku - sonnet |
-| **forge-reviewer** | Two-pass review: spec compliance + blast radius analysis | sonnet - opus |
-| **forge-verifier** | Four-level verification: existence, substantive, wired, runtime | sonnet - opus |
-| **forge-complexity** | Scores task complexity across 5 dimensions for model routing | haiku |
+The separation between agents is deliberate. The reviewer has fresh context and no implementation bias. The verifier never sees execution details, only checks outcomes against the spec.
 
-## How Forge Differs from Plain Claude Code
+---
 
-| Capability | Claude Code | Forge |
-|---|---|---|
-| Planning | You hold the plan in your head | Formal dependency DAG with typed contracts |
-| Parallelism | One task at a time | Streaming concurrent execution |
-| Testing | On request | Built into every task cycle |
-| Review | Manual | Automated blast radius + spec compliance + convention matching |
-| Cross-model review | Single model only | Claude reviews spec compliance, Codex catches edge cases |
-| Cost control | Same model for everything | Intelligent routing (haiku/sonnet/opus per task) |
-| Context limits | Session dies, progress lost | Auto-handoff at 60%, seamless resume |
-| Failure recovery | You debug | Circuit breaker, Codex rescue, re-decomposition, then human |
-| Debugging | Same model retries | Different model (Codex) brings fresh perspective after 2 fails |
-| Conventions | Follows CLAUDE.md | Also infers from existing code when CLAUDE.md is incomplete |
+## Circuit Breakers
 
-## Configuration
+Seven levels of circuit breakers prevent infinite loops and runaway spending. Each escalates to the next when exhausted.
 
-Forge stores per-project state in `.forge/` (gitignored). Default config:
+| Level | Trigger | Threshold | Action |
+|-------|---------|-----------|--------|
+| 1 | Test failures | 3 consecutive | Enter DEBUG mode |
+| 2 | Debug attempts | 2 failures | Codex rescue (different model, fresh perspective) |
+| 3 | Debug exhaustion | 3 total | Re-decompose task into sub-tasks (T005.1, T005.2) |
+| 4 | Review iterations | 3 passes | Accept with warnings, move on |
+| 5 | No progress | 2 identical snapshots | Block for human |
+| 6 | Max iterations | 100 (configurable) | Save state, force exit |
+| 7 | Budget exhaustion | 100% of token budget | Graceful handoff |
 
-```jsonc
-{
-  "autonomy": "gated",
-  "depth": "standard",
-  "auto_detect_depth": true,
-  "max_iterations": 100,
-  "token_budget": 500000,
+---
 
-  // V2: Streaming concurrency
-  "parallelism": {
-    "max_concurrent_agents": 3,
-    "max_concurrent_per_repo": 2
-  },
+## Token-Saving Hooks
 
-  // V2: Intelligent model routing
-  "model_routing": {
-    "enabled": true,
-    "cost_weights": { "haiku": 1, "sonnet": 5, "opus": 25 },
-    "role_baselines": {
-      "forge-reviewer": { "min": "sonnet" },
-      "forge-executor": { "min": "haiku", "preferred": "sonnet", "max": "opus" }
-    }
-  },
+Three hooks operate at zero or near-zero context cost. Patterns derived from studying the Claude Code source.
 
-  // V2: Token-saving hooks
-  "hooks_config": {
-    "test_filter": true,
-    "tool_cache": true,
-    "tool_cache_ttl": 120,
-    "progress_tracker": true
-  },
+| Hook | Type | What It Does | Savings |
+|------|------|-------------|---------|
+| Test output filter | PostToolUse | Detects test runners, compresses output >2000 chars to failures + context + summary | 22-26K tokens/session |
+| Tool call cache | PreToolUse | Caches idempotent calls (git status, ls, Read, Grep) with 2min TTL. Never caches mutations. | 2-4.5K tokens/session |
+| Progress tracker | PostToolUse | Writes to disk + stderr only. Never stdout. | Zero token cost |
 
-  // V2: Adaptive replanning
-  "replanning": {
-    "enabled": true,
-    "concern_threshold": 0.3
-  },
+---
 
-  // V2: Task re-decomposition
-  "redecomposition": {
-    "enabled": true,
-    "max_expansion_depth": 1
-  },
+## Intelligent Model Routing
 
-  // V2: Codex hybrid (graceful degradation if not installed)
-  "codex": {
-    "enabled": true,
-    "review": { "enabled": true, "model": "gpt-5.4-mini" },
-    "rescue": { "enabled": true, "debug_attempts_before_rescue": 2 }
-  },
+Every task is scored 0-20 across 5 dimensions:
 
-  // Circuit breakers
-  "loop": {
-    "circuit_breaker_test_fails": 3,
-    "circuit_breaker_debug_attempts": 3,
-    "single_task_budget_percent": 20
-  }
-}
-```
+| Dimension | Score Range |
+|-----------|------------|
+| Files touched | 0-4 |
+| Task type (scaffolding through architecture) | 0-5 |
+| Judgment required | 0-4 |
+| Cross-component dependencies | 0-5 |
+| Novelty | 0-4 |
 
-## Enterprise and Legacy Codebase Support
+Score mapping: 0-4 = haiku, 5-10 = sonnet, 11+ = opus. Role baselines enforce quality floors (reviewers never drop below sonnet). Budget pressure >70% downgrades one tier, >90% uses role minimum only. **30-40% cost reduction** vs single-model approach.
 
-### Convention Inference
+---
 
-When `CLAUDE.md` is missing or incomplete, the executor auto-detects from existing code: import style, naming conventions, error handling patterns, test framework, and file organization. For legacy codebases, Forge matches existing conventions even when they differ from modern best practices. Consistency within a codebase takes priority.
+## Goal-Backward Verification
 
-### Blast Radius Analysis
+The verifier works backwards from the spec, not forwards from the tasks. Four levels:
 
-The reviewer runs dependency impact analysis before approving any task: finds all files importing modified modules, checks for breaking changes in exported signatures, verifies dependent tests still pass, flags untested downstream modules, and respects CODEOWNERS for domain-specific review routing.
+| Level | Checks |
+|-------|--------|
+| **Existence** | Do expected files, functions, routes, migrations exist? |
+| **Substantive** | Real code, not stubs? Detects TODO, hardcoded returns, empty catch, skipped tests, placeholder components. |
+| **Wired** | Module imported where used? Route registered? Middleware applied? Dead code = not satisfied. |
+| **Runtime** | If Playwright: E2E tests. If Stripe: webhook handlers. If Vercel: deploy preview. If gh: CI status. |
 
-### Branch Review
+---
+
+## Backpropagation
+
+When a bug is found post-execution, `/forge backprop` traces it back to the spec gap that allowed it.
+
+1. **TRACE** -- Which spec and R-number does this bug map to?
+2. **ANALYZE** -- Gap type: missing criterion, incomplete criterion, or missing requirement
+3. **PROPOSE** -- Spec update for human approval
+4. **GENERATE** -- Regression test that would have caught it
+5. **VERIFY** -- Run test (should fail, confirming the gap). Optionally re-execute affected tasks.
+6. **LOG** -- Record in backprop history. After 3+ gaps of the same category (input_validation, concurrency, error_handling), suggest systemic changes to future brainstorming questions.
+
+---
+
+## Context Reset and Resume
+
+At 60% context usage, Forge saves a comprehensive handoff to `.forge/state.md`: current phase, task in progress, what's done (with commit hashes), in-flight work, key decisions, and token usage. New session reads state, spec, and frontier, then continues exactly where it left off. No re-reading completed work.
+
+For sessions that may hit context limits, the runner wrapper auto-restarts Claude:
 
 ```bash
-/forge:review-branch --base main                          # standalone review
-/forge:review-branch --base main --spec .forge/specs/spec-auth.md  # with spec compliance
-/forge:review-branch --base main --fix --comment          # auto-fix + PR comment
+bash scripts/forge-runner.sh
 ```
 
-Dispatches 4 parallel review agents: spec compliance, blast radius, convention/quality, and research validation.
+---
+
+## Codex Hybrid Integration
+
+Optionally integrates [OpenAI Codex CLI](https://github.com/openai/codex) at two critical points. Core insight: **different model for review = different blind spots caught**.
+
+**Adversarial Review Gate** -- After Claude's reviewer passes, Codex reviews the same diff for race conditions, edge cases, and hidden assumptions. ~6% cost at standard depth.
+
+**Debug Rescue** -- Claude stuck after 2 attempts? Codex gets a structured diagnosis prompt. One rescue call ($0.50) beats 3 more Claude attempts ($1.50+).
+
+```bash
+npm install -g @openai/codex    # optional -- Forge works without it
+codex login
+```
+
+When Codex CLI is not installed, all integration is silently skipped.
+
+---
+
+## Streaming DAG Execution
+
+Tasks launch the instant their specific dependencies complete, not when the entire tier finishes. Typed artifact contracts between tasks: each task declares what it `provides:` and `consumes:`. Downstream agents get 2-3 line artifact summaries instead of re-reading source files (saves 5-15K tokens per execution).
+
+Concurrency controls: max 3 concurrent agents, max 2 per repo, zero file overlap allowed between parallel tasks.
+
+---
 
 ## CLI Tool Ecosystem
 
-Forge auto-discovers CLI tools on your system and adapts execution. Run `/forge:setup-tools` to see what is available.
+Forge auto-discovers CLI tools and adapts execution. Run `/forge setup-tools` to see what's available.
 
 | Tool | What Forge Uses It For |
 |------|----------------------|
@@ -362,24 +244,71 @@ Forge auto-discovers CLI tools on your system and adapts execution. Run `/forge:
 | `playwright` | E2E browser testing, runtime verification |
 | `stripe` | Payment webhook testing, event simulation |
 | `vercel` | Preview deployments, serverless function testing |
-| `supabase` | Database migrations, edge function testing |
 | `docker` | Containerized dependencies for integration tests |
+| `ffmpeg` | Media processing, transcoding |
 
-Desktop app CLIs (GIMP, Blender, Inkscape, LibreOffice) are generated on-the-fly via [CLI-Anything](https://github.com/HKUDS/CLI-Anything) when the planner tags tasks that need them.
+Desktop app CLIs (GIMP, Blender, LibreOffice) are generated on-the-fly via [CLI-Anything](https://github.com/HKUDS/CLI-Anything) when tasks require them.
 
-## Fully Autonomous Mode
+---
 
-For sessions that may hit context limits:
+## Enterprise and Legacy Codebase Support
+
+**Convention inference** -- When CLAUDE.md is missing or incomplete, the executor auto-detects from existing code: import style, naming conventions, error handling patterns, test framework, and file organization. Legacy codebases get matched, not modernized. Consistency within a codebase takes priority.
+
+**Blast radius analysis** -- The reviewer finds all files importing modified modules, checks for breaking changes in exported signatures, verifies dependent tests still pass, flags untested downstream modules, and respects CODEOWNERS for domain-specific routing.
+
+**Branch review** -- Dispatches 4 parallel review agents: spec compliance, blast radius, convention/quality, and research validation.
 
 ```bash
-bash scripts/forge-runner.sh
+/forge review-branch --base main --spec .forge/specs/spec-auth.md --fix --comment
 ```
 
-This wrapper auto-restarts Claude after context resets, reads the handoff snapshot from `.forge/.forge-resume.md`, and continues from the exact point of interruption.
+---
+
+## Commands
+
+| Command | Description | Key Flags |
+|---|---|---|
+| `/forge brainstorm [topic]` | Interactive spec generation | `--from-code`, `--from-docs path/` |
+| `/forge plan` | Decompose specs into streaming DAG | `--filter tag`, `--depth quick\|standard\|thorough` |
+| `/forge execute` | Autonomous implementation loop | `--autonomy full\|gated\|supervised`, `--max-iterations N` |
+| `/forge resume` | Continue after context reset | -- |
+| `/forge backprop [desc]` | Trace bug to spec gap | `--from-test path/` |
+| `/forge status` | Progress, budget, blockers | -- |
+| `/forge review-branch` | Review unmerged branch | `--base main`, `--fix`, `--comment` |
+| `/forge setup-tools` | Detect and install CLI tools | -- |
+
+## Autonomy Levels
+
+| Level | Behavior | Best For |
+|---|---|---|
+| `full` | Runs unattended, handles context resets | Long-running features, overnight |
+| `gated` | Pauses between phases for approval | Recommended default |
+| `supervised` | Pauses between individual tasks | Maximum oversight |
+
+---
+
+## Configuration
+
+Forge stores per-project state in `.forge/` (gitignored). See `templates/config.json` for the full default configuration including streaming concurrency, model routing, token hooks, adaptive replanning, re-decomposition, Codex hybrid, and circuit breaker thresholds.
+
+## Project Structure
+
+```
+forge/
+  commands/        Slash commands (brainstorm, plan, execute, resume, backprop, status)
+  skills/          Procedural workflows (brainstorming, planning, executing, reviewing)
+  agents/          Specialized subagents with model routing + artifact contracts
+  hooks/           Self-prompting engine (stop hook state machine + token hooks)
+  scripts/         Core utilities (state machine, routing, budgeting, capability discovery)
+  templates/       Output + config templates
+  references/      Reference docs (token profiles, patterns, heuristics)
+  docs/            Architecture video + design docs (GitHub Pages)
+```
 
 ## Platform Support
 
-Works on **macOS**, **Linux**, and **Windows (WSL)**. Pure JavaScript (CommonJS) + Bash. No native dependencies, no build step.
+Works on macOS, Linux, and Windows (WSL). Pure JavaScript (CommonJS) + Bash. No native dependencies, no build step.
 
 ## Contributing
 
@@ -387,8 +316,7 @@ Works on **macOS**, **Linux**, and **Windows (WSL)**. Pure JavaScript (CommonJS)
 2. Create a feature branch (`git checkout -b feat/your-feature`)
 3. Make your changes
 4. Run tests: `node --test tests/`
-5. Commit with a descriptive message
-6. Open a pull request
+5. Open a pull request
 
 ## License
 
