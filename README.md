@@ -100,7 +100,48 @@ Role baselines ensure reviewers never drop below Sonnet. **30-40% cost reduction
 
 ### Codex Hybrid Integration
 
-Post-task adversarial review with GPT-5.4-mini catches edge cases that a single-model pipeline misses. Debug rescue escalation breaks Claude out of reasoning loops by handing stuck tasks to a different model. Gracefully degrades when Codex CLI is not installed -- Forge works fine without it.
+Forge optionally integrates [OpenAI Codex CLI](https://github.com/openai/codex) as a second AI model at two critical points in the execution loop. The core insight: **using a different model for review than for implementation eliminates correlated blind spots**.
+
+**Adversarial Review Gate** -- After Claude's forge-reviewer passes a task, Codex (GPT-5.4-mini) reviews the same diff looking specifically for race conditions, edge cases, and hidden assumptions. Claude is strong at spec compliance; Codex catches what a single-model pipeline misses. Adds ~6% cost at standard depth.
+
+**Debug Rescue Escalation** -- When Claude is stuck after 2 debug attempts, Forge dispatches a Codex rescue agent with a structured diagnosis prompt. A different model often sees the root cause immediately because it reasons differently. One rescue call ($0.50) is cheaper than 3 more Claude attempts (~$1.50+) with diminishing returns.
+
+```
+Claude implements --> Claude reviews --> Codex adversarial review --> commit
+                                              |
+Claude debugging (2 attempts) ------> Codex rescue ------> re-decompose or human
+```
+
+**Setup** (optional -- Forge works without Codex):
+
+```bash
+npm install -g @openai/codex        # install Codex CLI
+codex login                          # authenticate
+/codex:setup                         # verify in Claude Code
+```
+
+**Configuration:**
+
+```jsonc
+{
+  "codex": {
+    "enabled": true,
+    "review": {
+      "enabled": true,
+      "depth_threshold": "standard",   // never at quick, always at thorough
+      "model": "gpt-5.4-mini",         // cheap + catches edge cases
+      "sensitive_tags": ["security", "shared", "api-export"]
+    },
+    "rescue": {
+      "enabled": true,
+      "debug_attempts_before_rescue": 2,
+      "model": null                     // uses Codex default
+    }
+  }
+}
+```
+
+When Codex CLI is not installed, all integration points are silently skipped. No errors, no warnings, no behavior change.
 
 ### Token-Saving Hooks
 
@@ -219,10 +260,12 @@ forge/
 | Planning | You hold the plan in your head | Formal dependency DAG with typed contracts |
 | Parallelism | One task at a time | Streaming concurrent execution |
 | Testing | On request | Built into every task cycle |
-| Review | Manual | Automated blast radius + spec compliance + adversarial cross-model |
+| Review | Manual | Automated blast radius + spec compliance + convention matching |
+| Cross-model review | Single model only | Claude reviews spec compliance, Codex catches edge cases |
 | Cost control | Same model for everything | Intelligent routing (haiku/sonnet/opus per task) |
 | Context limits | Session dies, progress lost | Auto-handoff at 60%, seamless resume |
-| Failure recovery | You debug | Circuit breaker, re-decomposition, Codex rescue, then human |
+| Failure recovery | You debug | Circuit breaker, Codex rescue, re-decomposition, then human |
+| Debugging | Same model retries | Different model (Codex) brings fresh perspective after 2 fails |
 | Conventions | Follows CLAUDE.md | Also infers from existing code when CLAUDE.md is incomplete |
 
 ## Configuration
