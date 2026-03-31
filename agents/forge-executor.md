@@ -215,6 +215,28 @@ After committing, update `.forge/state.md`:
 3. Clear "In-Flight Work"
 4. Update "What's Next" with remaining tasks
 
+### 5.5 Write Artifact (if applicable)
+
+If this task has `provides:` fields in the frontier, write an artifact file to `.forge/artifacts/{task-id}.json`:
+
+```json
+{
+  "task_id": "T003",
+  "status": "complete",
+  "commit": "abc1234",
+  "artifacts": {
+    "register_endpoint": "src/controllers/auth.ts -- POST /auth/register with email+password validation"
+  },
+  "files_created": ["src/controllers/auth.ts", "src/__tests__/auth.test.ts"],
+  "files_modified": ["src/routes/index.ts"],
+  "key_decisions": ["Used bcrypt with 12 rounds for password hashing"]
+}
+```
+
+The `artifacts` map keys should match the `provides:` names from the frontier. Values should be a brief description of what was produced and where. Downstream tasks will consume these summaries instead of re-reading your code.
+
+If a context bundle file exists at `.forge/context-bundles/{task-id}.md`, read it first for curated context from your dependencies.
+
 ### 6. Report Status
 
 Report your status using one of the four status codes (DONE, DONE_WITH_CONCERNS, NEEDS_CONTEXT, BLOCKED) along with a brief summary:

@@ -44,14 +44,16 @@ depth: {quick|standard|thorough}
 
 Each task line follows this pattern:
 ```
-- [T{NNN}] {Task name} | est: ~{N}k tokens | repo: {REPO} | depends: {T001, T002}
+- [T{NNN}] {Task name} | est: ~{N}k tokens | repo: {REPO} | depends: {T001, T002} | provides: {artifact-name} | consumes: {artifact-name}
 ```
 
-- **ID**: Sequential, zero-padded to 3 digits (T001, T002, ... T999)
+- **ID**: Sequential, zero-padded to 3 digits (T001, T002, ... T999). Re-decomposed sub-tasks use decimal IDs (T003.1, T003.2)
 - **Name**: Short, descriptive. Verb-first. Example: "User model + migration", "Registration endpoint + tests"
 - **Estimate**: Token estimate in thousands, prefixed with `~`. Based on depth level (see below)
 - **Repo**: Which repo this task targets. Omit if single-repo project
 - **Depends**: Comma-separated list of task IDs this task depends on. Omit if no dependencies (Tier 1)
+- **Provides**: Comma-separated list of artifact names this task produces. Use lowercase with hyphens (e.g., `user-model`, `auth-routes`). These become keys in the artifact JSON that downstream tasks can reference.
+- **Consumes**: Comma-separated list of artifact names from dependency tasks that this task needs. Must match a `provides` value from a dependency task.
 
 ## Token Estimation by Depth
 
