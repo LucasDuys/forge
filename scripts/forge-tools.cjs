@@ -60,7 +60,24 @@ const DEFAULT_CONFIG = {
   review: { enabled: true, min_depth: 'standard', model: 'claude' },
   verification: { enabled: true, min_depth: 'standard', stub_detection: true },
   backprop: { auto_generate_regression_tests: true, re_run_after_spec_update: false },
-  capability_hints: {}
+  capability_hints: {},
+  parallelism: { max_concurrent_agents: 3, max_concurrent_per_repo: 2 },
+  model_routing: {
+    enabled: true,
+    cost_weights: { haiku: 1, sonnet: 5, opus: 25 },
+    role_baselines: {
+      'forge-researcher': { min: 'haiku', preferred: 'sonnet', max: 'sonnet' },
+      'forge-complexity': { min: 'haiku', preferred: 'haiku', max: 'haiku' },
+      'forge-executor': { min: 'haiku', preferred: 'sonnet', max: 'opus' },
+      'forge-reviewer': { min: 'sonnet', preferred: 'sonnet', max: 'opus' },
+      'forge-verifier': { min: 'sonnet', preferred: 'sonnet', max: 'opus' },
+      'forge-speccer': { min: 'sonnet', preferred: 'opus', max: 'opus' },
+      'forge-planner': { min: 'sonnet', preferred: 'sonnet', max: 'opus' }
+    }
+  },
+  hooks_config: { test_filter: true, progress_tracker: true, tool_cache: true, tool_cache_ttl: 120 },
+  replanning: { enabled: true, concern_threshold: 0.3 },
+  redecomposition: { enabled: true, max_expansion_depth: 1 }
 };
 
 function loadConfig(projectDir) {
@@ -349,14 +366,17 @@ function parseFrontier(text) {
       continue;
     }
 
-    const taskMatch = line.match(/^- \[([A-Z]\d+)\]\s+(.+)/);
+    // Match task IDs: T001, T003.1, T003.2 (decimal IDs for re-decomposed sub-tasks)
+    const taskMatch = line.match(/^- \[([A-Z]\d+(?:\.\d+)?)\]\s+(.+)/);
     if (taskMatch) {
       const id = taskMatch[1];
       const rest = taskMatch[2];
 
       const repoMatch = rest.match(/repo:\s*(\S+)/);
-      const dependsMatch = rest.match(/depends:\s*([A-Z0-9,\s]+?)(?:\s*\||$)/);
+      const dependsMatch = rest.match(/depends:\s*([A-Z0-9.,\s]+?)(?:\s*\||$)/);
       const estMatch = rest.match(/est:\s*~?(\d+)k/);
+      const providesMatch = rest.match(/provides:\s*([a-z0-9_,\s-]+?)(?:\s*\||$)/);
+      const consumesMatch = rest.match(/consumes:\s*([a-z0-9_,\s-]+?)(?:\s*\||$)/);
       const name = rest.split('|')[0].trim();
 
       tasks.push({
@@ -366,6 +386,8 @@ function parseFrontier(text) {
         repo: repoMatch ? repoMatch[1] : null,
         depends: dependsMatch ? dependsMatch[1].split(',').map(s => s.trim()) : [],
         estimated_tokens: estMatch ? parseInt(estMatch[1], 10) * 1000 : 0,
+        provides: providesMatch ? providesMatch[1].split(',').map(s => s.trim()) : [],
+        consumes: consumesMatch ? consumesMatch[1].split(',').map(s => s.trim()) : [],
         status: 'pending'
       });
     }
@@ -660,26 +682,78 @@ function verifyStateConsistency(forgeDir, state) {
 function findAllUnblockedTasks(tasks, forgeDir) {
   const registry = readTaskRegistry(forgeDir);
   const doneTasks = new Set();
+  const runningTasks = new Set();
 
   // Primary source: task registry
   for (const [id, info] of Object.entries(registry.tasks)) {
     if (info.status === 'complete') doneTasks.add(id);
+    if (info.status === 'running') runningTasks.add(id);
   }
 
   // Fallback: state.md content (backwards compatibility)
   const state = readState(forgeDir);
   for (const line of (state.content || '').split('\n')) {
-    const match = line.match(/^[\s*-]*\*{0,2}(T\d+)\*{0,2}[\s:—-]/);
+    const match = line.match(/^[\s*-]*\*{0,2}(T\d+(?:\.\d+)?)\*{0,2}[\s:—-]/);
     if (match) doneTasks.add(match[1]);
   }
 
   const unblocked = [];
   for (const task of tasks) {
-    if (doneTasks.has(task.id)) continue;
+    if (doneTasks.has(task.id) || runningTasks.has(task.id)) continue;
     const allDepsComplete = task.depends.every(d => doneTasks.has(d));
     if (allDepsComplete) unblocked.push(task);
   }
   return unblocked;
+}
+
+// === Streaming Dispatch: Get all ready tasks regardless of tier ===
+// Unlike findAllUnblockedTasks (which was tier-aware), getReadyTasks
+// returns ANY task whose individual dependencies are complete, enabling
+// streaming topological dispatch where tasks start as soon as their
+// specific deps finish, not when the whole tier finishes.
+
+function getReadyTasks(tasks, forgeDir) {
+  const config = loadConfig(path.dirname(forgeDir));
+  const maxConcurrent = (config.parallelism || {}).max_concurrent_agents || 3;
+  const maxPerRepo = (config.parallelism || {}).max_concurrent_per_repo || 2;
+
+  const allUnblocked = findAllUnblockedTasks(tasks, forgeDir);
+
+  // Apply concurrency limits
+  const registry = readTaskRegistry(forgeDir);
+  const runningCount = Object.values(registry.tasks).filter(t => t.status === 'running').length;
+  const runningPerRepo = {};
+  for (const [id, info] of Object.entries(registry.tasks)) {
+    if (info.status === 'running' && info.repo) {
+      runningPerRepo[info.repo] = (runningPerRepo[info.repo] || 0) + 1;
+    }
+  }
+
+  const ready = [];
+  for (const task of allUnblocked) {
+    if (runningCount + ready.length >= maxConcurrent) break;
+    if (task.repo && (runningPerRepo[task.repo] || 0) >= maxPerRepo) continue;
+    // File overlap detection: skip if any running task shares estimated files
+    if (hasFileOverlap(task, registry)) continue;
+    ready.push(task);
+  }
+  return ready;
+}
+
+// === File Overlap Detection ===
+// Prevents parallel tasks from modifying the same files
+
+function hasFileOverlap(task, registry) {
+  const taskFiles = new Set(task.estimated_files || []);
+  if (taskFiles.size === 0) return false;
+  for (const [id, info] of Object.entries(registry.tasks)) {
+    if (info.status !== 'running') continue;
+    const runningFiles = info.estimated_files || [];
+    for (const f of runningFiles) {
+      if (taskFiles.has(f)) return true;
+    }
+  }
+  return false;
 }
 
 // === CLI: Route Command (called by stop-hook.sh) ===
@@ -1181,6 +1255,7 @@ module.exports = {
   updateTokenLedger, parseFrontier,
   discoverCapabilities, generateResumePrompt, generateSummary, inferMcpUse,
   routeDecision, findNextUnblockedTask, findAllUnblockedTasks,
+  getReadyTasks, hasFileOverlap,
   buildTaskPrompt, advanceToNextTask,
   readTaskRegistry, writeTaskRegistry, markTaskComplete, initTaskRegistry,
   getProgressSnapshot, checkProgress, getNoProgressCount,
