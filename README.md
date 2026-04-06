@@ -24,15 +24,15 @@
 
 ---
 
-Claude Code is powerful, but for non-trivial features you become the glue: prompting, reviewing, re-prompting, losing context, starting over. A 12-task feature takes dozens of manual exchanges and multiple sessions.
+You start a feature in Claude Code. You write the prompt. It writes the code. You review it. You re-prompt. It tries again. It loses context. You re-explain. You watch the "context: 87%" warning crawl up. You restart. You re-explain again. You're three hours in, you have half a feature, and you're the one keeping the whole thing from falling apart.
 
-You are the project manager. You are the state machine. You are the thing keeping everything from falling apart.
+You are the project manager. You are the state machine. You are the glue.
 
-**Forge replaces you as the glue.** You describe what you want. Forge writes the spec, plans the tasks, runs them with TDD, reviews the code, verifies against acceptance criteria, and commits atomically. You read the diffs.
+**Forge replaces you as the glue.** You describe what you want in one line. Forge writes the spec, plans the tasks, runs them in parallel git worktrees with TDD, reviews the code, verifies it against the acceptance criteria, and commits atomically. You read the diffs in the morning.
 
 ## Install
 
-Requires Claude Code v1.0.33+. Zero npm install, zero build step.
+Requires Claude Code v1.0.33+. Zero npm install, zero build step, zero dependencies.
 
 ```bash
 claude plugin marketplace add LucasDuys/forge
@@ -47,27 +47,90 @@ claude plugin install forge@forge-marketplace
 /forge execute --autonomy full
 ```
 
-That's it. Forge runs unattended until the feature is implemented, tested, reviewed, and committed.
+Then walk away.
 
-## Why Forge
+## What you actually see
 
-- **Native Claude Code plugin** — lives in your existing session, no separate harness or TUI to learn
-- **Hard token budgets** per task and per session — no silent overruns at 3am ([docs](docs/budgets.md))
-- **Git worktree isolation** per task — failed tasks discarded cleanly, successful ones squash-merged ([docs](docs/worktrees.md))
-- **Crash recovery** from lock file + checkpoints + git log — `/forge resume` picks up where you crashed ([docs](docs/recovery.md))
-- **Headless mode** for CI/cron with proper exit codes and <5ms JSON state queries ([docs](docs/headless.md))
-- **Backpropagation** — when a bug surfaces, trace it back to the spec gap that allowed it ([docs](docs/backpropagation.md))
-- **Goal-backward verification** — the verifier checks the spec, not the tasks ([docs](docs/verification.md))
+```
+$ /forge brainstorm "add rate limiting to /api/search with per-user quotas"
+
+[forge-speccer] generating spec from idea...
+spec written: .forge/specs/spec-rate-limiting.md
+  R001  per-user quotas, configurable per tier (free / pro / enterprise)
+  R002  sliding window counters (1 minute, 1 hour, 1 day)
+  R003  429 response with Retry-After header
+  R004  bypass for admin tokens
+  R005  redis-backed counters with atomic increment
+  R006  structured logs for rate-limit events
+  R007  integration test against /api/search
+
+$ /forge plan
+
+[forge-planner] decomposing into task DAG...
+8 tasks across 3 tiers (depth: standard)
+  T001  add redis client + connection pool          [haiku, quick]
+  T002  implement sliding window counter            [sonnet, standard]
+  T003  build rate-limit middleware                 [sonnet, standard]
+  T004  wire middleware to /api/search route        [haiku, quick]
+  T005  add 429 response with Retry-After           [haiku, quick]
+  T006  admin token bypass                          [haiku, quick]
+  T007  structured logging                          [haiku, quick]
+  T008  integration test                            [sonnet, standard]
+        deps: T001 T002 T003 T004 T005 T006 T007
+
+$ /forge execute --autonomy full
+
+[14:02:11Z] lock acquired (pid 18432)
+[14:02:11Z] T001 worktree created -> .forge/worktrees/T001/
+[14:02:11Z] T001 executing  haiku  budget 5000
+[14:02:48Z] T001 PASS       4 lines  1 commit  budget 1820/5000
+[14:02:48Z] T002 executing  sonnet  budget 15000
+[14:02:48Z] T003 executing  sonnet  budget 15000   (parallel, no file conflict)
+[14:04:33Z] T002 PASS       37 lines  5 tests  budget 11240/15000
+[14:06:01Z] T003 PASS       62 lines  8 tests  budget 13880/15000
+[14:06:01Z] T004 T005 T006 T007 dispatched in parallel
+[14:08:27Z] tier 2 complete  squash-merged 6 worktrees
+[14:08:27Z] T008 executing  sonnet  budget 15000
+[14:14:12Z] T008 PASS       44 lines  12 tests  budget 12300/15000
+[14:14:12Z] forge-verifier: existence > substantive > wired > runtime
+[14:14:18Z] verifier PASS  all 7 requirements satisfied
+[14:14:18Z] <promise>FORGE_COMPLETE</promise>
+
+8 tasks. 12 minutes. 218 lines. 9 commits squash-merged to main.
+session budget: 47200 / 500000 used. lock released.
+```
+
+You read the diffs. You merge the branch. You move on.
+
+## Why it works
+
+- **Native Claude Code plugin.** Lives in your existing session. No separate harness, no TUI to learn, no API key to manage. ([architecture](docs/architecture.md))
+- **Hard token budgets.** Per-task and per-session ceilings, enforced as hard stops, not warnings. No more silent overruns at 3am. ([budgets](docs/budgets.md))
+- **Git worktree isolation.** Every task runs in its own worktree. Failed tasks get discarded. Successful ones squash-merge with atomic commit messages. Your main branch only ever sees green code. ([worktrees](docs/worktrees.md))
+- **Crash recovery that actually works.** Lock file with heartbeat, per-step checkpoints, forensic resume from git log. If your machine reboots mid-feature, `/forge resume` picks up exactly where it died. ([recovery](docs/recovery.md))
+- **Headless mode for CI and cron.** Proper exit codes, JSON state queries in under 5ms, zero interactive prompts. ([headless](docs/headless.md))
+- **Goal-backward verification.** The verifier checks the spec, not the tasks. Existence > substantive > wired > runtime. Catches stubs, dead code, and "looks done but isn't" before they ship. ([verification](docs/verification.md))
+- **Backpropagation.** When a bug surfaces in production, `/forge backprop` traces it back to the spec gap that allowed it and writes the regression test that would have caught it. ([backprop](docs/backpropagation.md))
+
+## Receipts
+
+- **100 tests, 0 dependencies.** Full suite runs in 2.4 seconds. Pure `node:assert`.
+- **Headless state query: under 5ms.** Zero LLM calls. Drop it in a Prometheus exporter.
+- **Caveman compression: 26.8% reduction** on internal artifacts. ([benchmark](docs/benchmarks/caveman-integration.md))
+- **Lock heartbeat survives** crashes, reboots, OOMs, and context resets. Five minute stale threshold, never auto-deletes user work.
+- **Worktree isolation:** failed tasks never touch your main branch. Successful ones land as one squashed commit with a structured message.
+- **Seven specialized agents.** Speccer, planner, researcher, executor, reviewer, verifier, complexity scorer. Each routed to the cheapest model that can handle the job. ([agents](docs/agents.md))
+- **Seven circuit breakers.** Test failures, debug exhaustion, review iterations, no-progress detection, token ceilings. Nothing runs forever. ([circuit breakers](docs/verification.md))
 
 ## How it compares
 
 Forge is one of three tools in this space alongside [Ralph Loop](https://ghuntley.com/ralph/) and [GSD-2](https://github.com/taches-org/gsd). They overlap but optimize for different things:
 
-- Pick **Forge** if you want autonomous execution that lives inside your Claude Code session, with hard cost controls and adaptive depth
-- Pick **GSD-2** if you want a more battle-tested standalone TUI harness
-- Pick **Ralph Loop** if you have a tightly-scoped task and want the minimum infrastructure possible
+- Pick **Forge** if you want autonomous execution that lives inside your existing Claude Code session, with hard cost controls, adaptive depth, and crash recovery.
+- Pick **GSD-2** if you want a more battle-tested standalone TUI harness with more engineering hours behind it.
+- Pick **Ralph Loop** if you have a tightly-scoped greenfield task with binary verification and want the absolute minimum infrastructure.
 
-Full honest comparison: [docs/comparison.md](docs/comparison.md).
+Full honest comparison with all the trade-offs: [docs/comparison.md](docs/comparison.md).
 
 ## Documentation
 
