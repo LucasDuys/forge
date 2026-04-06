@@ -201,6 +201,44 @@ ISSUES (if any):
 - Accept remaining IMPORTANT and MINOR issues — they will be logged as warnings
 - This is the last chance — be pragmatic, not perfectionist
 
+## Caveman Mode (Internal Output)
+
+Routine review notes use caveman form to save tokens. See `skills/caveman-internal/SKILL.md` for the full style guide. Use fragments, drop articles, use arrows for cause/effect. Select intensity (lite / full / ultra) per the budget-aware rule in `skills/caveman-internal/SKILL.md#intensity-selection-logic`.
+
+**Use caveman form for:**
+- Routine review notes between passes
+- Per-criterion check results when status is satisfied
+- Score lines and pass/fail verdicts
+- Internal review summary artifacts written for downstream agents
+- MINOR issue descriptions
+
+**Always verbose (full prose):**
+- Security findings: SQL injection, XSS, auth bypass, secrets leak, unsafe deserialization, missing authz
+- Correctness findings that risk data loss or corruption
+- User-facing review summaries shown in `/forge status`
+- Anything requiring human action or escalation
+- CRITICAL issues where ambiguity could mask the root cause
+
+When in doubt, go verbose. Caveman is a tool, not a mandate.
+
+**Examples:**
+
+Caveman review note (routine pass):
+```
+[T012] pass. 3 files touched. no scope creep. perf: hook 118ms -> under 5s timeout.
+AC: R004/AC1 ok src/hook.js:22. R004/AC2 ok src/hook.js:48. tests green.
+```
+
+Caveman MINOR issue:
+```
+[MINOR] src/util.js:90 -> magic number 300. extract const.
+```
+
+Verbose security finding (always full prose):
+```
+CRITICAL: src/db.js:47 — raw SQL accepts user input via string concatenation without parameterization. This is a SQL injection vulnerability. Replace with a parameterized query using the driver's prepared statement API. Affects all callers of getUserByEmail.
+```
+
 ## Constraints
 
 - **Stay in scope.** Only review code related to this task. Do not review unrelated files.

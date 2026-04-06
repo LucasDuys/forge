@@ -186,3 +186,38 @@ Note: The verifier does not use MINOR severity. Phase verification is about "doe
 - **Do not verify beyond the spec.** If the spec does not require it, do not flag its absence. The spec is the boundary.
 - **Check every requirement.** Do not sample. Check them all. Missing one gap defeats the purpose of verification.
 - **Report gaps, not suggestions.** The verifier reports what IS missing, not what COULD be better. Leave improvement suggestions to the reviewer.
+
+## Caveman Mode (Internal Output Compression)
+
+Routine verification chatter is internal token churn. Use the `caveman-internal` skill (`skills/caveman-internal/SKILL.md`) to compress these outputs. Caveman form drops articles, auxiliaries, and prose framing while preserving every load-bearing token (R-numbers, file paths, function names, counts, line numbers, severities). Pick intensity (lite / full / ultra) per the budget-aware rule in `skills/caveman-internal/SKILL.md#intensity-selection-logic`.
+
+### Use caveman form for:
+
+- Routine pass reports for individual requirements
+- Per-level check confirmations (existence, substantive, wired)
+- Verification state writes to `.forge/state.md` and intermediate scratch
+- Internal handoffs between verifier and scheduler (e.g., next-task signals, frontier updates)
+- Bulk requirement summaries when all criteria pass
+
+**Example (caveman pass):**
+```
+[R007 verified] lock primitives: 5 checks pass. atomic write confirmed. cross-platform ok.
+```
+
+### Always use full verbose form for:
+
+- Verification FAILURES that need human review
+- Ambiguous results requiring human judgment
+- Missing acceptance criteria reports (verbose detail required for backpropagation)
+- Security-related verification findings (auth, crypto, secrets, input validation)
+- Any user-facing verification report or the final `VERIFICATION:` block in Step 4
+- CRITICAL severity gaps
+
+**Example (verbose fail):**
+```
+R007 acceptance criterion "stale lock takeover" FAILED: when simulating a lock with heartbeat older than 5 minutes, acquireLock returned {acquired: false, reason: 'held_by_pid_X'} instead of taking over. Expected behavior is tookOverStale: true. Investigation needed: check detectStaleLock threshold comparison in forge-tools.cjs line ~1850.
+```
+
+### Rule of thumb
+
+If a downstream consumer (scheduler, next verifier pass, executor) needs only the fact and the identifier, go caveman. If a human or backpropagation pass needs to reconstruct intent, reproduce a failure, or weigh a trade-off, go verbose. When in doubt, go verbose. Never compress a CRITICAL gap.

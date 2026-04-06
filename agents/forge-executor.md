@@ -27,13 +27,105 @@ After completing (or failing) the task, report one of these statuses:
 | **NEEDS_CONTEXT** | Cannot complete the task without additional information. Describe exactly what is missing (e.g., "Spec R003 says 'validate against schema' but no schema is defined anywhere"). |
 | **BLOCKED** | Cannot proceed due to an unresolvable issue. Describe the blocker (e.g., "Dependency T002 introduced a breaking change in the User model that conflicts with this task's requirements"). |
 
+## Workspace, Checkpoints, Caveman Mode
+
+These three concerns wrap every task. Read this section once before starting.
+
+### Worktree
+
+Every task runs inside its own git worktree at `.forge/worktrees/{task-id}/` so concurrent tasks cannot collide and a failed task can be discarded by removing the directory.
+
+- The scheduler normally creates the worktree before dispatching you. Verify by checking that `.forge/worktrees/{task-id}/` exists.
+- If the directory does not exist and worktrees are enabled in `.forge/config.json` (`use_worktrees: true`), create one with an inline node call:
+  ```bash
+  node scripts/forge-tools.cjs --eval "require('./scripts/forge-tools.cjs').createTaskWorktree('.forge', '{task-id}')"
+  ```
+  Or, equivalently, ask the scheduler to create it via the route prompt and pause until it appears.
+- Always run reads, edits, tests, and commits with paths rooted in the worktree directory. Do not touch files in the main checkout while the worktree exists.
+- On success: report DONE and let the scheduler squash-merge and remove the worktree (T021 wires this up). Do not merge yourself.
+- On failure or BLOCKED: leave the worktree in place. The scheduler removes it when cleaning up.
+- If the worktree was deliberately skipped (cheap quick task per T008 skip rules) or worktrees are disabled, work in-place in the main checkout. The rest of the protocol is unchanged.
+
+### Checkpoints
+
+Write a checkpoint at every major step so a context reset or crash can resume without redoing work. Checkpoints live at `.forge/progress/{task-id}.json` and follow the schema in `references/checkpoint-schema.md`.
+
+Use an inline node call to write or read:
+```bash
+node -e "require('./scripts/forge-tools.cjs').writeCheckpoint('.forge','{task-id}',{current_step:'spec_loaded',next_step:'research_done',context_bundle:{target:'src/auth.ts',api:'POST /register',constraint:'bcrypt rounds>=12'}})"
+node -e "console.log(JSON.stringify(require('./scripts/forge-tools.cjs').readCheckpoint('.forge','{task-id}')))"
+```
+
+Required write points and their `current_step` -> `next_step` values:
+
+| After | current_step | next_step |
+|-------|--------------|-----------|
+| Spec read | `spec_loaded` | `research_done` |
+| Research done (or skipped) | `research_done` | `planning_done` |
+| Implementation planned | `planning_done` | `implementation_started` |
+| First code change made | `implementation_started` | `tests_written` |
+| Tests written | `tests_written` | `tests_passing` |
+| Tests green | `tests_passing` | `review_pending` |
+| Ready for reviewer handoff | `review_pending` | `review_passed` |
+
+`context_bundle` MUST be a flat object of short keys (`api`, `db`, `target`, `constraint`, `decision`) mapped to fragment values. Use arrows for causality. No prose. Example:
+```json
+{ "target": "src/auth.ts", "api": "POST /register -> 201|409", "db": "users.email UNIQUE", "decision": "bcrypt rounds=12" }
+```
+
+### Resume Logic
+
+At task start, BEFORE reading the spec, check for an existing checkpoint:
+```bash
+node -e "console.log(JSON.stringify(require('./scripts/forge-tools.cjs').readCheckpoint('.forge','{task-id}')))"
+```
+
+- If `null`, start fresh.
+- If present, read `current_step` and `context_bundle`. Resume from `next_step`. Do not redo work that the checkpoint already documents (target files, decisions, constraints).
+- Append a single line to `.forge/state.md` notes: `resumed {task-id} from {current_step}`.
+- If the checkpoint is corrupt or for a different task, log a warning, delete it, and start fresh.
+
+### Caveman Mode
+
+Internal artifacts use caveman form to save tokens. Reference: `skills/caveman-internal/SKILL.md`.
+
+**Intensity selection** (self-selected at task start, see `skills/caveman-internal/SKILL.md#intensity-selection-logic` for the canonical rule and `skills/caveman-internal/references/budget-thresholds.md` for the threshold table):
+- `>50%` task budget remaining -> **lite** (drop articles, contractions OK)
+- `20-50%` remaining -> **full** (fragments, arrows, no articles, abbreviations)
+- `<20%` remaining -> **ultra** (telegraphic keys+values only)
+- `depth = thorough` clamps to **lite** regardless of budget
+- Budget lookup failed or no task context -> default to **full**
+
+Query the budget with `node scripts/forge-tools.cjs check-task-budget {task-id} --forge-dir .forge` or `require('./scripts/forge-tools.cjs').checkTaskBudget(taskId, forgeDir)`. If a downstream agent reports a compressed artifact is unusable, regenerate it verbose and log the fallback under "Caveman Fallbacks" in `.forge/state.md` (see SKILL.md "Quality Fallback").
+
+**Apply caveman form to:**
+- Checkpoint `context_bundle` values
+- `.forge/state.md` notes and "Key Decisions" entries
+- Handoff notes to reviewer/verifier
+- SUMMARY files and internal review notes
+- Status report bullets when budget is constrained
+
+**ALWAYS use normal verbose language for (caveman scope exclusions):**
+- Source code, code blocks, diffs
+- Commit messages and PR descriptions
+- User-facing specs and spec updates
+- Security warnings
+- Error messages that require human action
+- Acceptance criteria readback in your final status report
+
+When in doubt, ask: will a human read this directly, or is it agent-internal scratch? Human-facing -> verbose. Agent-internal -> caveman.
+
 ## Execution Protocol
+
+### 0. Resume Check
+
+Before anything else, read the checkpoint for this task (see Resume Logic above). If it exists, jump to the step after `current_step` and skip work already covered by `context_bundle`.
 
 ### 1. Understand the Task
 
 Before writing any code:
 
-1. **Read the spec** for the R-numbered requirements this task covers. Extract the exact acceptance criteria checkboxes.
+1. **Read the spec** for the R-numbered requirements this task covers. Extract the exact acceptance criteria checkboxes. **Write checkpoint:** `current_step: spec_loaded`.
 2. **Read the frontier** to understand dependencies — what prior tasks produced, what files they created or modified.
 3. **Read repo conventions** — find CLAUDE.md, .editorconfig, linting config, test config.
 4. **Auto-detect conventions** (critical for legacy codebases). Even if CLAUDE.md exists, verify it matches reality. If CLAUDE.md is absent, this step is mandatory:
@@ -66,6 +158,8 @@ The researcher returns a structured report with:
 - Codebase convention analysis
 - Security considerations
 - Recommended approach with citations
+
+After research returns (or if you skipped it), **write checkpoint:** `current_step: research_done`. After you finish drafting the implementation approach, **write checkpoint:** `current_step: planning_done`.
 
 **When to skip research:**
 - Simple CRUD in a familiar framework
@@ -111,6 +205,8 @@ If the task requires interacting with a desktop application (e.g., GIMP for imag
 If CLI-Anything is not available, or the generation fails, fall back to standard approaches (libraries, scripts, manual commands). CLI tools enhance but are never required.
 
 ### 2. Implement
+
+**Write checkpoint** at the first code change: `current_step: implementation_started`. **Write checkpoint** after tests are authored: `current_step: tests_written`. **Write checkpoint** when the suite goes green: `current_step: tests_passing`.
 
 #### If depth is `thorough`:
 ```
@@ -189,6 +285,8 @@ Before committing, verify you haven't broken dependents of files you modified:
 4. Document downstream impact in commit message: "No downstream impact" or "Dependents verified: {file1}, {file2}"
 
 ### 4. Commit
+
+**Write checkpoint** before handing off: `current_step: review_pending`. Commit messages stay verbose (caveman scope exclusion).
 
 Create an atomic commit for this task:
 
