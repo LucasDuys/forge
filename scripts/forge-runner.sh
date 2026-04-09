@@ -12,6 +12,33 @@ MAX_RESTARTS=${FORGE_MAX_RESTARTS:-10}
 BASE_DELAY=${FORGE_BASE_DELAY:-3}
 RESTART_COUNT=0
 
+# ─── TUI bridge (R007/R008) ──────────────────────────────────────────────────
+# When FORGE_TUI=1 is set (typically by /forge watch), delegate to the
+# interactive dashboard first. On fallback sentinel exit code 87 or
+# command-not-found 127, fall back to the original plain-text loop below —
+# UNLESS FORGE_TUI_NO_FALLBACK=1 was set, in which case propagate the exit
+# code and stop.
+if [ "${FORGE_TUI:-0}" = "1" ]; then
+  TUI_SCRIPT="${CLAUDE_PLUGIN_ROOT:-$(dirname "$0")/..}/scripts/forge-tui.cjs"
+  if [ -f "$TUI_SCRIPT" ] && command -v node >/dev/null 2>&1; then
+    echo "Starting Forge TUI dashboard..."
+    node "$TUI_SCRIPT" "$@"
+    TUI_EXIT=$?
+    if [ "$TUI_EXIT" = "0" ] || [ "$TUI_EXIT" = "1" ]; then
+      exit "$TUI_EXIT"
+    fi
+    if [ "${FORGE_TUI_NO_FALLBACK:-0}" = "1" ]; then
+      echo "TUI exited with code $TUI_EXIT and fallback is disabled." >&2
+      exit "$TUI_EXIT"
+    fi
+    # Sentinel 87 (self-abort) or 127 (node/tui not found) -> fall through.
+    echo "TUI exited with code $TUI_EXIT — falling back to plain runner." >&2
+  else
+    echo "FORGE_TUI=1 set but node or forge-tui.cjs unavailable — using plain runner." >&2
+  fi
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
 echo "Starting Forge autonomous runner..."
 echo "Max restarts: $MAX_RESTARTS (set FORGE_MAX_RESTARTS to override)"
 echo "Press Ctrl+C to stop"
