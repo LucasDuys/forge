@@ -529,37 +529,461 @@ function parseFrontmatter(raw) {
 }
 
 // ============================================================================
-// SECTION 7 — main() entry (Tier 2 skeleton; runner/renderer wire in Tier 3)
+// SECTION 7 — Renderer: 5-region ANSI dashboard with transcript ring buffer (T010, R003 + R009)
+// ============================================================================
+//
+// Five regions:
+//   1. Header line              — "Forge" + "phase X/Y"
+//   2. Status block (3 lines)   — task / agent+tool / progress bar
+//   3. Token+meter line         — input/output/cached + restarts + context%
+//   4. Separator
+//   5. Transcript pane          — ring buffer of last N events
+//
+// Rendered as a single string per frame and written in one stdout.write to
+// minimize tearing. 10Hz tick (setInterval 100ms). The renderer DOES NOT
+// react to individual events — it always reads the latest snapshot. This
+// keeps the data flow one-way and avoids race conditions.
+
+const MIN_COLS = 80;
+const MIN_ROWS = 24;
+const RENDER_INTERVAL_MS = 100;
+
+class Renderer {
+  constructor({ caps, args, poller, parser }) {
+    this.caps = caps;
+    this.args = args;
+    this.poller = poller;
+    this.parser = parser;
+    this.transcript = [];   // ring buffer of { glyph, text }
+    this.maxTranscript = args.transcriptLines;
+    this.timer = null;
+    this.alert = null;      // { kind: 'blocked'|'error', text }
+    this.countdown = null;  // { remaining, total } during backoff
+    this.lastFrame = '';
+  }
+
+  start() {
+    this.timer = setInterval(() => this.render(), RENDER_INTERVAL_MS);
+    if (this.timer.unref) this.timer.unref();
+  }
+
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  pushTranscript(glyph, text) {
+    // Collapse multiline tool_result bodies to first line + (N more lines).
+    const lines = String(text).split('\n');
+    const display = lines.length > 1
+      ? `${lines[0]} (${lines.length - 1} more lines)`
+      : lines[0];
+    this.transcript.push({ glyph, text: display });
+    if (this.transcript.length > this.maxTranscript) {
+      this.transcript.shift();
+    }
+  }
+
+  setAlert(alert) { this.alert = alert; }
+  clearAlert() { this.alert = null; }
+  setCountdown(remaining, total) { this.countdown = { remaining, total }; }
+  clearCountdown() { this.countdown = null; }
+
+  render() {
+    const cols = process.stdout.columns || 80;
+    const rows = process.stdout.rows || 24;
+
+    if (cols < MIN_COLS || rows < MIN_ROWS) {
+      const msg = `Terminal too small — resize to ${MIN_COLS}x${MIN_ROWS} (current ${cols}x${rows})`;
+      const frame = ANSI.home + ANSI.clear + msg + '\n';
+      if (frame !== this.lastFrame) {
+        process.stdout.write(frame);
+        this.lastFrame = frame;
+      }
+      return;
+    }
+
+    const snap = this.poller.getSnapshot();
+    this.poller.reconcile(this.parser.latest);
+
+    const frame = this._buildFrame(snap, cols, rows);
+    if (frame !== this.lastFrame) {
+      process.stdout.write(frame);
+      this.lastFrame = frame;
+    }
+  }
+
+  _buildFrame(snap, cols, rows) {
+    const lines = [];
+    lines.push(this._header(snap, cols));
+    lines.push(this._statusLine(snap, cols));
+    lines.push(this._agentLine(snap, cols));
+    lines.push(this._progressLine(snap, cols));
+    lines.push(this._tokenLine(snap, cols));
+    lines.push(this._meterLine(snap, cols));
+    lines.push(this._sep(cols));
+    if (this.alert) lines.push(this._alertLine(this.alert, cols));
+    if (this.countdown) lines.push(this._countdownLine(this.countdown, cols));
+    lines.push(this._sep(cols, 'Transcript'));
+
+    const overhead = lines.length + 2;
+    const transcriptRows = Math.max(3, rows - overhead);
+    const slice = this.transcript.slice(-transcriptRows);
+    for (const t of slice) {
+      lines.push(`  ${this._color('gray', t.glyph)} ${this._truncate(t.text, cols - 4)}`);
+    }
+    while (lines.length < rows - 1) lines.push('');
+
+    return ANSI.home + ANSI.clear + lines.join('\n') + '\n';
+  }
+
+  _header(snap, cols) {
+    const left = `${ANSI.bold}Forge${ANSI.reset} ${this._color('gray', '— interactive runner')}`;
+    const phase = snap.phase || 'idle';
+    const right = this._color('cyan', `phase: ${phase}`);
+    return this._twoCol(left, right, cols);
+  }
+
+  _statusLine(snap, cols) {
+    const task = snap.currentTask || '—';
+    const status = snap.taskStatus || 'unknown';
+    const statusColor = status === 'blocked' ? 'red'
+                      : status === 'complete' ? 'green'
+                      : 'yellow';
+    return `  Task:   ${ANSI.bold}${task}${ANSI.reset}  ${this._color(statusColor, `[${status}]`)}`;
+  }
+
+  _agentLine(snap, cols) {
+    const agent = this.parser.activeSubagent();
+    const tool = this.parser.latest.activeTool || '—';
+    return `  Agent:  ${this._color('magenta', agent)}   Tool: ${this._color('cyan', tool)}`;
+  }
+
+  _progressLine(snap, cols) {
+    const total = snap.frontier.total || 0;
+    const done = Math.min(snap.completedCount, total);
+    const pct = total > 0 ? Math.floor((done / total) * 100) : 0;
+    const barWidth = Math.min(40, cols - 30);
+    const filled = total > 0 ? Math.round((done / total) * barWidth) : 0;
+    const fillChar = this.caps.utf8 ? '\u2588' : '#';
+    const emptyChar = this.caps.utf8 ? '\u2591' : '-';
+    const bar = fillChar.repeat(filled) + emptyChar.repeat(barWidth - filled);
+    return `  Tasks:  [${this._color('green', bar)}] ${done}/${total} (${pct}%)`;
+  }
+
+  _tokenLine(snap, cols) {
+    const t = snap.ledger;
+    return `  Tokens: ${this._fmtTokens(t.input)} in / ${this._fmtTokens(t.output)} out / ${this._fmtTokens(t.cache_read)} cached`;
+  }
+
+  _meterLine(snap, cols) {
+    const ctxPct = Math.min(100, Math.floor((snap.ledger.input / this.args.contextLimit) * 100));
+    const ctxColor = ctxPct >= 80 ? 'red' : ctxPct >= 60 ? 'yellow' : 'green';
+    return `  Meters: Restarts ${snap.restartCount}/${this.args.maxRestarts}   Context ${this._color(ctxColor, ctxPct + '%')}   Tools used ${snap.toolCount}`;
+  }
+
+  _alertLine(alert, cols) {
+    const label = alert.kind === 'blocked' ? ' BLOCKED ' : ' ERROR ';
+    return `  ${ANSI.bgRed}${ANSI.bold}${label}${ANSI.reset} ${this._color('red', alert.text)}`;
+  }
+
+  _countdownLine(c, cols) {
+    return `  ${this._color('yellow', `Restarting in ${c.remaining}s... (${c.total - c.remaining + 1} of ${c.total})`)}`;
+  }
+
+  _sep(cols, label) {
+    const line = '─'.repeat(Math.max(0, cols));
+    if (!label) return this._color('gray', line);
+    const tag = ` ${label} `;
+    const left = '─'.repeat(2);
+    const right = '─'.repeat(Math.max(0, cols - left.length - tag.length));
+    return this._color('gray', left + tag + right);
+  }
+
+  _color(name, str) {
+    if (!this.caps.isTTY) return str;
+    const code = ANSI[name] || '';
+    return `${code}${str}${ANSI.reset}`;
+  }
+
+  _fmtTokens(n) {
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000) return Math.round(n / 1_000) + 'k';
+    return String(n);
+  }
+
+  _truncate(s, max) {
+    if (s.length <= max) return s;
+    return s.slice(0, Math.max(0, max - 1)) + '…';
+  }
+
+  _twoCol(left, right, cols) {
+    // Strip ANSI for length math, then pad.
+    const visibleLen = (s) => s.replace(/\x1b\[[0-9;]*m/g, '').length;
+    const pad = Math.max(1, cols - visibleLen(left) - visibleLen(right));
+    return left + ' '.repeat(pad) + right;
+  }
+}
+
+// ============================================================================
+// SECTION 8 — Runner: spawn claude, restart loop, blocked/complete detection (T011, R006)
+// ============================================================================
+//
+// Reimplements scripts/forge-runner.sh in JS, plus:
+//   - spawns claude with --output-format stream-json --verbose
+//   - pipes stdout into StreamParser
+//   - countdown displayed in dashboard during backoff
+//   - hydrates restart count from .tui-state.json so restarts survive process death
+//
+// Identical math to forge-runner.sh:
+//   delay = base * 2^(restart-1), capped at 60
+//   on non-zero child exit: delay *= 2, capped at 120
+
+class Runner {
+  constructor({ args, parser, poller, renderer }) {
+    this.args = args;
+    this.parser = parser;
+    this.poller = poller;
+    this.renderer = renderer;
+    this.restartCount = poller.persisted.restart_count || 0;
+    this.aborted = false;
+    this.fatal = null;
+  }
+
+  abort(reason) {
+    this.aborted = true;
+    this.fatal = reason;
+  }
+
+  // Compute backoff delay matching forge-runner.sh integer arithmetic exactly.
+  static computeDelay(baseDelay, restartCount, childExitedNonZero) {
+    let delay = baseDelay;
+    for (let i = 1; i < restartCount; i++) {
+      delay *= 2;
+      if (delay > 60) { delay = 60; break; }
+    }
+    if (childExitedNonZero) {
+      delay *= 2;
+      if (delay > 120) delay = 120;
+    }
+    return delay;
+  }
+
+  resumePromptPath() {
+    return path.join(this.args.forgeDir, '.forge-resume.md');
+  }
+
+  async run() {
+    while (true) {
+      const resumePath = this.resumePromptPath();
+      if (!fs.existsSync(resumePath)) {
+        process.stderr.write(`No resume prompt found at ${resumePath}. Run /forge execute first.\n`);
+        return EXIT_ERROR;
+      }
+      const prompt = fs.readFileSync(resumePath, 'utf8');
+
+      this.renderer.pushTranscript('>', `Launching Claude (restart ${this.restartCount + 1}/${this.args.maxRestarts})`);
+
+      const exitCode = await this._spawnOnce(prompt);
+
+      if (this.aborted) {
+        process.stderr.write(`FORGE_TUI_FALLBACK: ${this.fatal && this.fatal.message ? this.fatal.message : 'aborted'}\n`);
+        return this.args.noFallback ? EXIT_ERROR : EXIT_FALLBACK;
+      }
+
+      // Completion: loop file removed.
+      if (!fs.existsSync(path.join(this.args.forgeDir, '.forge-loop.json'))) {
+        this.renderer.pushTranscript('=', 'Forge complete!');
+        return EXIT_OK;
+      }
+
+      // Blocked: state.md task_status: blocked.
+      const snap = this.poller.getSnapshot();
+      if (snap.taskStatus === 'blocked') {
+        this.renderer.setAlert({ kind: 'blocked', text: snap.blockedReason || 'task blocked, needs human input' });
+        return EXIT_OK;
+      }
+
+      this.restartCount++;
+      this.poller.persist({ restartCount: this.restartCount });
+
+      if (this.restartCount >= this.args.maxRestarts) {
+        this.renderer.setAlert({ kind: 'error', text: `Max restarts (${this.args.maxRestarts}) reached` });
+        return EXIT_ERROR;
+      }
+
+      const delay = Runner.computeDelay(this.args.baseDelay, this.restartCount, exitCode !== 0);
+      for (let s = delay; s > 0; s--) {
+        this.renderer.setCountdown(s, delay);
+        await sleep(1000);
+        if (this.aborted) break;
+      }
+      this.renderer.clearCountdown();
+    }
+  }
+
+  _spawnOnce(prompt) {
+    return new Promise((resolve) => {
+      const child = spawn('claude', [
+        '-p', prompt,
+        '--output-format', 'stream-json',
+        '--verbose',
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+      child.on('error', (err) => {
+        // ENOENT means claude isn't on PATH — fallback sentinel via abort().
+        this.abort(err.code === 'ENOENT'
+          ? new Error('claude command not found on PATH')
+          : err);
+        resolve(EXIT_ERROR);
+      });
+
+      child.stdout.on('data', (chunk) => this.parser.feed(chunk));
+      child.stderr.on('data', (chunk) => {
+        // stderr lines are not stream-json — surface in transcript.
+        const txt = chunk.toString('utf8').trim();
+        if (txt) this.renderer.pushTranscript('!', txt);
+      });
+
+      child.on('close', (code) => {
+        this.parser.end();
+        resolve(code == null ? EXIT_ERROR : code);
+      });
+    });
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ============================================================================
+// SECTION 9 — main() entry (Tier 3 wired)
 // ============================================================================
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv);
   if (args.help) { printHelp(); process.exit(EXIT_OK); }
 
-  // Tier 1 wiring — foundational modules initialized.
-  // Later tiers add: parser (T006), poller (T007), attribution (T008),
-  // renderer (T010), runner semantics (T011), fallback contract (T012).
   TuiLog.truncateOnStartup(args.forgeDir);
   const caps = detectCaps();
-  const persisted = TuiState.load(args.forgeDir);
 
-  // Guard: non-TTY invocation is a fallback signal (see R010). For now,
-  // exit with the fallback sentinel so forge-runner.sh uses the plain path.
+  // Non-TTY invocation: emit a compact one-line-per-event stream and let the
+  // runner still drive to completion. This satisfies R010 AC: "When isTTY is
+  // false, TUI prints a one-line status per event instead of rendering the
+  // full dashboard." We also don't exit with the fallback sentinel here — a
+  // piped invocation is legitimate (e.g. CI logs), not a TUI failure.
   if (!caps.isTTY) {
-    process.stderr.write('FORGE_TUI_FALLBACK: stdout is not a TTY\n');
-    process.exit(args.noFallback ? EXIT_ERROR : EXIT_FALLBACK);
+    return runHeadless(args);
   }
 
-  // Placeholder until renderer/runner land — emit a diagnostic frame so
-  // manual smoke tests of the scaffold produce visible output.
+  // Wire the pipeline: parser -> poller reconciles -> renderer reads snapshot.
+  const poller = new StatePoller({ forgeDir: args.forgeDir });
+  poller.start();
+
+  const parser = new StreamParser({
+    forgeDir: args.forgeDir,
+    onEvent: (event, agent) => onEvent(event, agent, renderer),
+    onFatal: (err) => runner.abort(err),
+  });
+
+  const renderer = new Renderer({ caps, args, poller, parser });
+  const runner = new Runner({ args, parser, poller, renderer });
+
   enableRawTerminal(caps);
-  process.stdout.write(`${ANSI.bold}forge-tui${ANSI.reset} (scaffold)\n`);
-  process.stdout.write(`  forge dir:      ${args.forgeDir}\n`);
-  process.stdout.write(`  caps:           ${JSON.stringify(caps)}\n`);
-  process.stdout.write(`  restart cache:  ${persisted.restart_count}\n`);
-  process.stdout.write(`  frontier total: ${persisted.frontier_total}\n`);
-  restoreTerminal(caps);
-  process.exit(EXIT_OK);
+  renderer.start();
+
+  // Terminal restore on any exit path.
+  const cleanup = (code) => {
+    renderer.stop();
+    poller.stop();
+    restoreTerminal(caps);
+    process.exit(typeof code === 'number' ? code : EXIT_OK);
+  };
+  process.on('SIGINT', () => cleanup(EXIT_OK));
+  process.on('SIGTERM', () => cleanup(EXIT_OK));
+
+  try {
+    const code = await runner.run();
+    // One final frame so the completion/blocked banner is visible.
+    renderer.render();
+    cleanup(code);
+  } catch (err) {
+    process.stderr.write(`FORGE_TUI_FALLBACK: ${err && err.message ? err.message : err}\n`);
+    cleanup(args.noFallback ? EXIT_ERROR : EXIT_FALLBACK);
+  }
+}
+
+// Glyph mapping for transcript events.
+function onEvent(event, agent, renderer) {
+  if (!event || !event.type) return;
+  if (event.type === 'assistant' && event.message && Array.isArray(event.message.content)) {
+    for (const block of event.message.content) {
+      if (block.type === 'text' && block.text) {
+        renderer.pushTranscript('>', `[${agent}] ${block.text}`);
+      } else if (block.type === 'tool_use') {
+        const inputHint = summarizeToolInput(block);
+        renderer.pushTranscript('~', `${block.name}${inputHint ? ' ' + inputHint : ''}`);
+      }
+    }
+  } else if (event.type === 'user' && event.message && Array.isArray(event.message.content)) {
+    for (const block of event.message.content) {
+      if (block.type === 'tool_result') {
+        const body = typeof block.content === 'string'
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.map((c) => c.text || '').join('\n')
+            : '';
+        renderer.pushTranscript('=', body || '(ok)');
+      }
+    }
+  } else if (event.type === 'result') {
+    const u = event.usage || {};
+    renderer.pushTranscript('>', `turn complete — ${u.input_tokens || 0} in / ${u.output_tokens || 0} out`);
+  }
+}
+
+function summarizeToolInput(block) {
+  if (!block.input) return '';
+  if (block.input.file_path) return String(block.input.file_path);
+  if (block.input.pattern) return String(block.input.pattern);
+  if (block.input.command) return String(block.input.command).slice(0, 60);
+  if (block.input.subagent_type) return `→ ${block.input.subagent_type}`;
+  return '';
+}
+
+// Headless mode: no dashboard, just tails events as single lines. Used when
+// stdout is not a TTY (piped/CI). Still runs the full runner loop.
+async function runHeadless(args) {
+  const poller = new StatePoller({ forgeDir: args.forgeDir });
+  poller.start();
+  const parser = new StreamParser({
+    forgeDir: args.forgeDir,
+    onEvent: (event, agent) => {
+      if (event.type === 'assistant' && event.message && Array.isArray(event.message.content)) {
+        for (const b of event.message.content) {
+          if (b.type === 'text' && b.text) process.stdout.write(`[${agent}] ${b.text}\n`);
+          if (b.type === 'tool_use') process.stdout.write(`[${agent}] ~${b.name}\n`);
+        }
+      } else if (event.type === 'result' && event.usage) {
+        process.stdout.write(`[result] ${event.usage.input_tokens}in/${event.usage.output_tokens}out\n`);
+      }
+    },
+    onFatal: () => {},
+  });
+  // Render is a no-op stub for runner.run() — provide a minimal shim.
+  const rendererStub = {
+    pushTranscript: (_g, t) => process.stdout.write(t + '\n'),
+    setAlert: (a) => process.stdout.write(`[ALERT ${a.kind}] ${a.text}\n`),
+    clearAlert: () => {},
+    setCountdown: (r) => process.stdout.write(`restart in ${r}s...\n`),
+    clearCountdown: () => {},
+    render: () => {},
+  };
+  const runner = new Runner({ args, parser, poller, renderer: rendererStub });
+  const code = await runner.run();
+  poller.stop();
+  process.exit(code);
 }
 
 // Export for tests (run.cjs loads this with require()).
@@ -572,6 +996,8 @@ module.exports = {
   TuiLog, MAX_LOG_LINES,
   StreamParser, MAX_CONSECUTIVE_PARSE_ERRORS,
   StatePoller, POLL_INTERVAL_MS, parseFrontmatter,
+  Renderer, MIN_COLS, MIN_ROWS, RENDER_INTERVAL_MS,
+  Runner,
 };
 
 // Only run main() when invoked as a script, not when require()'d by tests.
