@@ -102,6 +102,84 @@ session budget: 47200 / 500000 used. lock released.
 
 You read the diffs. You merge the branch. You move on.
 
+## How it works under the hood
+
+The whole loop is a state machine that lives inside your Claude Code session. One line in, tested and verified code out. Here is what actually happens between the prompt and the commit:
+
+```mermaid
+flowchart TB
+    User([You: one line idea]) --> Brainstorm["/forge brainstorm<br/>spec writer"]
+    Brainstorm --> Spec[".forge/specs/spec-{domain}.md<br/>R001, R002, R003... acceptance criteria"]
+    Spec --> Plan["/forge plan<br/>planner + complexity"]
+    Plan --> Frontier[".forge/plans/{spec}-frontier.md<br/>tier 1, tier 2, tier 3...<br/>dependency DAG"]
+
+    Frontier --> Loop{state machine<br/>routeDecision}
+
+    Loop -->|tier ready| Dispatch[streaming-DAG dispatch]
+    Dispatch -->|T001 worktree| Exec1["forge-executor<br/>(haiku)"]
+    Dispatch -->|T002 worktree| Exec2["forge-executor<br/>(sonnet)"]
+    Dispatch -->|T003 worktree| Exec3["forge-executor<br/>(sonnet)"]
+
+    Exec1 --> CP1[".forge/progress/T001.json<br/>spec_loaded → tests_written → tests_passing"]
+    Exec2 --> CP2[".forge/progress/T002.json"]
+    Exec3 --> CP3[".forge/progress/T003.json"]
+
+    CP1 --> Tests{tests pass?}
+    CP2 --> Tests
+    CP3 --> Tests
+
+    Tests -->|pass| Review["forge-reviewer<br/>spec compliance + code quality"]
+    Tests -->|fail x3| Hook["PostToolUse hook<br/>auto-backprop.js"]
+
+    Hook --> Flag[".forge/.auto-backprop-pending.json<br/>+ state.md flag"]
+    Flag --> Backprop["/forge backprop<br/>injected on next iteration"]
+    Backprop --> SpecGap["TRACE → ANALYZE → PROPOSE<br/>spec update + regression test"]
+    SpecGap --> Loop
+
+    Review -->|issues| Loop
+    Review -->|pass| Verify["forge-verifier<br/>existence > substantive > wired > runtime"]
+    Verify -->|gap| Loop
+    Verify -->|all R's met| Squash["squash-merge worktrees<br/>atomic commits to main"]
+    Squash --> Loop
+
+    Loop -->|all tiers complete| Done([promise: FORGE_COMPLETE])
+
+    Watch["/forge watch<br/>TUI dashboard"] -.->|reads| State["state.md<br/>task-status.json<br/>progress/*.json<br/>token-ledger.json<br/>.forge-loop.lock"]
+    Loop -.->|writes| State
+
+    Headless["/forge status --json<br/>headless query"] -.->|reads| State
+
+    classDef agent fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef state fill:#fff3e0,stroke:#e65100,color:#bf360c
+    classDef hook fill:#fce4ec,stroke:#c2185b,color:#880e4f
+    classDef ui fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+
+    class Exec1,Exec2,Exec3,Review,Verify,Brainstorm,Plan,Backprop,SpecGap agent
+    class Spec,Frontier,CP1,CP2,CP3,Flag,State state
+    class Hook hook
+    class Watch,Headless,User,Done ui
+```
+
+### What each piece does
+
+**The state machine** (`scripts/forge-tools.cjs::routeDecision`) is the brain. Every time Claude tries to exit, the Stop hook calls it, asks "what's next given the current `.forge/state.md`?", and either feeds back a new prompt to keep going or lets Claude exit clean. There are 12 phases (idle, executing, reviewing_branch, verifying, budget_exhausted, conflict_resolution, recovering, lock_conflict, …) and the router knows every transition between them.
+
+**Streaming-DAG dispatch** is how parallel tasks happen. The frontier file is a DAG with tier numbers; the router calls `findAllUnblockedTasks(tasks, forgeDir)` and gets back every task whose dependencies are satisfied. Up to `parallelism.max_concurrent_agents` (default 3) of those run simultaneously, each in its own git worktree at `.forge/worktrees/{task-id}/`. Worktrees mean failed tasks can be discarded without touching your main branch and successful ones squash-merge atomically.
+
+**Per-task checkpoints** at `.forge/progress/{task-id}.json` track progress through 10 steps: `spec_loaded → research_done → planning_done → implementation_started → tests_written → tests_passing → review_pending → review_passed → verification_pending → complete`. If your machine crashes mid-task, `/forge resume` reads the checkpoint and picks up at the exact step where it died — no re-running tests that already passed.
+
+**Model routing** sends each agent to the cheapest model that can handle its job. `forge-complexity` always runs on haiku. `forge-executor` runs on haiku for "quick" tasks, sonnet for "standard", opus for "thorough" — controlled by per-role baselines in `.forge/config.json`. `forge-speccer` and `forge-reviewer` start at sonnet because spec quality drives everything downstream.
+
+**Auto-backprop** is the new bug → spec-gap loop. When the `hooks/auto-backprop.js` PostToolUse hook sees a test failure during executor runs, it captures the failure context, writes `.forge/.auto-backprop-pending.json`, and flips a flag in `state.md`. The TUI dashboard's `BACKPROP` banner lights up immediately. On the next iteration, the Stop hook prepends an `AUTO-BACKPROP TRIGGERED` directive to the routed prompt — the executor pauses the current task, runs the 5-step backprop workflow (TRACE → ANALYZE → PROPOSE → GENERATE → LOG), updates the spec, generates a regression test, then resumes. The flag is deleted atomically so the same failure never re-fires. Opt out with `auto_backprop: false` in config or `FORGE_AUTO_BACKPROP=0` env.
+
+**The TUI dashboard** (`/forge watch`) doesn't write any state — it only reads. It polls `state.md`, `task-status.json`, every running task's `progress/{id}.json`, the lock file, and the token ledger on a 500ms interval, then renders a 5-region ANSI frame at 10Hz. When more than one task is running, a `── Parallel ──` panel shows one row per task with its agent, current step, and live token cost vs per-task budget. Zero npm install — pure Node built-ins and ANSI sequences.
+
+**The headless mode** (`/forge status --json` or `node scripts/forge-tools.cjs headless query --json`) is the same data as the TUI but as a single JSON snapshot in under 5ms. Drop it into a Prometheus exporter, a Grafana dashboard, or a `--watch` polling loop. 17 fields, schema versioned at 1.0, zero LLM calls.
+
+**Crash recovery** uses three layers: a lock file with 30-second heartbeat (5-minute stale threshold) prevents two sessions from racing on the same project, per-step checkpoints let resume restart inside a task at the exact step, and `performForensicRecovery()` reconstructs state from the lock + checkpoints + git log even if `state.md` itself is corrupted.
+
+The whole thing is one Node-and-bash codebase with no npm install, no build step, and no external services. State lives in markdown and JSON files under `.forge/`. Every commit is atomic. Every test runs in 2.4 seconds.
+
 ## Why it works
 
 - **Native Claude Code plugin.** Lives in your existing session. No separate harness, no TUI to learn, no API key to manage. ([architecture](docs/architecture.md))

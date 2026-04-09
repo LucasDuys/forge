@@ -23,14 +23,68 @@ Forge — interactive runner                                       phase: execut
 | Region | Source | Updates |
 |---|---|---|
 | Header | `.forge/state.md` frontmatter (`phase`) | 500ms poll |
-| Task line | `.forge/state.md` (`current_task`, `task_status`) | 500ms poll |
+| Task line | `.forge/state.md` (`current_task`, `task_status`) + per-task checkpoint (`current_step`, `next_step`, `token_usage`) | 500ms poll |
 | Agent + Tool line | `assistant` events from stream-json (Task `subagent_type` + most recent `tool_use.name`) | live |
 | Progress bar | Newest `.forge/plans/*-frontier.md` (`total_tasks`) + completed task IDs cached in `.forge/.tui-state.json` | 500ms poll |
-| Token meters | `result` events `usage.input_tokens` / `output_tokens` / `cache_read_input_tokens` (high-water mark) | live |
-| Restart + Context meters | Internal counter + cumulative `input_tokens` divided by 200k | live |
+| **Parallel panel (R013)** | `.forge/task-status.json` `running` tasks + each task's `.forge/progress/{id}.json` checkpoint | 500ms poll |
+| Token meters | `result` events `usage.input_tokens` / `output_tokens` / `cache_read_input_tokens` (high-water mark), session budget from headless query, total task tokens summed across all checkpoints | live + 500ms |
+| Restart + Context meters | Internal counter + cumulative `input_tokens` divided by session budget total (or 200k fallback) | live |
+| Lock indicator | `.forge/.forge-loop.lock` (PID + heartbeat age, 5-min stale threshold) | 500ms poll |
 | Transcript | Ring buffer of last 50 events (configurable via `--transcript-lines`) | live |
 
 Multiline `tool_result` bodies are collapsed on screen to the first line plus `(N more lines)`. The full event log is mirrored to `.forge/.tui-log.jsonl` for post-mortem inspection.
+
+## Parallel panel (R013)
+
+When more than one task is running in parallel (v2.1 streaming-DAG dispatch with worktree isolation), the dashboard renders a `── Parallel ──` separator followed by one row per task:
+
+```
+── Parallel ──────────────────────────────────────────────────────────────
+  T002  forge-executor   @ tests_written → tests_passing   8.4k/15k tok (56%)
+  T003  forge-reviewer   @ review_pending                  12.1k/15k tok (80%)
+  T004  forge-executor   @ implementation_started           2.3k/15k tok (15%)
+```
+
+Each row shows:
+
+- **Task ID** — clickable in modern terminals if the executor logs file links
+- **Agent** — `forge-executor`, `forge-reviewer`, etc., from the checkpoint's `agent` field
+- **Step** — current_step → next_step from `.forge/progress/{id}.json`
+- **Token cost** — `tokens_used / per_task_budget (percentage)` with green/yellow/red color thresholds at 70/90
+
+The panel is **capped at 4 visible rows** plus a `(...N more)` overflow indicator so 8 parallel tasks don't crush the transcript pane. When the terminal is too small to fit both the panel and a 5-row transcript minimum, the panel collapses to the v1 single-line summary (`Running: T002, T003, T004 (3 parallel)`) automatically.
+
+The panel only renders when **more than one** task is running. With one task, the status line already covers it.
+
+## Per-task token cost (R014)
+
+Single-task mode adds a token suffix to the status line:
+
+```
+  Task:   T010  [in_progress]  @ tests_written → tests_passing   12.4k/15k tok (83%)
+```
+
+The token line gains a `task-tot` subfield showing total tokens summed across **every** `.forge/progress/{id}.json` checkpoint (not just running tasks):
+
+```
+  Tokens: 142k in / 38k out / 89k cached   budget 47k/500k (9%)   task-tot 47k
+```
+
+Per-task budgets come from `.forge/config.json`:
+
+```json
+{
+  "per_task_budget": {
+    "quick": 5000,
+    "standard": 15000,
+    "thorough": 40000
+  }
+}
+```
+
+The depth used for the current task is read from the task's checkpoint (`depth` field), falling back to the project's `depth` config field. Color thresholds intentionally diverge from the context-meter (70/90 for budget, 60/80 for context) because they measure different things — budget is "how much of this task's allowance have we spent" while context is "how close are we to a context reset."
+
+When a checkpoint has no `token_usage` field (older checkpoint format), the display falls back to `— tok` instead of crashing.
 
 ## Requirements
 

@@ -98,6 +98,15 @@ This means a user who runs `/forge watch` on a machine without Node, or in a ter
 
 The seed fixture at `tests/forge-tui/fixture-stream.jsonl` is currently a hand-crafted synthetic recording of a forge-executor session: system init → assistant text → Task tool_use → nested Read/Edit → tool_results → result event with usage. It exists because the implementation environment did not have the `claude` CLI on PATH and could not produce a real recording at execution time. The synthetic fixture should be replaced with a real recording the first time `/forge watch` runs end-to-end against a live forge session — the snapshot test will catch any structural drift.
 
+## v2 amendments (R013/R014, shipped post-merge)
+
+After the initial v1 ship, two requirements were appended to the spec to fully integrate with v2.1's streaming-DAG dispatch:
+
+- **R013 — Multi-task parallel panel.** When more than one task is running, the renderer emits a `── Parallel ──` section with one row per task showing id/agent/step/tokens. Capped at 4 visible rows plus an overflow indicator. Falls back to the v1 single-line summary when the terminal is too small to fit both the panel and a 5-row transcript minimum. Implemented in `Renderer._parallelPanelLines()` and `Renderer._parallelRow()`.
+- **R014 — Per-task token cost.** Status line and parallel-panel rows show `tokens_used / per_task_budget (percentage)` with 70/90 color thresholds. Token line gains a `task-tot` subfield summing token_usage across all `.forge/progress/*.json` checkpoints. `StatePoller._readAll()` reads `per_task_budget` from `.forge/config.json` and resolves the current task's depth from its checkpoint.
+
+These amendments preserve backwards compatibility — the existing single-task render path is unchanged, and all v1 snapshot tests still pass. The fallback to the v1 single-line summary ensures small-terminal users keep their transcript visible.
+
 ## Future considerations
 
 - Interactive controls (pause, resume, skip task, re-plan from dashboard) — explicitly deferred

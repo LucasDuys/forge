@@ -444,6 +444,13 @@ class StatePoller {
       sessionBudget: null,       // { used, remaining, total } from headless query
       lastError: null,           // free-form error message from headless query
       autoBackpropPending: false,// auto-backprop hook flag
+      // R013/R014: per-task enrichments
+      runningTaskDetails: [],    // [{ id, currentStep, nextStep, tokenUsage, agent }]
+      currentTaskTokens: null,   // checkpoint.token_usage for currentTask
+      currentTaskBudget: null,   // per_task_budget.{depth} from .forge/config.json
+      perTaskBudgets: null,      // { quick, standard, thorough } from config
+      currentDepth: 'standard',  // .forge/config.json depth (drives currentTaskBudget)
+      taskTotalTokens: 0,        // sum of token_usage across ALL .forge/progress/*.json
     };
   }
 
@@ -595,15 +602,74 @@ class StatePoller {
     // Per-task checkpoint step for the current task. Gives the dashboard a
     // sub-task progress indicator (e.g. "tests_written → tests_passing").
     if (s.currentTask) {
-      try {
-        const cp = JSON.parse(fs.readFileSync(
-          path.join(this.forgeDir, 'progress', `${s.currentTask}.json`),
-          'utf8'
-        ));
+      const cp = readCheckpoint(this.forgeDir, s.currentTask);
+      if (cp) {
         if (cp.current_step) s.currentStep = cp.current_step;
         if (cp.next_step) s.nextStep = cp.next_step;
-      } catch (e) { /* checkpoint may not exist for this task */ }
+        // R014: token usage from current task's checkpoint
+        if (typeof cp.token_usage === 'number') s.currentTaskTokens = cp.token_usage;
+      }
     }
+
+    // R013/R014: per-task checkpoint reads for ALL running tasks (not just
+    // current). Powers the multi-row parallel panel and per-row token cost.
+    // Issues N filesystem reads per 500ms poll — acceptable at N<=10. If the
+    // running set ever grows past that, add an mtime cache here.
+    if (s.runningTasks && s.runningTasks.length > 0) {
+      s.runningTaskDetails = s.runningTasks.map((id) => {
+        const cp = readCheckpoint(this.forgeDir, id);
+        return {
+          id,
+          currentStep: cp && cp.current_step ? cp.current_step : null,
+          nextStep: cp && cp.next_step ? cp.next_step : null,
+          tokenUsage: cp && typeof cp.token_usage === 'number' ? cp.token_usage : null,
+          // Agent attribution: checkpoint may carry the routed model/agent.
+          // Forge v2.1 schema doesn't pin this — read either field if present.
+          agent: (cp && (cp.agent || cp.subagent_type || cp.routed_model)) || null,
+          // Depth per task (for per-task budget calculation in the renderer).
+          depth: (cp && cp.depth) || s.currentDepth,
+        };
+      });
+    }
+
+    // R014: total tokens spent across ALL checkpoints (not just running). Used
+    // for the "task-tot Nk" subfield on the token line. Bounded scan: at most
+    // 100 checkpoint files — keeps the poll under the 100ms headless budget.
+    try {
+      const progDir = path.join(this.forgeDir, 'progress');
+      if (fs.existsSync(progDir)) {
+        const files = fs.readdirSync(progDir).filter((f) => f.endsWith('.json')).slice(0, 100);
+        let total = 0;
+        for (const f of files) {
+          try {
+            const cp = JSON.parse(fs.readFileSync(path.join(progDir, f), 'utf8'));
+            if (typeof cp.token_usage === 'number') total += cp.token_usage;
+          } catch (e) { /* skip malformed */ }
+        }
+        s.taskTotalTokens = total;
+      }
+    } catch (e) { /* progress dir may not exist */ }
+
+    // R014: per-task budget map from .forge/config.json (per_task_budget.{depth}).
+    // Falls back to template defaults (5k/15k/40k) if config is missing fields.
+    try {
+      const cfg = JSON.parse(fs.readFileSync(path.join(this.forgeDir, 'config.json'), 'utf8'));
+      const ptb = (cfg && cfg.per_task_budget) || {};
+      s.perTaskBudgets = {
+        quick: typeof ptb.quick === 'number' ? ptb.quick : 5000,
+        standard: typeof ptb.standard === 'number' ? ptb.standard : 15000,
+        thorough: typeof ptb.thorough === 'number' ? ptb.thorough : 40000,
+      };
+      if (cfg && typeof cfg.depth === 'string') s.currentDepth = cfg.depth;
+      // Resolve current task's budget from depth (per-task depth wins if the
+      // checkpoint specified one; otherwise project depth).
+      let depth = s.currentDepth;
+      if (s.currentTask) {
+        const cp = readCheckpoint(this.forgeDir, s.currentTask);
+        if (cp && typeof cp.depth === 'string') depth = cp.depth;
+      }
+      if (s.perTaskBudgets[depth]) s.currentTaskBudget = s.perTaskBudgets[depth];
+    } catch (e) { /* config missing — defaults already applied via _empty() */ }
 
     // Lock file with stale detection. .forge/.forge-loop.lock has pid,
     // started_at, current_task, last_heartbeat. Stale if heartbeat > 5min.
@@ -636,6 +702,18 @@ class StatePoller {
     if (this.snapshot.ledger.input > s.ledger.input) s.ledger = this.snapshot.ledger;
 
     this.snapshot = s;
+  }
+}
+
+// R013/R014 helper: read a single task checkpoint file. Returns parsed JSON
+// or null on any error. Used by StatePoller for both the current task and
+// every running task in the parallel-panel render.
+function readCheckpoint(forgeDir, taskId) {
+  try {
+    const raw = fs.readFileSync(path.join(forgeDir, 'progress', `${taskId}.json`), 'utf8');
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
   }
 }
 
@@ -750,10 +828,21 @@ class Renderer {
     lines.push(this._statusLine(snap, cols));
     lines.push(this._agentLine(snap, cols));
     lines.push(this._progressLine(snap, cols));
-    // v2.1: only show parallel-tasks line when more than one task is in flight,
-    // otherwise it's just visual noise (the current-task line already covers it).
+    // R013: multi-row parallel panel when >1 task running. Falls back to the
+    // v1 single-line summary when terminal is small (cols<80 or fewer than
+    // panel_height+10 rows available). Existing snapshot tests for the
+    // single-task path are unaffected because both gates require >1 running.
     if (snap.runningTasks && snap.runningTasks.length > 1) {
-      lines.push(this._parallelLine(snap, cols));
+      const panelLines = this._parallelPanelLines(snap, cols, rows);
+      // Min-size collapse: if panel + transcript can't both fit, fall back
+      // to the single-line summary so the user keeps the transcript visible.
+      const transcriptMin = 5;
+      const fixedOverhead = 9; // header/status/agent/progress/token/meter/sep/sep/transcript-sep
+      if (rows >= panelLines.length + fixedOverhead + transcriptMin && cols >= MIN_COLS) {
+        for (const l of panelLines) lines.push(l);
+      } else {
+        lines.push(this._parallelLine(snap, cols));
+      }
     }
     lines.push(this._tokenLine(snap, cols));
     lines.push(this._meterLine(snap, cols));
@@ -797,13 +886,95 @@ class Renderer {
         ? `  ${this._color('gray', `@ ${snap.currentStep}`)} ${this._color('gray', '→')} ${this._color('cyan', snap.nextStep)}`
         : `  ${this._color('gray', `@ ${snap.currentStep}`)}`;
     }
-    return `  Task:   ${ANSI.bold}${task}${ANSI.reset}  ${this._color(statusColor, `[${status}]`)}${stepInfo}`;
+    // R014: append per-task token cost suffix when checkpoint has token_usage.
+    // Format: "  12.4k/15k tok (83%)" with 70/90 color thresholds.
+    let tokInfo = '';
+    if (snap.currentTaskTokens != null) {
+      const used = snap.currentTaskTokens;
+      if (snap.currentTaskBudget) {
+        const pct = Math.floor((used / snap.currentTaskBudget) * 100);
+        const color = pct >= 90 ? 'red' : pct >= 70 ? 'yellow' : 'green';
+        tokInfo = `  ${this._color(color, `${this._fmtTokens(used)}/${this._fmtTokens(snap.currentTaskBudget)} tok (${pct}%)`)}`;
+      } else {
+        tokInfo = `  ${this._color('gray', `${this._fmtTokens(used)} tok`)}`;
+      }
+    }
+    return `  Task:   ${ANSI.bold}${task}${ANSI.reset}  ${this._color(statusColor, `[${status}]`)}${stepInfo}${tokInfo}`;
   }
 
   // v2.1: parallel running tasks (streaming-DAG dispatch — multiple worktrees).
+  // Single-line fallback used when the multi-row panel does not fit.
   _parallelLine(snap, cols) {
     const list = snap.runningTasks.join(', ');
     return `  Running:${this._color('gray', '')} ${this._color('yellow', list)} ${this._color('gray', `(${snap.runningTasks.length} parallel)`)}`;
+  }
+
+  // R013: multi-row parallel panel. Returns an array of lines that the
+  // caller injects into _buildFrame's `lines`. Layout:
+  //
+  //   ── Parallel ──────────────────────────────────
+  //     T002  forge-executor   @ tests_written → tests_passing   8.4k/15k tok (56%)
+  //     T003  forge-reviewer   @ review_pending                 12.1k/15k tok (80%)
+  //     T004  forge-executor   @ implementation_started          2.3k/15k tok (15%)
+  //
+  // Capped at PANEL_MAX_VISIBLE rows. Overflow shows "(...N more)".
+  // Per-row token color uses the SAME 70/90 thresholds as R014's status line
+  // (intentionally divergent from the context-meter's 60/80 — they measure
+  // different things: per-task budget vs context-window utilization).
+  _parallelPanelLines(snap, cols) {
+    const PANEL_MAX_VISIBLE = 4;
+    const out = [];
+    out.push(this._sep(cols, 'Parallel'));
+
+    const details = (snap.runningTaskDetails && snap.runningTaskDetails.length)
+      ? snap.runningTaskDetails
+      : snap.runningTasks.map((id) => ({ id, currentStep: null, nextStep: null, tokenUsage: null, agent: null, depth: snap.currentDepth }));
+
+    const visible = details.slice(0, PANEL_MAX_VISIBLE);
+    const overflowCount = details.length - visible.length;
+
+    for (const t of visible) {
+      out.push(this._parallelRow(t, snap, cols));
+    }
+    if (overflowCount > 0) {
+      out.push(`  ${this._color('gray', `(...${overflowCount} more)`)}`);
+    }
+    return out;
+  }
+
+  _parallelRow(task, snap, cols) {
+    // ID column (5 chars: "T###  ")
+    const id = (task.id || '—').padEnd(5);
+    // Agent column (16 chars). Defaults to "—" when checkpoint omits it.
+    const agent = (task.agent || '—').slice(0, 14).padEnd(16);
+    // Step column. "@ current → next" or "@ current" or "—"
+    let step = '—';
+    if (task.currentStep) {
+      step = task.nextStep
+        ? `@ ${task.currentStep} → ${task.nextStep}`
+        : `@ ${task.currentStep}`;
+    }
+    // Token cost column with color thresholds (70/90).
+    const tokens = this._formatTaskTokens(task, snap);
+
+    // Compose with truncation to keep within `cols - 4` (4 = leading spaces).
+    const stepWidth = Math.max(20, cols - 4 - 5 - 16 - 22); // 22 reserved for tokens
+    const stepCol = this._truncate(step, stepWidth).padEnd(stepWidth);
+    return `  ${this._color('cyan', id)}${this._color('magenta', agent)}${this._color('gray', stepCol)}  ${tokens}`;
+  }
+
+  // R014: format "N/M tok (P%)" with green/yellow/red color thresholds.
+  // When token_usage missing, render "— tok" in gray. When budget unknown,
+  // render the raw token count without a percentage.
+  _formatTaskTokens(task, snap) {
+    if (task.tokenUsage == null) return this._color('gray', '— tok');
+    const used = task.tokenUsage;
+    const budget = (snap.perTaskBudgets && task.depth && snap.perTaskBudgets[task.depth])
+      || snap.currentTaskBudget;
+    if (!budget) return this._color('gray', `${this._fmtTokens(used)} tok`);
+    const pct = Math.floor((used / budget) * 100);
+    const color = pct >= 90 ? 'red' : pct >= 70 ? 'yellow' : 'green';
+    return this._color(color, `${this._fmtTokens(used)}/${this._fmtTokens(budget)} tok (${pct}%)`);
   }
 
   _autoBackpropLine(snap, cols) {
@@ -839,6 +1010,11 @@ class Renderer {
       const pct = Math.floor((used / total) * 100);
       const color = pct >= 90 ? 'red' : pct >= 70 ? 'yellow' : 'green';
       line += `   ${this._color('gray', 'budget')} ${this._color(color, `${this._fmtTokens(used)}/${this._fmtTokens(total)} (${pct}%)`)}`;
+    }
+    // R014: total tokens spent across all per-task checkpoints. Lets users
+    // see project-wide task spend at a glance, distinct from session/context.
+    if (snap.taskTotalTokens > 0) {
+      line += `   ${this._color('gray', `task-tot ${this._fmtTokens(snap.taskTotalTokens)}`)}`;
     }
     return line;
   }
@@ -1172,7 +1348,7 @@ module.exports = {
   detectCaps, ANSI, enableRawTerminal, restoreTerminal,
   TuiLog, MAX_LOG_LINES,
   StreamParser, MAX_CONSECUTIVE_PARSE_ERRORS,
-  StatePoller, POLL_INTERVAL_MS, parseFrontmatter,
+  StatePoller, POLL_INTERVAL_MS, parseFrontmatter, readCheckpoint,
   Renderer, MIN_COLS, MIN_ROWS, RENDER_INTERVAL_MS,
   Runner,
 };
