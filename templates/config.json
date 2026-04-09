@@ -32,6 +32,7 @@
     "auto_generate_regression_tests": true,
     "re_run_after_spec_update": false
   },
+  "auto_backprop": true,
   "capability_hints": {},
   "parallelism": {
     "max_concurrent_agents": 3,

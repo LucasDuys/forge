@@ -1,5 +1,5 @@
 {
-  "description": "Forge plugin hooks — autonomous loop engine, token monitoring, progress tracking, test filtering, and tool caching",
+  "description": "Forge plugin hooks — autonomous loop engine, token monitoring, progress tracking, test filtering, tool caching, and auto-backprop",
   "hooks": {
     "Stop": [
       {
@@ -39,6 +39,16 @@
           {
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/test-output-filter.js",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/auto-backprop.js",
             "timeout": 5
           }
         ]

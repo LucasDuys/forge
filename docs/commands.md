@@ -11,6 +11,7 @@
 | `/forge status` | Unified dashboard: phase, budget, locks, checkpoints | `--json` |
 | `/forge review-branch` | Review unmerged branch | `--base main`, `--fix`, `--comment` |
 | `/forge setup-tools` | Detect and install CLI tools | |
+| `/forge update` | Pull the latest Forge from upstream | `--check`, `--force`, `--plugin-root PATH` |
 
 ## Autonomy Levels
 

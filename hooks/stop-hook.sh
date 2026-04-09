@@ -237,6 +237,77 @@ if [ -z "$NEXT_PROMPT" ]; then
   exit 0
 fi
 
+# === Auto-backprop injection ===
+# If hooks/auto-backprop.js wrote a flag file (test failure detected during
+# executor runs), inject a backprop directive at the TOP of NEXT_PROMPT so
+# the executor handles the failure-to-spec-gap trace before continuing the
+# current task. The flag is cleared atomically here so the next iteration
+# doesn't re-fire on the same failure. State.md flag is also cleared so the
+# TUI dashboard's BACKPROP banner clears on the next render tick.
+AUTOBP_FLAG="${FORGE_DIR}/.auto-backprop-pending.json"
+if [ -f "$AUTOBP_FLAG" ]; then
+  # Read failure context, prepend directive, then delete the flag.
+  AUTOBP_PREFIX=$(node -e "
+    try {
+      const fs = require('fs');
+      const flag = JSON.parse(fs.readFileSync('${AUTOBP_FLAG}', 'utf8'));
+      const cmd = (flag.command || '').replace(/[\r\n]+/g, ' ').slice(0, 200);
+      const excerpt = (flag.failure_excerpt || '').slice(0, 2000);
+      const lines = [
+        '═══ AUTO-BACKPROP TRIGGERED ═══',
+        '',
+        'A test failure was detected by the auto-backprop hook at ' + (flag.triggered_at || 'unknown time') + '.',
+        'Before continuing with the task below, run the /forge backprop workflow on this failure:',
+        '',
+        'Failing command:',
+        '  ' + cmd,
+        '',
+        'Failure excerpt:',
+        excerpt.split('\n').map(function (l) { return '  ' + l; }).join('\n'),
+        '',
+        'Backprop instructions:',
+        '  1. TRACE the failure to a spec requirement in .forge/specs/',
+        '  2. CLASSIFY the gap (missing_criterion / incomplete_criterion / missing_requirement)',
+        '  3. PROPOSE a spec update (and apply it after the user confirms)',
+        '  4. GENERATE a regression test that would have caught this failure',
+        '  5. LOG the entry in .forge/history/backprop-log.md',
+        '',
+        'If after step 1 you determine the failure is environmental (network, missing tool,',
+        'flaky external service) and not a spec gap, log that determination and skip backprop.',
+        '',
+        'After backprop completes (or is skipped), resume the original task:',
+        '',
+        '═══ ORIGINAL PROMPT ═══',
+        '',
+      ];
+      console.log(lines.join('\n'));
+    } catch (e) {
+      console.log('');
+    }
+  " 2>>"$DEBUG_LOG" || echo "")
+
+  if [ -n "$AUTOBP_PREFIX" ]; then
+    NEXT_PROMPT="${AUTOBP_PREFIX}
+${NEXT_PROMPT}"
+    echo "[$(date -Iseconds)] auto-backprop directive injected" >> "$DEBUG_LOG"
+  fi
+
+  # Clear the flag file (idempotent — never re-fire on the same failure).
+  rm -f "$AUTOBP_FLAG" 2>/dev/null || true
+
+  # Clear the state.md flag so the TUI dashboard banner goes away.
+  if [ -f "$STATE_FILE" ]; then
+    node -e "
+      try {
+        const fs = require('fs');
+        let c = fs.readFileSync('${STATE_FILE}', 'utf8');
+        c = c.replace(/^\s*auto_backprop_pending\s*:.*$/m, 'auto_backprop_pending: false');
+        fs.writeFileSync('${STATE_FILE}', c);
+      } catch (e) {}
+    " 2>>"$DEBUG_LOG" || true
+  fi
+fi
+
 # Update iteration counter
 NEXT_ITERATION=$((ITERATION + 1))
 echo "$LOOP_DATA" | node -e "
