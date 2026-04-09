@@ -51,21 +51,24 @@ const SCENES=[
   {id:'spec',d:4500},
   {id:'research',d:4500},
   {id:'dag',d:4500},
+  {id:'watch',d:4500},
   {id:'tokens',d:4000},
   {id:'routing',d:4000},
   {id:'breakers',d:4500},
   {id:'backprop',d:4000},
+  {id:'autobp',d:4000},
   {id:'verify',d:4000},
   {id:'codex',d:4000},
+  {id:'selfupdate',d:3500},
   {id:'cta',d:3500},
 ];
 const TL=SCENES.reduce((a,s,i)=>{a.push({...s,start:i?a[i-1].start+a[i-1].d:0});return a;},[]);
 const TOTAL=TL[TL.length-1].start+TL[TL.length-1].d;
 
 const LABELS={hero:'',problem:'why forge exists',loop:'core architecture',selfprompt:'the engine',
-  spec:'brainstorm',research:'before execution',dag:'planning',tokens:'efficiency',
-  routing:'cost optimization',breakers:'safety',backprop:'feedback loop',
-  verify:'goal-backward',codex:'cross-model',cta:''};
+  spec:'brainstorm',research:'before execution',dag:'planning',watch:'live visibility',
+  tokens:'efficiency',routing:'cost optimization',breakers:'safety',backprop:'feedback loop',
+  autobp:'automatic backprop',verify:'goal-backward',codex:'cross-model',selfupdate:'self-updating',cta:''};
 
 /* ── Shared Components ── */
 function Fade({show,children,y=20}){
@@ -383,7 +386,7 @@ function SceneBackprop({p}){
   return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
     <Label p={R(p,.02,.1)}>Feedback Loop</Label>
     <Title p={R(p,.04,.15)}>Backpropagation</Title>
-    <Desc p={R(p,.06,.18)}>Traces runtime bugs back to spec gaps. Generates regression tests. Learns from patterns.</Desc>
+    <Desc p={R(p,.06,.18)}>Traces runtime bugs back to spec gaps. Generates regression tests. Learns from patterns. Available manually via /forge backprop or automatically when test failures hit during execution (next scene).</Desc>
     <div style={{display:'flex',flexDirection:'column',gap:5,maxWidth:460,width:'100%'}}>
       {steps.map((s,i)=><div key={i} style={{opacity:i<vis?1:0,transform:`translateX(${i<vis?0:12}px)`,
         transition:'opacity 0.25s,transform 0.25s',display:'flex',alignItems:'center',gap:10,
@@ -439,6 +442,102 @@ function SceneCodex({p}){
         </CardEl>
       </Fade>
     </div>
+  </div>;
+}
+
+/* ── Scene: TUI Watch (live dashboard) ── */
+function SceneWatch({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  // Animate the dashboard "filling in" as the scene progresses
+  const taskProg=Math.floor(R(p,.15,.7)*15);
+  const tokIn=Math.floor(R(p,.2,.7)*142);
+  const ctxPct=Math.floor(R(p,.25,.75)*71);
+  const showPanel=R(p,.35,.6);
+  const rows=[
+    {id:'T002',ag:'forge-executor',step:'tests_written → tests_passing',tok:'8.4k/15k tok (56%)',col:C.sage},
+    {id:'T003',ag:'forge-reviewer',step:'review_pending',tok:'12.1k/15k tok (80%)',col:C.amber},
+    {id:'T004',ag:'forge-executor',step:'implementation_started',tok:'2.3k/15k tok (15%)',col:C.sage},
+  ];
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
+    <Label p={R(p,.02,.1)}>Live Visibility</Label>
+    <Title p={R(p,.04,.15)}>/forge watch</Title>
+    <Desc p={R(p,.06,.18)}>Interactive TUI dashboard. 5-region ANSI render at 10Hz. Reads state files only -- never writes. Zero npm install.</Desc>
+    <Fade show={R(p,.1,.25)}>
+      <div className="code-box" style={{maxWidth:560,fontSize:11,lineHeight:1.5}}>
+        <div style={{color:C.text,fontWeight:700,marginBottom:4}}>Forge — interactive runner                                <span style={{color:C.teal}}>phase: executing</span></div>
+        <div>  Task:   <span style={{color:C.gold,fontWeight:700}}>T010</span>  <span style={{color:C.amber}}>[in_progress]</span>  <span style={{color:C.dim}}>@ tests_written → tests_passing</span></div>
+        <div>  Agent:  <span style={{color:C.coral}}>forge-executor</span>   Tool: <span style={{color:C.teal}}>Edit</span></div>
+        <div>  Tasks:  [<span style={{color:C.sage}}>{'█'.repeat(taskProg)}</span><span style={{color:C.dim}}>{'░'.repeat(15-taskProg)}</span>] {taskProg}/15</div>
+        <div>  Tokens: <span style={{color:C.gold}}>{tokIn}k</span> in / 38k out / 89k cached   <span style={{color:C.dim}}>budget {tokIn}k/500k</span></div>
+        <div>  Meters: Restarts 2/10   Context <span style={{color:ctxPct>=70?C.amber:C.sage}}>{ctxPct}%</span>   Tools 17</div>
+        <div style={{color:C.dim,marginTop:4}}>{'─'.repeat(64)}</div>
+        {showPanel>0&&<div style={{opacity:E(showPanel)}}>
+          <div style={{color:C.dim}}>── Parallel ──────────────────────────────────</div>
+          {rows.map((r,i)=><div key={i}>  <span style={{color:C.teal}}>{r.id}</span>  <span style={{color:C.coral}}>{r.ag.padEnd(16)}</span><span style={{color:C.dim}}>@ {r.step.padEnd(28)}</span>  <span style={{color:r.col}}>{r.tok}</span></div>)}
+        </div>}
+      </div>
+    </Fade>
+  </div>;
+}
+
+/* ── Scene: Auto-backprop ── */
+function SceneAutoBP({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const stages=[
+    {n:'1. Test fails',d:'PostToolUse hook auto-backprop.js sees FAIL pattern in vitest/jest/pytest output',c:C.coral,p:R(p,.1,.25)},
+    {n:'2. Capture',d:'Failure context (failure lines + 4 above + 8 below + summary tail, 4KB cap) written to .forge/.auto-backprop-pending.json',c:C.amber,p:R(p,.25,.4)},
+    {n:'3. Banner',d:'state.md auto_backprop_pending: true → TUI dashboard BACKPROP banner lights up immediately',c:C.gold,p:R(p,.4,.55)},
+    {n:'4. Inject',d:'Stop hook prepends AUTO-BACKPROP TRIGGERED directive to the next routed prompt with the captured context',c:C.teal,p:R(p,.55,.7)},
+    {n:'5. Workflow',d:'TRACE → ANALYZE → PROPOSE spec update → GENERATE regression test → LOG → resume the original task',c:C.sage,p:R(p,.7,.85)},
+  ];
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:12}}>
+    <Label p={R(p,.02,.1)}>Automatic Backprop</Label>
+    <Title p={R(p,.04,.15)}>Test fails → spec gap → fix → resume</Title>
+    <Desc p={R(p,.06,.18)}>Backprop used to be manual. Now a PostToolUse hook detects test failures and queues the workflow automatically. Opt out with <code className="mono" style={{color:C.gold}}>auto_backprop: false</code>.</Desc>
+    <div style={{display:'flex',flexDirection:'column',gap:6,maxWidth:540,width:'100%'}}>
+      {stages.map((s,i)=><Fade key={i} show={s.p}>
+        <div style={{display:'flex',alignItems:'flex-start',gap:10,padding:'8px 14px',borderRadius:7,background:C.s1,border:`1px solid ${C.border}`,borderLeftColor:s.c,borderLeftWidth:3}}>
+          <span className="mono" style={{color:s.c,fontWeight:700,fontSize:11,minWidth:80}}>{s.n}</span>
+          <span style={{fontSize:11,color:C.muted,lineHeight:1.5}}>{s.d}</span>
+        </div>
+      </Fade>)}
+    </div>
+  </div>;
+}
+
+/* ── Scene: Self-update ── */
+function SceneSelfUpdate({p}){
+  const fi=E(R(p,0,.15)),fo=1-E(R(p,.85,1)),o=Math.min(fi,fo);
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
+    <Label p={R(p,.02,.12)}>Self-Updating</Label>
+    <Title p={R(p,.05,.18)}>/forge update</Title>
+    <Desc p={R(p,.08,.22)}>Pulls the latest forge from upstream without leaving Claude Code. Detects how it was installed and runs the right path.</Desc>
+    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,maxWidth:540,width:'100%'}}>
+      <Fade show={R(p,.18,.4)}>
+        <CardEl style={{borderLeftColor:C.teal,borderLeftWidth:3}}>
+          <div style={{fontWeight:700,fontSize:13,color:C.text,marginBottom:6}}>Git checkout</div>
+          <div style={{fontSize:11,color:C.muted,lineHeight:1.5}}>git fetch + ff-only merge. Refuses dirty trees unless <span className="mono" style={{color:C.gold}}>--force</span> (which stashes + pops). Cross-platform git.exe resolution.</div>
+        </CardEl>
+      </Fade>
+      <Fade show={R(p,.32,.55)}>
+        <CardEl style={{borderLeftColor:C.amber,borderLeftWidth:3}}>
+          <div style={{fontWeight:700,fontSize:13,color:C.text,marginBottom:6}}>Marketplace cache</div>
+          <div style={{fontSize:11,color:C.muted,lineHeight:1.5}}>Prints <span className="mono" style={{color:C.gold}}>claude plugin marketplace update</span> instructions. Cache is managed by Claude Code, so this script intentionally does not touch it.</div>
+        </CardEl>
+      </Fade>
+    </div>
+    <Fade show={R(p,.5,.7)}>
+      <div className="code-box" style={{maxWidth:540,fontSize:11}}>
+        <div style={{color:C.amber}}>$ /forge update --check</div>
+        <div style={{color:C.muted}}>Currently installed: forge 0.1.0</div>
+        <div style={{color:C.muted}}>Detected git checkout on branch 'main'</div>
+        <div style={{color:C.muted}}>Incoming commits:</div>
+        <div style={{color:C.dim,marginLeft:14}}>4234ed0 feat(tui): R013 multi-task panel + R014 per-task token cost</div>
+        <div style={{color:C.dim,marginLeft:14}}>e415511 feat(backprop): auto-backprop on test failures</div>
+        <div style={{color:C.dim,marginLeft:14}}>0ce2495 feat(update): /forge update command</div>
+        <div style={{color:C.teal}}>3 updates available. Re-run without --check to apply.</div>
+      </div>
+    </Fade>
   </div>;
 }
 
@@ -533,6 +632,7 @@ function VideoPlayer(){
   const tp=elapsed/TOTAL;
 
   const scenes={hero:SceneHero,problem:SceneProblem,loop:SceneLoop,selfprompt:SceneSelfPrompt,
+    watch:SceneWatch,autobp:SceneAutoBP,selfupdate:SceneSelfUpdate,
     spec:SceneSpec,research:SceneResearch,dag:SceneDAG,tokens:SceneTokens,
     routing:SceneRouting,breakers:SceneBreakers,backprop:SceneBackprop,
     verify:SceneVerify,codex:SceneCodex,cta:SceneCTA};
