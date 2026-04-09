@@ -26,15 +26,20 @@ function tmpForgeDir() {
     '',
     'body',
   ].join('\n'));
-  // Minimal frontier
+  // Minimal frontier — 12 entries in body match total_tasks frontmatter so
+  // both the headless query (counts actual entries) and the file-polling
+  // fallback (reads frontmatter) agree on the total.
+  const taskLines = [];
+  for (let i = 1; i <= 12; i++) {
+    taskLines.push(`- [T${String(i).padStart(3, '0')}] task ${i}`);
+  }
   fs.writeFileSync(path.join(dir, 'plans', 'spec-test-frontier.md'), [
     '---',
     'spec: test',
     'total_tasks: 12',
     '---',
     '',
-    '- [T001] foo',
-    '- [T002] bar',
+    ...taskLines,
   ].join('\n'));
   // Loop active marker
   fs.writeFileSync(path.join(dir, '.forge-loop.json'), '{"active":true}');

@@ -387,6 +387,29 @@ class StreamParser {
 // .tui-state.json so restart-boundary data survives.
 
 const POLL_INTERVAL_MS = 500;
+const STALE_LOCK_MS = 300000; // 5 minutes — matches forge-tools.cjs detectStaleLock
+
+// Lazy-load forge-tools.cjs once. If it's missing, throws, or has incompatible
+// API, we silently fall back to direct file polling. Both modes work; the
+// forge-tools path gives us the canonical headless query schema (17 fields,
+// versioned 1.0) and frees us from re-implementing every parse.
+let _forgeToolsCache = undefined; // undefined = not yet attempted, null = unavailable
+function loadForgeTools() {
+  if (_forgeToolsCache !== undefined) return _forgeToolsCache;
+  try {
+    const tools = require('./forge-tools.cjs');
+    // Sanity check: only consider it loaded if the headless query function
+    // is exported. Older versions of forge-tools.cjs won't have it.
+    if (typeof tools.queryHeadlessState === 'function') {
+      _forgeToolsCache = tools;
+    } else {
+      _forgeToolsCache = null;
+    }
+  } catch (e) {
+    _forgeToolsCache = null;
+  }
+  return _forgeToolsCache;
+}
 
 class StatePoller {
   constructor({ forgeDir }) {
@@ -395,10 +418,13 @@ class StatePoller {
     this.frontier = { total: 0, taskIds: [] };
     this.snapshot = this._empty();
     this.timer = null;
+    this.tools = loadForgeTools(); // null if unavailable
+    this.contextLimit = 200000; // overridden in _readAll from config if present
   }
 
   _empty() {
     return {
+      // Core (always populated)
       phase: 'unknown',
       currentTask: null,
       taskStatus: 'unknown',
@@ -409,6 +435,15 @@ class StatePoller {
       frontier: this.frontier,
       completedCount: this.persisted.completed_task_ids.length,
       restartCount: this.persisted.restart_count,
+      // v2.1 enrichments (null if forge-tools.cjs unavailable or fields missing)
+      runningTasks: [],          // task IDs currently in `running` state
+      currentStep: null,         // checkpoint current_step for currentTask
+      nextStep: null,            // checkpoint next_step for currentTask
+      lockStatus: 'free',        // 'free' | 'alive' | 'stale'
+      lockHolder: null,          // { pid, lastBeatSec } when held
+      sessionBudget: null,       // { used, remaining, total } from headless query
+      lastError: null,           // free-form error message from headless query
+      autoBackpropPending: false,// auto-backprop hook flag
     };
   }
 
@@ -445,23 +480,65 @@ class StatePoller {
 
   _readAll() {
     const s = this._empty();
+    const nonNull = (v) => (v && v !== 'null' ? v : null);
 
     // .forge/.forge-loop.json — existence indicates loop active.
     s.loopActive = fs.existsSync(path.join(this.forgeDir, '.forge-loop.json'));
 
-    // .forge/state.md — YAML frontmatter block at top.
-    // Forge templates use literal "null" strings for unset fields (v2.1
-    // template/state.md has phase: idle, current_task: null, ...).
-    // Treat "null" the same as missing so dashboard fallbacks work.
-    const nonNull = (v) => (v && v !== 'null' ? v : null);
+    // ─── PRIMARY SOURCE: headless query (v2.1) ─────────────────────────────
+    // queryHeadlessState() returns a 17-field stable JSON snapshot in <100ms.
+    // Versioned (HEADLESS_STATUS_SCHEMA_VERSION) so future field additions
+    // are forward-compatible. We prefer this when available because it's the
+    // canonical source — same data the headless CI/cron path consumes.
+    let headlessOk = false;
+    if (this.tools) {
+      try {
+        const q = this.tools.queryHeadlessState(this.forgeDir);
+        if (q && typeof q === 'object') {
+          if (q.phase) s.phase = q.phase;
+          if (q.current_task) s.currentTask = q.current_task;
+          if (typeof q.completed_tasks === 'number') s.completedCount = q.completed_tasks;
+          if (typeof q.remaining_tasks === 'number') {
+            this.frontier.total = q.completed_tasks + q.remaining_tasks;
+          }
+          if (typeof q.tool_count === 'number') s.toolCount = q.tool_count;
+          if (typeof q.token_budget_used === 'number' && typeof q.token_budget_remaining === 'number') {
+            s.sessionBudget = {
+              used: q.token_budget_used,
+              remaining: q.token_budget_remaining,
+              total: q.token_budget_used + q.token_budget_remaining,
+            };
+            // Use the session budget total as the context-meter denominator
+            // (better than the hardcoded 200k for projects with custom budgets).
+            if (s.sessionBudget.total > 0) this.contextLimit = s.sessionBudget.total;
+          }
+          if (q.lock_status) s.lockStatus = q.lock_status;
+          if (q.last_error) s.lastError = q.last_error;
+          headlessOk = true;
+        }
+      } catch (e) {
+        // forge-tools threw — fall through to file-based read.
+      }
+    }
+
+    // ─── FALLBACK / AUGMENT: direct file polling ───────────────────────────
+    // Always run the file-based reads. If the headless query already filled
+    // a field, we don't overwrite. If it didn't, we populate from disk.
+
+    // .forge/state.md — frontmatter (task_status, blocked_reason not in
+    // headless schema; also serves as the full fallback path).
     try {
       const raw = fs.readFileSync(path.join(this.forgeDir, 'state.md'), 'utf8');
       const fm = parseFrontmatter(raw);
-      if (fm.phase) s.phase = fm.phase;
-      const t = nonNull(fm.current_task); if (t) s.currentTask = t;
+      if (!headlessOk && fm.phase) s.phase = fm.phase;
+      const t = nonNull(fm.current_task);
+      if (!headlessOk && t) s.currentTask = t;
       const st = nonNull(fm.task_status); if (st) s.taskStatus = st;
       s.blockedReason = nonNull(fm.blocked_reason);
-    } catch (e) { /* file may not exist yet */ }
+      // Auto-backprop flag (set by hooks/auto-backprop.js when test failures
+      // are detected; cleared when backprop runs).
+      if (fm.auto_backprop_pending === 'true') s.autoBackpropPending = true;
+    } catch (e) { /* state.md may not exist yet */ }
 
     // .forge/token-ledger.json — cumulative numeric usage.
     try {
@@ -476,33 +553,83 @@ class StatePoller {
       }
     } catch (e) { /* optional */ }
 
-    // .forge/.tool-count — integer counter incremented by token-monitor.sh.
-    try {
-      const raw = fs.readFileSync(path.join(this.forgeDir, '.tool-count'), 'utf8');
-      s.toolCount = parseInt(raw.trim(), 10) || 0;
-    } catch (e) { /* optional */ }
+    // .forge/.tool-count — fallback if headless didn't supply it.
+    if (!headlessOk) {
+      try {
+        const raw = fs.readFileSync(path.join(this.forgeDir, '.tool-count'), 'utf8');
+        s.toolCount = parseInt(raw.trim(), 10) || 0;
+      } catch (e) { /* optional */ }
+    }
 
-    // Newest .forge/plans/*-frontier.md — parse total_tasks from frontmatter.
-    try {
-      const plansDir = path.join(this.forgeDir, 'plans');
-      const files = fs.readdirSync(plansDir)
-        .filter((f) => f.endsWith('-frontier.md'))
-        .map((f) => ({ f, mtime: fs.statSync(path.join(plansDir, f)).mtimeMs }))
-        .sort((a, b) => b.mtime - a.mtime);
-      if (files.length > 0) {
-        const raw = fs.readFileSync(path.join(plansDir, files[0].f), 'utf8');
-        const fm = parseFrontmatter(raw);
-        if (fm.total_tasks) {
-          this.frontier.total = parseInt(fm.total_tasks, 10) || 0;
+    // Newest .forge/plans/*-frontier.md — fallback for frontier total.
+    if (this.frontier.total === 0) {
+      try {
+        const plansDir = path.join(this.forgeDir, 'plans');
+        const files = fs.readdirSync(plansDir)
+          .filter((f) => f.endsWith('-frontier.md'))
+          .map((f) => ({ f, mtime: fs.statSync(path.join(plansDir, f)).mtimeMs }))
+          .sort((a, b) => b.mtime - a.mtime);
+        if (files.length > 0) {
+          const raw = fs.readFileSync(path.join(plansDir, files[0].f), 'utf8');
+          const fm = parseFrontmatter(raw);
+          if (fm.total_tasks) this.frontier.total = parseInt(fm.total_tasks, 10) || 0;
+          const ids = (raw.match(/\[T\d{3}\]/g) || []).map((m) => m.slice(1, -1));
+          this.frontier.taskIds = Array.from(new Set(ids));
         }
-        // Extract task ids for a rough completed-count heuristic.
-        const ids = (raw.match(/\[T\d{3}\]/g) || []).map((m) => m.slice(1, -1));
-        this.frontier.taskIds = Array.from(new Set(ids));
+      } catch (e) { /* optional */ }
+    }
+
+    // ─── v2.1 ENRICHMENTS (parallel tasks, checkpoints, lock) ──────────────
+
+    // Parallel running tasks from .forge/task-status.json. v2.1 streaming-DAG
+    // dispatch can have multiple `running` tasks at once (one per worktree).
+    try {
+      const reg = JSON.parse(fs.readFileSync(path.join(this.forgeDir, 'task-status.json'), 'utf8'));
+      if (reg && reg.tasks && typeof reg.tasks === 'object') {
+        s.runningTasks = Object.keys(reg.tasks)
+          .filter((id) => reg.tasks[id] && reg.tasks[id].status === 'running')
+          .sort();
       }
-    } catch (e) { /* optional */ }
+    } catch (e) { /* file may not exist */ }
+
+    // Per-task checkpoint step for the current task. Gives the dashboard a
+    // sub-task progress indicator (e.g. "tests_written → tests_passing").
+    if (s.currentTask) {
+      try {
+        const cp = JSON.parse(fs.readFileSync(
+          path.join(this.forgeDir, 'progress', `${s.currentTask}.json`),
+          'utf8'
+        ));
+        if (cp.current_step) s.currentStep = cp.current_step;
+        if (cp.next_step) s.nextStep = cp.next_step;
+      } catch (e) { /* checkpoint may not exist for this task */ }
+    }
+
+    // Lock file with stale detection. .forge/.forge-loop.lock has pid,
+    // started_at, current_task, last_heartbeat. Stale if heartbeat > 5min.
+    try {
+      const lock = JSON.parse(fs.readFileSync(
+        path.join(this.forgeDir, '.forge-loop.lock'),
+        'utf8'
+      ));
+      if (lock && lock.pid) {
+        const beatStr = lock.last_heartbeat || lock.heartbeat || '';
+        const beatMs = Date.parse(beatStr);
+        const ageMs = Number.isFinite(beatMs) ? Date.now() - beatMs : Infinity;
+        const stale = ageMs > STALE_LOCK_MS;
+        s.lockStatus = stale ? 'stale' : 'alive';
+        s.lockHolder = {
+          pid: lock.pid,
+          lastBeatSec: Number.isFinite(ageMs) ? Math.floor(ageMs / 1000) : null,
+          startedAt: lock.started_at || null,
+        };
+      }
+    } catch (e) { /* lock file may not exist — already 'free' from _empty() */ }
 
     s.frontier = this.frontier;
-    s.completedCount = this.persisted.completed_task_ids.length;
+    if (s.completedCount === 0) {
+      s.completedCount = this.persisted.completed_task_ids.length;
+    }
     s.restartCount = this.persisted.restart_count;
 
     // Preserve ledger high-water mark from parser reconciliation across ticks.
@@ -623,9 +750,17 @@ class Renderer {
     lines.push(this._statusLine(snap, cols));
     lines.push(this._agentLine(snap, cols));
     lines.push(this._progressLine(snap, cols));
+    // v2.1: only show parallel-tasks line when more than one task is in flight,
+    // otherwise it's just visual noise (the current-task line already covers it).
+    if (snap.runningTasks && snap.runningTasks.length > 1) {
+      lines.push(this._parallelLine(snap, cols));
+    }
     lines.push(this._tokenLine(snap, cols));
     lines.push(this._meterLine(snap, cols));
     lines.push(this._sep(cols));
+    // Auto-backprop pending banner takes precedence over countdown but coexists
+    // with blocked alert (you can be blocked AND have backprop pending).
+    if (snap.autoBackpropPending) lines.push(this._autoBackpropLine(snap, cols));
     if (this.alert) lines.push(this._alertLine(this.alert, cols));
     if (this.countdown) lines.push(this._countdownLine(this.countdown, cols));
     lines.push(this._sep(cols, 'Transcript'));
@@ -654,7 +789,25 @@ class Renderer {
     const statusColor = status === 'blocked' ? 'red'
                       : status === 'complete' ? 'green'
                       : 'yellow';
-    return `  Task:   ${ANSI.bold}${task}${ANSI.reset}  ${this._color(statusColor, `[${status}]`)}`;
+    // v2.1: append checkpoint step if available — gives sub-task progress
+    // (e.g. "T010 [in_progress] @ tests_written → tests_passing").
+    let stepInfo = '';
+    if (snap.currentStep) {
+      stepInfo = snap.nextStep
+        ? `  ${this._color('gray', `@ ${snap.currentStep}`)} ${this._color('gray', '→')} ${this._color('cyan', snap.nextStep)}`
+        : `  ${this._color('gray', `@ ${snap.currentStep}`)}`;
+    }
+    return `  Task:   ${ANSI.bold}${task}${ANSI.reset}  ${this._color(statusColor, `[${status}]`)}${stepInfo}`;
+  }
+
+  // v2.1: parallel running tasks (streaming-DAG dispatch — multiple worktrees).
+  _parallelLine(snap, cols) {
+    const list = snap.runningTasks.join(', ');
+    return `  Running:${this._color('gray', '')} ${this._color('yellow', list)} ${this._color('gray', `(${snap.runningTasks.length} parallel)`)}`;
+  }
+
+  _autoBackpropLine(snap, cols) {
+    return `  ${ANSI.bgRed}${ANSI.bold} BACKPROP ${ANSI.reset} ${this._color('yellow', 'auto-backprop pending — runtime failure detected, will trigger on next iteration')}`;
   }
 
   _agentLine(snap, cols) {
@@ -677,13 +830,33 @@ class Renderer {
 
   _tokenLine(snap, cols) {
     const t = snap.ledger;
-    return `  Tokens: ${this._fmtTokens(t.input)} in / ${this._fmtTokens(t.output)} out / ${this._fmtTokens(t.cache_read)} cached`;
+    let line = `  Tokens: ${this._fmtTokens(t.input)} in / ${this._fmtTokens(t.output)} out / ${this._fmtTokens(t.cache_read)} cached`;
+    // v2.1: append session budget when available (real numbers from headless query
+    // beat the hardcoded estimate). Format: "  budget 47k/500k (9%)"
+    if (snap.sessionBudget && snap.sessionBudget.total > 0) {
+      const used = snap.sessionBudget.used;
+      const total = snap.sessionBudget.total;
+      const pct = Math.floor((used / total) * 100);
+      const color = pct >= 90 ? 'red' : pct >= 70 ? 'yellow' : 'green';
+      line += `   ${this._color('gray', 'budget')} ${this._color(color, `${this._fmtTokens(used)}/${this._fmtTokens(total)} (${pct}%)`)}`;
+    }
+    return line;
   }
 
   _meterLine(snap, cols) {
     const ctxPct = Math.min(100, Math.floor((snap.ledger.input / this.args.contextLimit) * 100));
     const ctxColor = ctxPct >= 80 ? 'red' : ctxPct >= 60 ? 'yellow' : 'green';
-    return `  Meters: Restarts ${snap.restartCount}/${this.args.maxRestarts}   Context ${this._color(ctxColor, ctxPct + '%')}   Tools used ${snap.toolCount}`;
+    let line = `  Meters: Restarts ${snap.restartCount}/${this.args.maxRestarts}   Context ${this._color(ctxColor, ctxPct + '%')}   Tools used ${snap.toolCount}`;
+    // v2.1: lock status indicator. 'free' is silent (no clutter), 'alive' is
+    // gray, 'stale' is red so it stands out.
+    if (snap.lockStatus && snap.lockStatus !== 'free') {
+      const lockColor = snap.lockStatus === 'stale' ? 'red' : 'gray';
+      const lockTxt = snap.lockHolder
+        ? `lock ${snap.lockStatus} pid ${snap.lockHolder.pid} (beat ${snap.lockHolder.lastBeatSec}s ago)`
+        : `lock ${snap.lockStatus}`;
+      line += `   ${this._color(lockColor, lockTxt)}`;
+    }
+    return line;
   }
 
   _alertLine(alert, cols) {

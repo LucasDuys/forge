@@ -20,6 +20,7 @@ const SUBDIR_TESTS = [
   'backoff-test.cjs',
   'fallback-test.cjs',
   'render-test.cjs',
+  'v21-integration-test.cjs',
 ];
 
 for (const file of SUBDIR_TESTS) {
