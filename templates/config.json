@@ -33,6 +33,9 @@
     "re_run_after_spec_update": false
   },
   "auto_backprop": true,
+  "execute": {
+    "status_header": true
+  },
   "capability_hints": {},
   "parallelism": {
     "max_concurrent_agents": 3,

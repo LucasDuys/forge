@@ -333,7 +333,8 @@ Forge could already do brainstorming, planning, autonomous execution, worktree i
 
 | Capability | Before | Now |
 |---|---|---|
-| **Live dashboard** | None — only raw `claude --print` text | `/forge watch` renders an interactive 5-region ANSI dashboard at 10Hz with current phase, active agent + tool, frontier progress bar, token meters, lock status, transcript |
+| **Live status during `/forge execute`** | Plain text only — you see Claude's responses but not what's happening at the orchestration level | **Automatic status header** prepended to every iteration showing phase, task + step, agent, progress bar, tokens, per-task budget, lock — no second command, no separate window. Opt out via `execute.status_header: false` |
+| **Fullscreen TUI dashboard** | None — only raw `claude --print` text | `/forge watch` runs forge in a separate process and renders an interactive 5-region ANSI dashboard at 10Hz with multi-task panel, lock status, transcript |
 | **Multi-task visibility** | Single line of text per turn | `── Parallel ──` panel showing one row per running task with id, agent, current step, and live token cost vs per-task budget |
 | **Per-task token cost** | Only session-wide token count | Status line shows `12.4k/15k tok (83%)` with 70/90 color thresholds; token line shows `task-tot Nk` summed across all checkpoints |
 | **Per-task checkpoint step** | Hidden | Status line shows `@ tests_written → tests_passing` from `.forge/progress/{id}.json` |
@@ -522,6 +523,14 @@ $ /forge plan
         deps: T001 T002 T003 T004 T005 T006 T007
 
 $ /forge execute --autonomy full
+
+══ FORGE iteration 3/100 ════════════════════════════════ phase: executing ══
+  Task    T002  [in_progress]  @ tests_written → tests_passing
+  Tasks   [████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 1/8 (12%)
+  Tokens  47k in / 12k out / 23k cached   budget 47k/500k (9%)
+  Per-task 8k/15k tok (53%)
+  Lock    alive pid 18432, 4s ago   restarts 0/10
+────────────────────────────────────────────────────────────────────────
 
 [14:02:11Z] lock acquired (pid 18432)
 [14:02:11Z] T001 worktree created -> .forge/worktrees/T001/

@@ -317,5 +317,25 @@ echo "$LOOP_DATA" | node -e "
   console.log(JSON.stringify(d,null,2));
 " > "$LOOP_FILE" 2>/dev/null
 
-# Block exit and feed next prompt (use node for proper JSON escaping)
-node -e "console.log(JSON.stringify({decision:'block',reason:'[Forge iteration ${NEXT_ITERATION}/${MAX_ITERATIONS}]\\n\\n'+process.argv[1]}))" "$NEXT_PROMPT"
+# === Status block injection (R-status, in-session dashboard) ===
+# Calls scripts/forge-status-block.cjs which reads .forge/ and emits a
+# compact ASCII dashboard. Prepended to every NEXT_PROMPT so the user sees
+# what forge is doing automatically inside /forge:execute, without having
+# to switch to /forge:watch in a separate terminal. Opt-out via
+# .forge/config.json execute.status_header=false.
+STATUS_BLOCK_SCRIPT="${PLUGIN_ROOT}/scripts/forge-status-block.cjs"
+STATUS_BLOCK=""
+if [ -f "$STATUS_BLOCK_SCRIPT" ]; then
+  STATUS_BLOCK=$(node "$STATUS_BLOCK_SCRIPT" --forge-dir "$FORGE_DIR" --no-color 2>>"$DEBUG_LOG" || echo "")
+fi
+
+# Block exit and feed next prompt (use node for proper JSON escaping).
+# The status block (if any) is prepended; the bracketed iteration tag and
+# the routed prompt follow.
+node -e "
+  const status = process.argv[1];
+  const prompt = process.argv[2];
+  const header = status ? status + '\\n' : '';
+  const tag = '[Forge iteration ${NEXT_ITERATION}/${MAX_ITERATIONS}]';
+  console.log(JSON.stringify({decision:'block',reason: header + tag + '\\n\\n' + prompt}));
+" "$STATUS_BLOCK" "$NEXT_PROMPT"
