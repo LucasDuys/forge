@@ -53,6 +53,304 @@ Then walk away.
 
 Forge is a state machine that lives inside your Claude Code session. Brainstorm a spec, plan a tier-ordered task DAG, then run an autonomous loop that dispatches parallel executors in git worktrees, gates each task through review and verification, and squash-merges atomically. Hooks watch every tool call to keep tokens in budget, condense test output, cache repeat reads, and trigger auto-backprop when test failures hit a spec gap. State files under `.forge/` are the single source of truth — the TUI dashboard and headless query both read them without writing. Crash recovery rebuilds state from the lock file + checkpoints + git log, so a kernel panic mid-feature is just a `/forge resume` away.
 
+> **Reading the diagrams.** The five focused diagrams below each fit cleanly in GitHub's column width. GitHub renders Mermaid blocks with a "click to expand" button (top-right of the diagram) on most repos — use it for any diagram that still feels cramped. The full one-piece architecture diagram is at the bottom in a collapsible block for anyone who wants the holistic view.
+
+### 1. The big picture
+
+The end-to-end pipeline. Three commands, one autonomous loop, one merge.
+
+```mermaid
+flowchart LR
+    User([You: one line idea]) --> Bs["/forge brainstorm"]
+    Bs --> Spec[".forge/specs/spec-{domain}.md<br/>R001…R0NN + acceptance criteria"]
+    Spec --> Plan["/forge plan"]
+    Plan --> Frontier[".forge/plans/{spec}-frontier.md<br/>tier 1 ┃ tier 2 ┃ tier 3<br/>dependency DAG"]
+    Frontier --> Exec["/forge execute"]
+    Exec --> Loop{"autonomous<br/>loop"}
+    Loop -->|all done| Done([squash-merge to main<br/>FORGE_COMPLETE])
+    Loop -.->|read-only| Watch["/forge watch<br/>live TUI dashboard"]
+    Loop -.->|read-only| Headless["/forge status --json<br/>headless query &lt;5ms"]
+    Crash[crash / context reset] -.->|/forge resume| Loop
+
+    classDef cmd fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef state fill:#fff3e0,stroke:#e65100,color:#bf360c
+    classDef ui fill:#e0f7fa,stroke:#006064,color:#004d40
+    classDef done fill:#c8e6c9,stroke:#1b5e20,color:#0d2818
+
+    class Bs,Plan,Exec,Loop cmd
+    class Spec,Frontier state
+    class Watch,Headless ui
+    class Done,User done
+    class Crash state
+```
+
+### 2. The execute loop
+
+What `/forge execute` actually runs. State machine drives everything; the Stop hook re-fires it after every Claude turn.
+
+```mermaid
+flowchart TB
+    Stop["Stop hook<br/>fires after every Claude turn"]
+    SM{{"routeDecision()<br/>12 phases"}}
+    Dispatch["Streaming-DAG dispatch<br/>findAllUnblockedTasks()<br/>tiers sequential ┃ tasks parallel"]
+    Router["forge-router.cjs<br/>selectModel(role, score, budget)<br/>haiku=1 ┃ sonnet=5 ┃ opus=25"]
+    Wt1["worktree T002<br/>forge-executor (sonnet)"]
+    Wt2["worktree T003<br/>forge-executor (sonnet)"]
+    Wt3["worktree T004<br/>forge-executor (haiku)"]
+    Reviewer["forge-reviewer<br/>spec compliance + style"]
+    Verifier["forge-verifier<br/>existence > substantive ><br/>wired > runtime"]
+    Squash["squash-merge to main<br/>atomic commit"]
+    Conflict["conflict_resolution<br/>preserve worktree,<br/>fall back to sequential"]
+
+    Stop --> SM
+    SM --> Dispatch
+    Dispatch --> Router
+    Router --> Wt1
+    Router --> Wt2
+    Router --> Wt3
+    Wt1 --> Reviewer
+    Wt2 --> Reviewer
+    Wt3 --> Reviewer
+    Reviewer -->|issues| SM
+    Reviewer -->|pass| Verifier
+    Verifier -->|gap| SM
+    Verifier -->|R's met| Squash
+    Squash -->|merge fail| Conflict
+    Squash -->|ok| SM
+    Conflict -.-> SM
+    SM -->|next iteration| Stop
+
+    classDef stop fill:#fce4ec,stroke:#c2185b,color:#880e4f
+    classDef sm fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef agent fill:#c8e6c9,stroke:#1b5e20,color:#0d2818
+    classDef gate fill:#fff9c4,stroke:#f57f17,color:#5d4037
+
+    class Stop stop
+    class SM,Dispatch,Router sm
+    class Wt1,Wt2,Wt3,Reviewer,Verifier agent
+    class Squash,Conflict gate
+```
+
+### 3. Hooks pipeline (every tool call)
+
+Six hooks fire on every executor tool call. They keep the loop fast, cheap, and self-correcting.
+
+```mermaid
+flowchart LR
+    Tool["executor tool call<br/>(Bash / Read / Edit / Glob / Grep)"]
+    Tool --> Pre["PreToolUse"]
+    Pre --> Cache["tool-cache.js<br/>120s TTL on git/ls/<br/>find/Glob/Read"]
+    Cache -.->|hit| Skip([return cached, no LLM])
+    Cache -.->|miss| Run[run real tool]
+
+    Run --> Post["PostToolUse fan-out"]
+    Post --> Tok["token-monitor.sh<br/>per-task budget<br/>80%/100% gates"]
+    Post --> Filt["test-output-filter.js<br/>>2000 chars → failures + context"]
+    Post --> Prog["progress-tracker.js<br/>.progress.json<br/>zero-context"]
+    Post --> AutoBP["auto-backprop.js<br/>FAIL pattern detect<br/>→ .auto-backprop-pending.json"]
+    Post --> Store["tool-cache-store.js<br/>warm the cache"]
+
+    Tok -->|>=100%| Exhaust([budget_exhausted phase])
+    AutoBP -->|FAIL detected| Flag([flag file + state.md banner])
+
+    classDef hook fill:#fce4ec,stroke:#c2185b,color:#880e4f
+    classDef state fill:#fff3e0,stroke:#e65100,color:#bf360c
+    classDef bad fill:#ffcdd2,stroke:#b71c1c,color:#7f0000
+
+    class Pre,Post,Cache,Tok,Filt,Prog,AutoBP,Store hook
+    class Flag state
+    class Exhaust bad
+```
+
+### 4. Backprop + replanning loops
+
+Two feedback loops that change what runs next based on what just happened.
+
+```mermaid
+flowchart TB
+    subgraph Auto["Auto-backprop loop (test failure → spec fix)"]
+        direction TB
+        Fail[test failure during executor run]
+        Hook["auto-backprop.js<br/>captures failure context"]
+        Flag[".forge/.auto-backprop-pending.json<br/>+ state.md flag"]
+        Inject["stop-hook.sh prepends<br/>AUTO-BACKPROP TRIGGERED<br/>to next prompt"]
+        BP5["TRACE → ANALYZE → PROPOSE<br/>→ GENERATE regression test → LOG"]
+        SpecUpd[spec updated<br/>+ regression test added]
+        Resume[resume original task<br/>flag deleted atomically]
+
+        Fail --> Hook --> Flag --> Inject --> BP5 --> SpecUpd --> Resume
+    end
+
+    subgraph Replan["Replanning loop (concerns → re-decompose)"]
+        direction TB
+        Tier[tier completes]
+        Check{"shouldReplan()<br/>concerns / completed<br/>≥ 0.3 threshold?"}
+        Redec["forge-planner re-invoked<br/>expansion_depth ≤ 1<br/>T003 → T003.1, T003.2"]
+        FrontUpd["frontier updated<br/>with new sub-tasks"]
+        Continue[continue with<br/>updated frontier]
+
+        Tier --> Check
+        Check -->|no| Continue
+        Check -->|yes| Redec --> FrontUpd --> Continue
+    end
+
+    SpecUpd -.->|spec change can<br/>also trigger replan| Check
+
+    classDef bp fill:#ffebee,stroke:#c62828,color:#7f0000
+    classDef plan fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
+    classDef gate fill:#fff9c4,stroke:#f57f17,color:#5d4037
+
+    class Fail,Hook,Flag,Inject,BP5,SpecUpd,Resume bp
+    class Tier,Redec,FrontUpd,Continue plan
+    class Check gate
+```
+
+### 5. Recovery layer
+
+What survives when things go wrong. Three independent layers cooperate.
+
+```mermaid
+flowchart LR
+    subgraph Live["Live execution"]
+        direction TB
+        Acquire["acquireLock()<br/>or take over stale (5min)"]
+        HB[heartbeat every 30s]
+        WriteCP["writeCheckpoint()<br/>after each step"]
+        Acquire --> HB
+        HB --> WriteCP
+    end
+
+    Live --> Files[".forge/.forge-loop.lock<br/>+ .forge/progress/{T###}.json<br/>+ .git log"]
+
+    Files --> Resume{"/forge resume"}
+    Resume --> Forensic["performForensicRecovery()<br/>reconstructs phase, current_task,<br/>completed tasks, orphan worktrees<br/>even if state.md is corrupted"]
+    Forensic --> Restored[restored state.md]
+    Restored --> Loop2[resume loop at exact step<br/>no re-running passing tests]
+
+    classDef live fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef state fill:#fff3e0,stroke:#e65100,color:#bf360c
+    classDef recover fill:#fce4ec,stroke:#c2185b,color:#880e4f
+
+    class Acquire,HB,WriteCP live
+    class Files,Restored state
+    class Resume,Forensic,Loop2 recover
+```
+
+### Inside one task execution
+
+The top-level diagram is a bird's-eye view. Here is what one task actually goes through, end to end:
+
+```mermaid
+flowchart LR
+    Tier[Tier ready,<br/>task picked by router]
+    Tier --> Acquire["acquireLock()<br/>or take over stale"]
+    Acquire --> Worktree["createTaskWorktree()<br/>git worktree add"]
+    Worktree --> CP1[".forge/progress/T###.json<br/>step: spec_loaded"]
+    CP1 --> ResearchQ{"complex task?<br/>(unfamiliar/security)"}
+    ResearchQ -->|yes| ResAgent[forge-researcher dispatch]
+    ResearchQ -->|no| Plan2[plan internally]
+    ResAgent --> CP2["step: research_done"]
+    Plan2 --> CP3["step: planning_done"]
+    CP2 --> CP3
+    CP3 --> Impl["forge-executor writes code<br/>(model from forge-router)"]
+    Impl --> CP4["step: implementation_started"]
+    CP4 --> WriteTests["write tests (TDD)"]
+    WriteTests --> CP5["step: tests_written"]
+    CP5 --> RunTests["run tests via Bash"]
+    RunTests --> Hooks2{"PostToolUse hooks fire"}
+    Hooks2 --> TokGate["token-monitor: budget OK?"]
+    Hooks2 --> Filt["test-output-filter: condense"]
+    Hooks2 --> AutoBP2["auto-backprop: FAIL detected?"]
+    TokGate -->|over| Exhaust([budget_exhausted])
+    AutoBP2 -->|yes| FlagWrite[".auto-backprop-pending.json<br/>+ state.md flag"]
+    FlagWrite -.->|next iter| BackpropFlow[backprop directive injected]
+    RunTests --> Pass{"tests pass?"}
+    Pass -->|no, retry x3| Impl
+    Pass -->|fail x3 + codex| CodexRescue[Codex rescue agent]
+    CodexRescue -.-> Impl
+    Pass -->|yes| CP6["step: tests_passing"]
+    CP6 --> ReviewQ["review queued"]
+    ReviewQ --> CP7["step: review_pending"]
+    CP7 --> Reviewer2[forge-reviewer]
+    Reviewer2 --> ReviewPass{"review pass?"}
+    ReviewPass -->|issues| Impl
+    ReviewPass -->|pass| CP8["step: review_passed"]
+    CP8 --> VerifyQ[verify queued]
+    VerifyQ --> CP9["step: verification_pending"]
+    CP9 --> Verifier2["forge-verifier:<br/>existence > substantive > wired > runtime"]
+    Verifier2 --> VPass{"all R's met?"}
+    VPass -->|gap| Impl
+    VPass -->|pass| CP10["step: complete"]
+    CP10 --> SquashMerge["completeTaskInWorktree()<br/>squash-merge to main"]
+    SquashMerge --> Conflict2{"merge conflict?"}
+    Conflict2 -->|yes| ConflictPhase[conflict_resolution phase]
+    Conflict2 -->|no| Cleanup["delete worktree<br/>delete checkpoint<br/>release tier slot"]
+    Cleanup --> Done2([next task or tier])
+
+    classDef cp fill:#fff3e0,stroke:#e65100
+    classDef agent fill:#c8e6c9,stroke:#1b5e20
+    classDef gate fill:#fff9c4,stroke:#f57f17
+    classDef bp fill:#ffebee,stroke:#c62828
+    classDef bad fill:#ffcdd2,stroke:#b71c1c
+
+    class CP1,CP2,CP3,CP4,CP5,CP6,CP7,CP8,CP9,CP10 cp
+    class ResAgent,Impl,Reviewer2,Verifier2,CodexRescue agent
+    class ResearchQ,Pass,ReviewPass,VPass,Hooks2,Conflict2 gate
+    class FlagWrite,BackpropFlow bp
+    class Exhaust,ConflictPhase bad
+```
+
+### Subsystem reference
+
+| Subsystem | File | What it does |
+|---|---|---|
+| **State machine** | `scripts/forge-tools.cjs::routeDecision` | 12-phase router called by Stop hook every Claude turn. Drives the entire loop. |
+| **Streaming-DAG dispatch** | `scripts/forge-tools.cjs::findAllUnblockedTasks` | Tiers run sequentially; tasks within a tier dispatch in parallel as separate agent calls within one session. |
+| **Re-decomposition** | `scripts/forge-tools.cjs` (`shouldReplan` + `expansion_depth`) | When completed tasks have `complete_with_concerns` and the fraction crosses `concern_threshold` (0.3 default), the planner is re-invoked to add sub-tasks (T003 → T003.1, T003.2) up to `max_expansion_depth: 1`. **This is "streaming task updates that change the next tasks."** |
+| **Model routing** | `scripts/forge-router.cjs::selectModel` | Per-role baselines (haiku/sonnet/opus) + task complexity score + budget state → model selection. Cost weights: haiku=1, sonnet=5, opus=25. |
+| **Cost-weighted budget** | `scripts/forge-budget.cjs` | Tracks per-task and session token spend with per-model cost weights. Hard 100% gate, 80% warning. |
+| **Capability discovery** | `scripts/forge-tools.cjs::discoverCapabilities` | Scans `.claude.json` MCP servers, `skills/`, plugin marketplaces; writes `.forge/capabilities.json`; agent prompts read it to recommend tools. |
+| **Researcher agent** | `agents/forge-researcher.md` | Dispatched before complex/security/unfamiliar-tech tasks to produce a docs + best-practices report. Skipped for simple CRUD or test-only work. |
+| **Codex rescue** | `scripts/forge-tools.cjs` (codex section) | After 2 consecutive debug failures, dispatches Codex with the failing context for an adversarial second opinion. Auto-detected from plugin cache. |
+| **Caveman compression** | `skills/caveman-internal/SKILL.md` + `formatCavemanValue()` | Three intensity modes (lite/full/ultra) compress inter-agent handoff artifacts — state files, context bundles, review reports. **Excludes** source code, commits, specs. Saves 20-30% on internal tokens. |
+| **Tool cache** | `hooks/tool-cache.js` + `tool-cache-store.js` | PreToolUse intercept + PostToolUse store with 120s TTL on read-only ops (`git status/log/diff/branch`, `ls`, `find`, `Glob`, `Grep`, `Read`). |
+| **Token monitor** | `hooks/token-monitor.sh` | PostToolUse cheap token estimator. 80% per-task budget → warning. 100% → escalate to `budget_exhausted` phase. |
+| **Test output filter** | `hooks/test-output-filter.js` | PostToolUse Bash matcher. For test commands >2000 chars (vitest/jest/pytest/cargo/go test/npm test/mocha), keeps failure blocks + 8 lines of context + summary tail. |
+| **Progress tracker** | `hooks/progress-tracker.js` | Zero-context PostToolUse. Writes `.forge/.progress.json` with tool counts, commits, test runs, current phase/task. Stderr-only output. |
+| **Auto-backprop** | `hooks/auto-backprop.js` + `hooks/stop-hook.sh` | PostToolUse Bash matcher detects test failures, captures context, writes `.forge/.auto-backprop-pending.json` and flips state.md flag. Stop hook injects `AUTO-BACKPROP TRIGGERED` directive into the next prompt; backprop runs the 5-step workflow before resuming the task. |
+| **Lock file + heartbeat** | `scripts/forge-tools.cjs::acquireLock` / `detectStaleLock` | `.forge/.forge-loop.lock` with PID + heartbeat. 5-minute stale threshold. Stale locks are taken over automatically with a new PID. |
+| **Checkpoints** | `scripts/forge-tools.cjs::writeCheckpoint` / `readCheckpoint` | `.forge/progress/{task-id}.json` tracks the 10-step enum. Each `forge-executor` step write is atomic; resume reads the latest. |
+| **Forensic recovery** | `scripts/forge-tools.cjs::performForensicRecovery` | `/forge resume` runs this first. Reconstructs phase, current task, completed tasks, active checkpoints, and orphan worktrees from lock + checkpoints + git log even when state.md is missing or corrupted. |
+| **Conflict resolution** | `scripts/forge-tools.cjs::completeTaskInWorktree` | Squash-merge fail → preserves the worktree, sets `phase: conflict_resolution`, falls back to sequential execution for the remaining tier. |
+| **Verifier stages** | `agents/forge-verifier.md` | `existence > substantive > wired > runtime`. Checks artifacts exist, are not stubs (TODOs/empty fns/placeholders), are connected to the rest of the system, and pass acceptance criteria at runtime. |
+| **TUI dashboard** | `scripts/forge-tui.cjs` (1359 lines, zero deps) | `/forge watch` reads state files on a 500ms poll and renders 5 regions + an optional `── Parallel ──` panel at 10Hz. **Read-only** — never writes state. |
+| **Headless query** | `scripts/forge-tools.cjs::queryHeadlessState` | 17-field JSON snapshot in <100ms. Versioned 1.0. Used by TUI as primary data source AND by external monitors (Prometheus, Grafana, cron). |
+| **`/forge update`** | `scripts/forge-update.cjs` | Self-update from upstream. Detects git checkout vs marketplace cache. Refuses dirty trees unless `--force`. Cross-platform git binary resolution. |
+
+### What's new (since v2.1)
+
+Forge could already do brainstorming, planning, autonomous execution, worktree isolation, lock-based crash recovery, headless mode, and manual backprop. Everything below is **new on top of that baseline** and shipped on `main` in this PR train (commits `601f3e9..4234ed0`):
+
+| Capability | Before | Now |
+|---|---|---|
+| **Live dashboard** | None — only raw `claude --print` text | `/forge watch` renders an interactive 5-region ANSI dashboard at 10Hz with current phase, active agent + tool, frontier progress bar, token meters, lock status, transcript |
+| **Multi-task visibility** | Single line of text per turn | `── Parallel ──` panel showing one row per running task with id, agent, current step, and live token cost vs per-task budget |
+| **Per-task token cost** | Only session-wide token count | Status line shows `12.4k/15k tok (83%)` with 70/90 color thresholds; token line shows `task-tot Nk` summed across all checkpoints |
+| **Per-task checkpoint step** | Hidden | Status line shows `@ tests_written → tests_passing` from `.forge/progress/{id}.json` |
+| **Lock status indicator** | Hidden | Meter line shows `lock alive pid 18432 (beat 12s ago)` in gray, `lock STALE` in red |
+| **Auto-backprop on failures** | Manual only — `/forge backprop "description"` | PostToolUse hook detects test failures, captures context, queues a directive that the stop hook injects into the next prompt. Five-step backprop runs automatically before resuming the failing task. Opt out with `auto_backprop: false` |
+| **Self-updating** | Manual `git pull` or `claude plugin update` | `/forge update` detects install method, fast-forwards git checkouts (with dirty-tree protection), prints manual instructions for marketplace caches. Cross-platform git resolution including Windows. |
+| **README architecture diagram** | Text only | Mermaid diagrams (this section) showing the full system + an executor-zoom view, rendered natively on GitHub |
+| **Stream-json parsing** | Plain text dump | Real-time event capture with chunk-boundary-safe buffer, agent attribution stack (Task tool_use → subagent_type → tool_result), token extraction from result events |
+| **Headless query as data source** | TUI did file polling only | TUI lazy-loads `forge-tools.cjs` and uses `queryHeadlessState()` as primary data source (canonical 17-field versioned snapshot), file polling kept as fallback |
+| **Session budget meter** | Hardcoded 200k context window assumption | Real session budget from headless query feeds the context-meter denominator and a new `budget N/M (P%)` subfield |
+| **Test count** | 100 | **189** — 100 v2.1 + 47 forge-tui + 31 auto-backprop + 11 forge-update |
+
+<details>
+<summary><strong>Click to expand: full one-piece architecture diagram</strong></summary>
+
+The five focused diagrams above are easier to read individually. This is the same information as a single large diagram for anyone who wants the holistic view in one place. Use GitHub's "click to expand" button (top-right of the diagram) to enlarge it, or open the raw README in your editor where it can render at full size.
+
 ```mermaid
 flowchart TB
     User([You: one line idea])
@@ -192,115 +490,7 @@ flowchart TB
     class Watch,Headless,Caveman read
 ```
 
-### Inside one task execution
-
-The top-level diagram is a bird's-eye view. Here is what one task actually goes through, end to end:
-
-```mermaid
-flowchart LR
-    Tier[Tier ready,<br/>task picked by router]
-    Tier --> Acquire["acquireLock()<br/>or take over stale"]
-    Acquire --> Worktree["createTaskWorktree()<br/>git worktree add"]
-    Worktree --> CP1[".forge/progress/T###.json<br/>step: spec_loaded"]
-    CP1 --> ResearchQ{"complex task?<br/>(unfamiliar/security)"}
-    ResearchQ -->|yes| ResAgent[forge-researcher dispatch]
-    ResearchQ -->|no| Plan2[plan internally]
-    ResAgent --> CP2["step: research_done"]
-    Plan2 --> CP3["step: planning_done"]
-    CP2 --> CP3
-    CP3 --> Impl["forge-executor writes code<br/>(model from forge-router)"]
-    Impl --> CP4["step: implementation_started"]
-    CP4 --> WriteTests["write tests (TDD)"]
-    WriteTests --> CP5["step: tests_written"]
-    CP5 --> RunTests["run tests via Bash"]
-    RunTests --> Hooks2{"PostToolUse hooks fire"}
-    Hooks2 --> TokGate["token-monitor: budget OK?"]
-    Hooks2 --> Filt["test-output-filter: condense"]
-    Hooks2 --> AutoBP2["auto-backprop: FAIL detected?"]
-    TokGate -->|over| Exhaust([budget_exhausted])
-    AutoBP2 -->|yes| FlagWrite[".auto-backprop-pending.json<br/>+ state.md flag"]
-    FlagWrite -.->|next iter| BackpropFlow[backprop directive injected]
-    RunTests --> Pass{"tests pass?"}
-    Pass -->|no, retry x3| Impl
-    Pass -->|fail x3 + codex| CodexRescue[Codex rescue agent]
-    CodexRescue -.-> Impl
-    Pass -->|yes| CP6["step: tests_passing"]
-    CP6 --> ReviewQ["review queued"]
-    ReviewQ --> CP7["step: review_pending"]
-    CP7 --> Reviewer2[forge-reviewer]
-    Reviewer2 --> ReviewPass{"review pass?"}
-    ReviewPass -->|issues| Impl
-    ReviewPass -->|pass| CP8["step: review_passed"]
-    CP8 --> VerifyQ[verify queued]
-    VerifyQ --> CP9["step: verification_pending"]
-    CP9 --> Verifier2["forge-verifier:<br/>existence > substantive > wired > runtime"]
-    Verifier2 --> VPass{"all R's met?"}
-    VPass -->|gap| Impl
-    VPass -->|pass| CP10["step: complete"]
-    CP10 --> SquashMerge["completeTaskInWorktree()<br/>squash-merge to main"]
-    SquashMerge --> Conflict2{"merge conflict?"}
-    Conflict2 -->|yes| ConflictPhase[conflict_resolution phase]
-    Conflict2 -->|no| Cleanup["delete worktree<br/>delete checkpoint<br/>release tier slot"]
-    Cleanup --> Done2([next task or tier])
-
-    classDef cp fill:#fff3e0,stroke:#e65100
-    classDef agent fill:#c8e6c9,stroke:#1b5e20
-    classDef gate fill:#fff9c4,stroke:#f57f17
-    classDef bp fill:#ffebee,stroke:#c62828
-    classDef bad fill:#ffcdd2,stroke:#b71c1c
-
-    class CP1,CP2,CP3,CP4,CP5,CP6,CP7,CP8,CP9,CP10 cp
-    class ResAgent,Impl,Reviewer2,Verifier2,CodexRescue agent
-    class ResearchQ,Pass,ReviewPass,VPass,Hooks2,Conflict2 gate
-    class FlagWrite,BackpropFlow bp
-    class Exhaust,ConflictPhase bad
-```
-
-### Subsystem reference
-
-| Subsystem | File | What it does |
-|---|---|---|
-| **State machine** | `scripts/forge-tools.cjs::routeDecision` | 12-phase router called by Stop hook every Claude turn. Drives the entire loop. |
-| **Streaming-DAG dispatch** | `scripts/forge-tools.cjs::findAllUnblockedTasks` | Tiers run sequentially; tasks within a tier dispatch in parallel as separate agent calls within one session. |
-| **Re-decomposition** | `scripts/forge-tools.cjs` (`shouldReplan` + `expansion_depth`) | When completed tasks have `complete_with_concerns` and the fraction crosses `concern_threshold` (0.3 default), the planner is re-invoked to add sub-tasks (T003 → T003.1, T003.2) up to `max_expansion_depth: 1`. **This is "streaming task updates that change the next tasks."** |
-| **Model routing** | `scripts/forge-router.cjs::selectModel` | Per-role baselines (haiku/sonnet/opus) + task complexity score + budget state → model selection. Cost weights: haiku=1, sonnet=5, opus=25. |
-| **Cost-weighted budget** | `scripts/forge-budget.cjs` | Tracks per-task and session token spend with per-model cost weights. Hard 100% gate, 80% warning. |
-| **Capability discovery** | `scripts/forge-tools.cjs::discoverCapabilities` | Scans `.claude.json` MCP servers, `skills/`, plugin marketplaces; writes `.forge/capabilities.json`; agent prompts read it to recommend tools. |
-| **Researcher agent** | `agents/forge-researcher.md` | Dispatched before complex/security/unfamiliar-tech tasks to produce a docs + best-practices report. Skipped for simple CRUD or test-only work. |
-| **Codex rescue** | `scripts/forge-tools.cjs` (codex section) | After 2 consecutive debug failures, dispatches Codex with the failing context for an adversarial second opinion. Auto-detected from plugin cache. |
-| **Caveman compression** | `skills/caveman-internal/SKILL.md` + `formatCavemanValue()` | Three intensity modes (lite/full/ultra) compress inter-agent handoff artifacts — state files, context bundles, review reports. **Excludes** source code, commits, specs. Saves 20-30% on internal tokens. |
-| **Tool cache** | `hooks/tool-cache.js` + `tool-cache-store.js` | PreToolUse intercept + PostToolUse store with 120s TTL on read-only ops (`git status/log/diff/branch`, `ls`, `find`, `Glob`, `Grep`, `Read`). |
-| **Token monitor** | `hooks/token-monitor.sh` | PostToolUse cheap token estimator. 80% per-task budget → warning. 100% → escalate to `budget_exhausted` phase. |
-| **Test output filter** | `hooks/test-output-filter.js` | PostToolUse Bash matcher. For test commands >2000 chars (vitest/jest/pytest/cargo/go test/npm test/mocha), keeps failure blocks + 8 lines of context + summary tail. |
-| **Progress tracker** | `hooks/progress-tracker.js` | Zero-context PostToolUse. Writes `.forge/.progress.json` with tool counts, commits, test runs, current phase/task. Stderr-only output. |
-| **Auto-backprop** | `hooks/auto-backprop.js` + `hooks/stop-hook.sh` | PostToolUse Bash matcher detects test failures, captures context, writes `.forge/.auto-backprop-pending.json` and flips state.md flag. Stop hook injects `AUTO-BACKPROP TRIGGERED` directive into the next prompt; backprop runs the 5-step workflow before resuming the task. |
-| **Lock file + heartbeat** | `scripts/forge-tools.cjs::acquireLock` / `detectStaleLock` | `.forge/.forge-loop.lock` with PID + heartbeat. 5-minute stale threshold. Stale locks are taken over automatically with a new PID. |
-| **Checkpoints** | `scripts/forge-tools.cjs::writeCheckpoint` / `readCheckpoint` | `.forge/progress/{task-id}.json` tracks the 10-step enum. Each `forge-executor` step write is atomic; resume reads the latest. |
-| **Forensic recovery** | `scripts/forge-tools.cjs::performForensicRecovery` | `/forge resume` runs this first. Reconstructs phase, current task, completed tasks, active checkpoints, and orphan worktrees from lock + checkpoints + git log even when state.md is missing or corrupted. |
-| **Conflict resolution** | `scripts/forge-tools.cjs::completeTaskInWorktree` | Squash-merge fail → preserves the worktree, sets `phase: conflict_resolution`, falls back to sequential execution for the remaining tier. |
-| **Verifier stages** | `agents/forge-verifier.md` | `existence > substantive > wired > runtime`. Checks artifacts exist, are not stubs (TODOs/empty fns/placeholders), are connected to the rest of the system, and pass acceptance criteria at runtime. |
-| **TUI dashboard** | `scripts/forge-tui.cjs` (1359 lines, zero deps) | `/forge watch` reads state files on a 500ms poll and renders 5 regions + an optional `── Parallel ──` panel at 10Hz. **Read-only** — never writes state. |
-| **Headless query** | `scripts/forge-tools.cjs::queryHeadlessState` | 17-field JSON snapshot in <100ms. Versioned 1.0. Used by TUI as primary data source AND by external monitors (Prometheus, Grafana, cron). |
-| **`/forge update`** | `scripts/forge-update.cjs` | Self-update from upstream. Detects git checkout vs marketplace cache. Refuses dirty trees unless `--force`. Cross-platform git binary resolution. |
-
-### What's new (since v2.1)
-
-Forge could already do brainstorming, planning, autonomous execution, worktree isolation, lock-based crash recovery, headless mode, and manual backprop. Everything below is **new on top of that baseline** and shipped on `main` in this PR train (commits `601f3e9..4234ed0`):
-
-| Capability | Before | Now |
-|---|---|---|
-| **Live dashboard** | None — only raw `claude --print` text | `/forge watch` renders an interactive 5-region ANSI dashboard at 10Hz with current phase, active agent + tool, frontier progress bar, token meters, lock status, transcript |
-| **Multi-task visibility** | Single line of text per turn | `── Parallel ──` panel showing one row per running task with id, agent, current step, and live token cost vs per-task budget |
-| **Per-task token cost** | Only session-wide token count | Status line shows `12.4k/15k tok (83%)` with 70/90 color thresholds; token line shows `task-tot Nk` summed across all checkpoints |
-| **Per-task checkpoint step** | Hidden | Status line shows `@ tests_written → tests_passing` from `.forge/progress/{id}.json` |
-| **Lock status indicator** | Hidden | Meter line shows `lock alive pid 18432 (beat 12s ago)` in gray, `lock STALE` in red |
-| **Auto-backprop on failures** | Manual only — `/forge backprop "description"` | PostToolUse hook detects test failures, captures context, queues a directive that the stop hook injects into the next prompt. Five-step backprop runs automatically before resuming the failing task. Opt out with `auto_backprop: false` |
-| **Self-updating** | Manual `git pull` or `claude plugin update` | `/forge update` detects install method, fast-forwards git checkouts (with dirty-tree protection), prints manual instructions for marketplace caches. Cross-platform git resolution including Windows. |
-| **README architecture diagram** | Text only | Mermaid diagrams (this section) showing the full system + an executor-zoom view, rendered natively on GitHub |
-| **Stream-json parsing** | Plain text dump | Real-time event capture with chunk-boundary-safe buffer, agent attribution stack (Task tool_use → subagent_type → tool_result), token extraction from result events |
-| **Headless query as data source** | TUI did file polling only | TUI lazy-loads `forge-tools.cjs` and uses `queryHeadlessState()` as primary data source (canonical 17-field versioned snapshot), file polling kept as fallback |
-| **Session budget meter** | Hardcoded 200k context window assumption | Real session budget from headless query feeds the context-meter denominator and a new `budget N/M (P%)` subfield |
-| **Test count** | 100 | **189** — 100 v2.1 + 47 forge-tui + 31 auto-backprop + 11 forge-update |
+</details>
 
 ## What you actually see
 
