@@ -29,6 +29,7 @@ forge/
 - **Capability discovery** — Scans for user's MCP servers and skills, routes work to leverage them
 - **Multi-repo** — Natively coordinates work across multiple repos (API-first ordering)
 - **Backpropagation** — Traces runtime bugs back to specs, generates regression tests
+- **Live TUI dashboard** — Opt-in visualization layer (`/forge watch` or `FORGE_TUI=1`) parses `claude --output-format stream-json` and renders a zero-dependency ANSI dashboard via `scripts/forge-tui.cjs`. Augments the bash runner; falls back to plain mode automatically on sentinel exit code 87
 
 ## Key Conventions
 - All state lives in `.forge/` per-project (gitignored)

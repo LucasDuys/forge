@@ -47,6 +47,7 @@ After installing, restart Claude Code. Commands will be available as `/forge:bra
 | `/forge:brainstorm [topic]` | Interactive spec generation from an idea | `--from-code`, `--from-docs path/` |
 | `/forge:plan` | Decompose specs into ordered task frontiers | `--filter tag`, `--depth quick\|standard\|thorough` |
 | `/forge:execute` | Autonomous implementation loop | `--autonomy full\|gated\|supervised`, `--max-iterations N`, `--token-budget N` |
+| `/forge:watch` | Same as `/forge:execute` plus a live TUI dashboard | All execute flags + `--max-restarts N`, `--base-delay N`, `--transcript-lines N`, `--no-fallback` |
 | `/forge:resume` | Continue after context reset or interruption | — |
 | `/forge:backprop [desc]` | Trace a bug back to a spec gap | `--from-test path/` |
 | `/forge:status` | Show current progress, budget, blockers | — |
@@ -119,6 +120,8 @@ forge/
 │   └── token-monitor.sh           Token usage + context monitoring
 ├── scripts/
 │   ├── forge-tools.cjs            Core utility (state, config, token math, capability discovery)
+│   ├── forge-tui.cjs              Zero-dep interactive dashboard for /forge:watch (R007/R008/R010)
+│   ├── forge-runner.sh            External restart loop (FORGE_TUI=1 delegates to forge-tui.cjs)
 │   └── setup.sh                   Initialize .forge/ in a project
 ├── templates/                     Output file templates (spec, plan, state, summary)
 └── references/                    Reference docs (token profiles, patterns, heuristics)
@@ -154,6 +157,42 @@ bash scripts/forge-runner.sh
 ```
 
 This script auto-restarts Claude after context resets, reads the handoff snapshot from `.forge/.forge-resume.md`, and continues from the exact point of interruption. It exits when the work is complete or when human intervention is needed.
+
+## Live Dashboard (`/forge:watch`)
+
+For eyes-on visibility into a running forge session, use `/forge:watch` instead of `/forge:execute`. It launches the same autonomous loop but spawns Claude with `--output-format stream-json --verbose` and renders an interactive dashboard:
+
+```
+Forge — interactive runner                                       phase: executing
+  Task:   T010  [in_progress]
+  Agent:  forge-executor   Tool: Edit
+  Tasks:  [████████████████████████░░░░░░░░░░░░░░░░] 9/15 (60%)
+  Tokens: 142k in / 38k out / 89k cached
+  Meters: Restarts 2/10   Context 71%   Tools used 17
+────────────────────────────────────────────────────────────────────────────────
+── Transcript ──────────────────────────────────────────────────────────────────
+  > [forge-executor] Reading src/auth/middleware.ts
+  ~ Edit /repo/src/auth/middleware.ts
+  = File edited successfully.
+  > [forge-executor] Running tests...
+  = tests passed (1 more lines)
+```
+
+The dashboard shows the current phase + task, which subagent is active and which tool it's invoking, a live frontier progress bar, cumulative token usage (in / out / cached), restart and context-window meters, and a scrolling transcript of the most recent stream-json events. Multiline tool results are collapsed to a single line with a `(N more lines)` suffix; the full event log is mirrored to `.forge/.tui-log.jsonl` for post-mortem inspection.
+
+**Requirements:** Node 18+, an interactive terminal of at least 80×24, and the `claude` CLI on PATH. Zero npm install — the dashboard uses only Node built-ins and ANSI escape sequences.
+
+**Equivalent invocations:**
+
+```bash
+# Slash command
+/forge:watch --autonomy full
+
+# Or set the env var directly when running the bash runner
+FORGE_TUI=1 bash scripts/forge-runner.sh
+```
+
+If the TUI hits an unrecoverable error (three consecutive stream-json parse failures, missing `claude` binary, or render fault), it self-aborts with exit code 87 and the bash runner falls back to the plain-text loop automatically. Pass `--no-fallback` to disable that fallthrough and propagate the sentinel instead.
 
 ## Platform Support
 
