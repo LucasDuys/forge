@@ -27,23 +27,186 @@ After completing (or failing) the task, report one of these statuses:
 | **NEEDS_CONTEXT** | Cannot complete the task without additional information. Describe exactly what is missing (e.g., "Spec R003 says 'validate against schema' but no schema is defined anywhere"). |
 | **BLOCKED** | Cannot proceed due to an unresolvable issue. Describe the blocker (e.g., "Dependency T002 introduced a breaking change in the User model that conflicts with this task's requirements"). |
 
+## Workspace, Checkpoints, Caveman Mode
+
+These three concerns wrap every task. Read this section once before starting.
+
+### Worktree
+
+Every task runs inside its own git worktree at `.forge/worktrees/{task-id}/` so concurrent tasks cannot collide and a failed task can be discarded by removing the directory.
+
+- The scheduler normally creates the worktree before dispatching you. Verify by checking that `.forge/worktrees/{task-id}/` exists.
+- If the directory does not exist and worktrees are enabled in `.forge/config.json` (`use_worktrees: true`), create one with an inline node call:
+  ```bash
+  node scripts/forge-tools.cjs --eval "require('./scripts/forge-tools.cjs').createTaskWorktree('.forge', '{task-id}')"
+  ```
+  Or, equivalently, ask the scheduler to create it via the route prompt and pause until it appears.
+- Always run reads, edits, tests, and commits with paths rooted in the worktree directory. Do not touch files in the main checkout while the worktree exists.
+- On success: report DONE and let the scheduler squash-merge and remove the worktree (T021 wires this up). Do not merge yourself.
+- On failure or BLOCKED: leave the worktree in place. The scheduler removes it when cleaning up.
+- If the worktree was deliberately skipped (cheap quick task per T008 skip rules) or worktrees are disabled, work in-place in the main checkout. The rest of the protocol is unchanged.
+
+### Checkpoints
+
+Write a checkpoint at every major step so a context reset or crash can resume without redoing work. Checkpoints live at `.forge/progress/{task-id}.json` and follow the schema in `references/checkpoint-schema.md`.
+
+Use an inline node call to write or read:
+```bash
+node -e "require('./scripts/forge-tools.cjs').writeCheckpoint('.forge','{task-id}',{current_step:'spec_loaded',next_step:'research_done',context_bundle:{target:'src/auth.ts',api:'POST /register',constraint:'bcrypt rounds>=12'}})"
+node -e "console.log(JSON.stringify(require('./scripts/forge-tools.cjs').readCheckpoint('.forge','{task-id}')))"
+```
+
+Required write points and their `current_step` -> `next_step` values:
+
+| After | current_step | next_step |
+|-------|--------------|-----------|
+| Spec read | `spec_loaded` | `research_done` |
+| Research done (or skipped) | `research_done` | `planning_done` |
+| Implementation planned | `planning_done` | `implementation_started` |
+| First code change made | `implementation_started` | `tests_written` |
+| Tests written | `tests_written` | `tests_passing` |
+| Tests green | `tests_passing` | `review_pending` |
+| Ready for reviewer handoff | `review_pending` | `review_passed` |
+
+`context_bundle` MUST be a flat object of short keys (`api`, `db`, `target`, `constraint`, `decision`) mapped to fragment values. Use arrows for causality. No prose. Example:
+```json
+{ "target": "src/auth.ts", "api": "POST /register -> 201|409", "db": "users.email UNIQUE", "decision": "bcrypt rounds=12" }
+```
+
+### Resume Logic
+
+At task start, BEFORE reading the spec, check for an existing checkpoint:
+```bash
+node -e "console.log(JSON.stringify(require('./scripts/forge-tools.cjs').readCheckpoint('.forge','{task-id}')))"
+```
+
+- If `null`, start fresh.
+- If present, read `current_step` and `context_bundle`. Resume from `next_step`. Do not redo work that the checkpoint already documents (target files, decisions, constraints).
+- Append a single line to `.forge/state.md` notes: `resumed {task-id} from {current_step}`.
+- If the checkpoint is corrupt or for a different task, log a warning, delete it, and start fresh.
+
+### Caveman Mode
+
+Internal artifacts use caveman form to save tokens. Reference: `skills/caveman-internal/SKILL.md`.
+
+**Intensity selection** (self-selected at task start, see `skills/caveman-internal/SKILL.md#intensity-selection-logic` for the canonical rule and `skills/caveman-internal/references/budget-thresholds.md` for the threshold table):
+- `>50%` task budget remaining -> **lite** (drop articles, contractions OK)
+- `20-50%` remaining -> **full** (fragments, arrows, no articles, abbreviations)
+- `<20%` remaining -> **ultra** (telegraphic keys+values only)
+- `depth = thorough` clamps to **lite** regardless of budget
+- Budget lookup failed or no task context -> default to **full**
+
+Query the budget with `node scripts/forge-tools.cjs check-task-budget {task-id} --forge-dir .forge` or `require('./scripts/forge-tools.cjs').checkTaskBudget(taskId, forgeDir)`. If a downstream agent reports a compressed artifact is unusable, regenerate it verbose and log the fallback under "Caveman Fallbacks" in `.forge/state.md` (see SKILL.md "Quality Fallback").
+
+**Apply caveman form to:**
+- Checkpoint `context_bundle` values
+- `.forge/state.md` notes and "Key Decisions" entries
+- Handoff notes to reviewer/verifier
+- SUMMARY files and internal review notes
+- Status report bullets when budget is constrained
+
+**ALWAYS use normal verbose language for (caveman scope exclusions):**
+- Source code, code blocks, diffs
+- Commit messages and PR descriptions
+- User-facing specs and spec updates
+- Security warnings
+- Error messages that require human action
+- Acceptance criteria readback in your final status report
+
+When in doubt, ask: will a human read this directly, or is it agent-internal scratch? Human-facing -> verbose. Agent-internal -> caveman.
+
 ## Execution Protocol
+
+### 0. Resume Check
+
+Before anything else, read the checkpoint for this task (see Resume Logic above). If it exists, jump to the step after `current_step` and skip work already covered by `context_bundle`.
 
 ### 1. Understand the Task
 
 Before writing any code:
 
-1. **Read the spec** for the R-numbered requirements this task covers. Extract the exact acceptance criteria checkboxes.
+1. **Read the spec** for the R-numbered requirements this task covers. Extract the exact acceptance criteria checkboxes. **Write checkpoint:** `current_step: spec_loaded`.
 2. **Read the frontier** to understand dependencies — what prior tasks produced, what files they created or modified.
-3. **Read repo conventions** — find CLAUDE.md, .editorconfig, linting config, test config. Note:
-   - Import style (relative vs. absolute, CommonJS vs. ESM)
-   - Naming conventions (camelCase, snake_case, BEM for CSS)
-   - Error handling patterns (custom error classes, error codes)
-   - Test framework and test file location conventions
-   - Commit message format
-4. **Scan existing code** for patterns. If implementing a new endpoint, find an existing endpoint and follow its structure exactly. If adding a new component, match the existing component patterns.
+3. **Read repo conventions** — find CLAUDE.md, .editorconfig, linting config, test config.
+4. **Auto-detect conventions** (critical for legacy codebases). Even if CLAUDE.md exists, verify it matches reality. If CLAUDE.md is absent, this step is mandatory:
+
+   **Import style**: grep for `import.*from` vs `require(` in 10 recent src/ files. Use whichever is dominant.
+   **Naming**: Sample 5-10 files. Check variables (camelCase vs snake_case), files (kebab-case vs PascalCase), constants (UPPER_CASE vs camelCase).
+   **Error handling**: grep for `throw new`, custom error classes, `catch` patterns. Follow the existing approach.
+   **Test location**: Find test files -- check for `__tests__/`, `.test.ts`, `.spec.ts`, `tests/` directory. Match the existing pattern.
+   **Test framework**: Read test imports -- jest, mocha, vitest, pytest. Never switch frameworks mid-project.
+   **File organization**: Run `ls src/` to understand structure. Models together? Co-located with routes? Follow it.
+
+   **Critical rule for legacy code:** If the codebase uses patterns that differ from modern best practices (callbacks instead of async/await, var instead of const, jQuery instead of React), **follow the existing conventions**. Consistency within a codebase is more important than modernity. Only modernize if the spec explicitly requires it. Document any convention conflicts in state.md under "Key Decisions."
+
+5. **Scan existing code** for patterns. If implementing a new endpoint, find an existing endpoint and follow its structure exactly. If adding a new component, match the existing component patterns.
+
+### 1.6 Research Before Implementing (complex/unfamiliar tasks)
+
+For tasks involving unfamiliar technology, security-sensitive code, or integration with external services, dispatch the **forge-researcher** agent before writing code:
+
+```
+Dispatch forge-researcher with:
+- Task description and acceptance criteria
+- Tech stack and frameworks from codebase scan
+- Available MCP servers (Context7, Semantic Scholar, arXiv if configured)
+```
+
+The researcher returns a structured report with:
+- Official documentation findings (highest trust)
+- Established best practice patterns
+- Codebase convention analysis
+- Security considerations
+- Recommended approach with citations
+
+After research returns (or if you skipped it), **write checkpoint:** `current_step: research_done`. After you finish drafting the implementation approach, **write checkpoint:** `current_step: planning_done`.
+
+**When to skip research:**
+- Simple CRUD in a familiar framework
+- Test-only or documentation tasks
+- Tasks where the spec provides explicit implementation guidance
+- Quick depth (research adds overhead inappropriate for quick tasks)
+
+**When research is mandatory:**
+- Security-sensitive code (auth, crypto, payments, user data)
+- Depth is `thorough`
+- Task involves technology not previously used in the codebase
+- Task touches shared infrastructure (databases, message queues, caching)
+
+### 1.7 Check Available Tools
+
+Read `.forge/capabilities.json` and check both `mcp_servers` and `cli_tools`. Adapt your implementation approach based on what is available:
+
+| Tool | When to use |
+|------|-------------|
+| **gh** | Create branches, check CI status after commits, link PRs to issues |
+| **stripe** | `stripe listen --forward-to` for webhook testing, `stripe trigger` for event simulation, `stripe fixtures` for test data |
+| **vercel** | `vercel deploy --prebuilt` for preview deployments, `vercel env pull` for env vars |
+| **ffmpeg** | Any media processing — transcode, thumbnail generation, format conversion, video/audio rendering |
+| **playwright** | E2E tests against running dev server, screenshot comparisons, accessibility checks |
+| **gws** | Read reference docs from Google Drive, pull spreadsheet data for test fixtures |
+| **notebooklm** | Research unfamiliar APIs with grounded, citation-backed answers before implementing |
+| **supabase** | `supabase db push` for migrations, `supabase functions serve` for local edge function testing |
+| **firebase** | `firebase emulators:start` for local testing, `firebase deploy --only functions` |
+| **docker** | Spin up dependencies (databases, message queues) for integration tests |
+
+**On-demand CLI generation with CLI-Anything:**
+
+If `.forge/capabilities.json` shows `cli_anything_available: true`, you can generate CLIs for desktop applications on the fly. Check `generated_clis` first -- if the app you need already has a generated CLI, use it directly.
+
+If the task requires interacting with a desktop application (e.g., GIMP for image processing, Blender for 3D rendering, LibreOffice for document conversion, Inkscape for SVG manipulation) and no generated CLI exists:
+
+1. **Evaluate need** -- Is a CLI genuinely better than a library/script for this task? Generating a CLI takes time. Only generate when the task clearly requires programmatic control of a desktop app (not for tasks solvable with standard libraries like Pillow, FFmpeg, or Pandoc).
+2. **Generate** -- Run `/cli-anything <app-name>` (or the equivalent command from the CLI-Anything plugin). This produces a `cli-anything-<app>` binary with `--help` and `--json` support.
+3. **Verify** -- Run `cli-anything-<app> --help` to confirm it installed and inspect available commands.
+4. **Use** -- Call the generated CLI with `--json` for structured output the verifier can check.
+5. **Note in status** -- Report DONE_WITH_CONCERNS if a CLI was generated mid-task, so the planner knows it's now available for future tasks.
+
+If CLI-Anything is not available, or the generation fails, fall back to standard approaches (libraries, scripts, manual commands). CLI tools enhance but are never required.
 
 ### 2. Implement
+
+**Write checkpoint** at the first code change: `current_step: implementation_started`. **Write checkpoint** after tests are authored: `current_step: tests_written`. **Write checkpoint** when the suite goes green: `current_step: tests_passing`.
 
 #### If depth is `thorough`:
 ```
@@ -80,10 +243,50 @@ Before declaring the task done, verify:
 - [ ] **No stubs** — every function has a real implementation, no `// TODO`, no `throw new Error('not implemented')`
 - [ ] **No over-engineering** — only what the spec requires, nothing more
 - [ ] **Conventions followed** — matches the repo's existing patterns for naming, imports, error handling, file structure
-- [ ] **Tests pass** — all tests (new and existing) pass
+- [ ] **Tests pass** — targeted tests and full suite both pass (see test strategy below)
 - [ ] **No unintended side effects** — changes are scoped to this task only
+- [ ] **No downstream breakage** — dependents of modified files still work (see dependency check below)
+
+### 3.5 Targeted Test Strategy
+
+For fast feedback during implementation, use a two-phase test approach:
+
+**Phase 1 (fast -- during implementation loop):**
+Run only tests that import from your modified files:
+```
+grep -r "from.*{your-module}" {test-dir}/ -> find related test files
+Run only those test files
+```
+For JavaScript: `jest --findRelatedTests {changed-files}`
+For Python: `pytest {related-test-files}`
+
+**Phase 2 (comprehensive -- before committing):**
+Run the full test suite to catch regressions in untested dependency chains:
+```
+npm test    (or equivalent full suite command)
+```
+
+If Phase 1 passes but Phase 2 fails, the failure is in a dependent module -- investigate the dependency, do not blindly fix code outside your task scope. Report as DONE_WITH_CONCERNS if the failure is in unrelated code.
+
+### 3.6 Dependency Impact Verification
+
+Before committing, verify you haven't broken dependents of files you modified:
+
+1. For each file you modified that exports functions/classes/types:
+   ```
+   grep -r "import.*from.*{modified-file}" src/
+   grep -r "require.*{modified-file}" src/
+   ```
+2. For each dependent found:
+   - Check if the import still resolves (no removed/renamed exports)
+   - If the dependent has tests, verify they pass
+   - If no tests exist for a dependent that uses a changed export, flag it in your status report
+3. If you changed a function signature (parameters, return type), check ALL callers match the new signature
+4. Document downstream impact in commit message: "No downstream impact" or "Dependents verified: {file1}, {file2}"
 
 ### 4. Commit
+
+**Write checkpoint** before handing off: `current_step: review_pending`. Commit messages stay verbose (caveman scope exclusion).
 
 Create an atomic commit for this task:
 
@@ -109,6 +312,28 @@ After committing, update `.forge/state.md`:
    ```
 3. Clear "In-Flight Work"
 4. Update "What's Next" with remaining tasks
+
+### 5.5 Write Artifact (if applicable)
+
+If this task has `provides:` fields in the frontier, write an artifact file to `.forge/artifacts/{task-id}.json`:
+
+```json
+{
+  "task_id": "T003",
+  "status": "complete",
+  "commit": "abc1234",
+  "artifacts": {
+    "register_endpoint": "src/controllers/auth.ts -- POST /auth/register with email+password validation"
+  },
+  "files_created": ["src/controllers/auth.ts", "src/__tests__/auth.test.ts"],
+  "files_modified": ["src/routes/index.ts"],
+  "key_decisions": ["Used bcrypt with 12 rounds for password hashing"]
+}
+```
+
+The `artifacts` map keys should match the `provides:` names from the frontier. Values should be a brief description of what was produced and where. Downstream tasks will consume these summaries instead of re-reading your code.
+
+If a context bundle file exists at `.forge/context-bundles/{task-id}.md`, read it first for curated context from your dependencies.
 
 ### 6. Report Status
 
@@ -156,16 +381,30 @@ When working in a multi-repo project:
 
 ## Debugging Protocol
 
-If tests fail repeatedly (3+ attempts), switch to systematic debugging:
+If tests fail repeatedly, switch to systematic debugging:
 
-1. **Read** — Read the full error message and stack trace. Do not guess.
-2. **Find** — Find a working example of similar code in the codebase. Compare with your code.
-3. **Hypothesize** — Form a specific hypothesis about the root cause. Write it down.
-4. **Test minimally** — Make the smallest possible change to test your hypothesis.
+1. **Read** -- Read the full error message and stack trace. Do not guess.
+2. **Find** -- Find a working example of similar code in the codebase. Compare with your code.
+3. **Hypothesize** -- Form a specific hypothesis about the root cause. Write it down.
+4. **Test minimally** -- Make the smallest possible change to test your hypothesis.
 
 Do not scatter `console.log` statements. Do not make multiple changes at once. One hypothesis, one change, one test run.
 
-If 3 debug attempts fail, report BLOCKED with:
+### Codex Rescue Escalation
+
+After 2 debug attempts fail (configurable via `codex.rescue.debug_attempts_before_rescue`), if Codex is available, the stop hook will dispatch a Codex rescue agent with a fresh perspective. The rescue agent uses a different model (GPT-5.4) which may see the problem differently than Claude.
+
+The Codex rescue receives:
+- The exact error message and stack trace
+- What you tried (your 2 debug hypotheses and outcomes)
+- Relevant file paths
+- Write access to make changes directly
+
+If Codex fixes it (tests pass), continue the normal flow. If Codex also fails, the loop proceeds to re-decomposition or human escalation.
+
+### If Codex is not available (or rescue also fails)
+
+After 3 debug attempts fail without resolution, report BLOCKED with:
 - The exact error message
 - What you tried
 - Your best hypothesis for the root cause

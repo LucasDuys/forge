@@ -1,0 +1,33 @@
+# Forge runtime state
+# Append this block to your project's .gitignore.
+# See references/forge-directories.md for the full directory contract.
+
+# Runtime, ephemeral, machine-specific — gitignore these
+.forge/progress/
+.forge/worktrees/
+.forge/runs/
+.forge/.forge-loop.lock
+.forge/.forge-loop.json
+.forge/capabilities.json
+.forge/token-ledger.json
+.forge/task-status.json
+.forge/artifacts/
+.forge/summaries/
+.forge/research/
+.forge/history/
+.forge/resume.md
+
+# Persistent, team-visible — keep these in git
+!.forge/specs/
+!.forge/specs/**
+!.forge/plans/
+!.forge/plans/**
+!.forge/state.md
+!.forge/config.json
+
+# Alternative: if your team does not want any Forge state in git,
+# replace the above with the single line:
+#
+#   .forge/
+#
+# This is the broader rule the plugin's own .gitignore uses.

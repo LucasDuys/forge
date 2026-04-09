@@ -29,6 +29,15 @@ Display the following help text to the user:
 
 **`/forge status`** — Show current progress and budget
 
+**`/forge review-branch`** — Review an unmerged branch before merging
+  - `--base main` — Base branch to diff against
+  - `--spec path/` — Spec file for acceptance criteria verification
+  - `--depth quick|standard|thorough` — Review depth
+  - `--fix` — Auto-fix critical issues
+  - `--comment` — Post results as GitHub PR comment
+
+**`/forge setup-tools`** — Detect and install CLI tools that enhance Forge
+
 **`/forge help`** — Show this help text
 
 ## Quick Start

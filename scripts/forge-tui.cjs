@@ -450,13 +450,17 @@ class StatePoller {
     s.loopActive = fs.existsSync(path.join(this.forgeDir, '.forge-loop.json'));
 
     // .forge/state.md — YAML frontmatter block at top.
+    // Forge templates use literal "null" strings for unset fields (v2.1
+    // template/state.md has phase: idle, current_task: null, ...).
+    // Treat "null" the same as missing so dashboard fallbacks work.
+    const nonNull = (v) => (v && v !== 'null' ? v : null);
     try {
       const raw = fs.readFileSync(path.join(this.forgeDir, 'state.md'), 'utf8');
       const fm = parseFrontmatter(raw);
       if (fm.phase) s.phase = fm.phase;
-      if (fm.current_task) s.currentTask = fm.current_task;
-      if (fm.task_status) s.taskStatus = fm.task_status;
-      if (fm.blocked_reason && fm.blocked_reason !== 'null') s.blockedReason = fm.blocked_reason;
+      const t = nonNull(fm.current_task); if (t) s.currentTask = t;
+      const st = nonNull(fm.task_status); if (st) s.taskStatus = st;
+      s.blockedReason = nonNull(fm.blocked_reason);
     } catch (e) { /* file may not exist yet */ }
 
     // .forge/token-ledger.json — cumulative numeric usage.

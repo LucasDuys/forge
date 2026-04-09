@@ -8,6 +8,14 @@ allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "R
 
 Launch the autonomous implementation loop. Reads the frontier, implements tasks one by one, and relies on the Stop hook state machine to drive iteration until all tasks are complete.
 
+## New in v2.1
+
+- **Token budgets** are now enforced as hard ceilings, not warnings. Exhaustion transitions to `budget_exhausted` phase with a handoff doc at `.forge/resume.md`.
+- **Git worktree isolation** per task: each task runs in `.forge/worktrees/{task-id}/` and is squash-merged on success.
+- **Lock file acquisition** at session start: refuses to run if another valid lock is held (unless stale >5min).
+- **Per-task checkpoints** at each step: resume picks up exactly where the last checkpoint was written.
+- **Headless mode** for CI: see `node scripts/forge-tools.cjs headless execute --help` for non-interactive usage with exit codes.
+
 ## Pre-flight Check
 
 1. Verify `.forge/` exists. If it does not, stop and tell the user:

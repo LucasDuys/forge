@@ -13,6 +13,35 @@ Check if `.forge/` exists. If it does not, stop and tell the user:
 
 > No Forge project found. Run `/forge brainstorm` to get started.
 
+## Step 1.5: Forensic recovery (T020, R007/R008)
+
+Before loading any state, run forensic recovery. This handles crashed sessions, stale locks, budget exhaustion, and orphan worktrees. The forensic recovery scan is always safe to run -- on a clean state it is a no-op.
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" forensic-recover --forge-dir .forge
+```
+
+The command:
+
+1. Sets phase to `recovering` while it runs
+2. Inspects `.forge/.forge-loop.lock` -- takes over stale locks (heartbeat older than 5 minutes)
+3. Reads checkpoints from `.forge/progress/` to find in-flight tasks
+4. Cross-references git log + `task-status.json` to identify committed tasks
+5. Lists worktrees and flags any orphans (worktrees for tasks not in any frontier or already committed)
+6. If `phase: budget_exhausted`, reads `.forge/resume.md` and surfaces the reason
+7. Writes a caveman-form summary to `.forge/state.md` notes
+8. Sets final phase to `idle` (clean) or `needs_human` (warnings present)
+9. Exits 0 on clean recovery, exit 2 if `needs_human`
+
+**Show the recovery report to the user.** Read it carefully:
+
+- If the report lists **orphan worktrees**, do NOT delete them automatically. Tell the user which paths are orphan and that they need to run `git worktree remove <path>` manually after reviewing the contents.
+- If the report says `Needs human: YES`, stop and ask the user how to proceed. Common cases: budget exhausted (raise the cap in `.forge/config.json`), live lock from another session (verify no other forge instance is running).
+- If `Resume point` is present, that is the task you will continue from in Step 6.
+- In **full autonomy mode**, auto-continue if `Needs human: no` and there are no warnings. Otherwise pause and prompt.
+
+Add `--json` for machine-readable output if you need to parse the report programmatically.
+
 ## Step 2: Load handoff context
 
 Check if `.forge/.forge-resume.md` exists:

@@ -71,3 +71,100 @@ forge/
 - Don't hardcode repo paths or project-specific assumptions
 - Don't make MCP servers required — Forge works standalone, MCPs enhance it
 - Don't over-engineer the first version — get the loop working, iterate
+
+---
+
+## New in v2.1 (GSD-2 + Caveman Integration)
+
+### Token Budgets with Hard Ceilings
+- Per-task budgets: quick=5k, standard=15k, thorough=40k (configurable via `per_task_budget`)
+- Session budget: `session_budget_tokens` (default 500000)
+- Enforced at every state machine transition via `checkSessionBudget()`
+- At 80% per-task: warning injected into next prompt
+- At 100% per-task: state transitions to `budget_exhausted`, handoff written to `.forge/resume.md`
+
+### Git Worktree Isolation
+- Each task runs in `.forge/worktrees/{task-id}/`
+- Success: squash-merge with atomic commit `forge({domain}): {task_name} [T{num}]`
+- Failure: worktree discarded, parent branch untouched
+- Conflicts: transition to `conflict_resolution` phase, worktree preserved
+- Skipped for quick+single-file tasks or when `use_worktrees: false`
+
+### Lock-File Crash Recovery
+- `.forge/.forge-loop.lock` with PID, start time, current task, heartbeat
+- 5-minute stale threshold, takeover supported
+- `/forge resume` runs `performForensicRecovery()` first: reconstructs state from lock + checkpoints + git log
+- Orphan worktrees detected but never auto-deleted
+
+### Task Checkpoints
+- `.forge/progress/{task-id}.json` written at each step
+- 10-value enum: spec_loaded, research_done, planning_done, implementation_started, tests_written, tests_passing, review_pending, review_passed, verification_pending, complete
+- On resume, executor picks up from last checkpoint step
+- Cleaned up on successful task completion
+
+### Headless Mode
+- `node scripts/forge-tools.cjs headless execute --spec <domain>` for CI/cron
+- `node scripts/forge-tools.cjs headless query [--json] [--watch]` for monitoring
+- Exit codes: 0=complete, 1=failed, 2=budget_exhausted, 3=blocked, 4=lock_conflict
+- Query completes in <5ms with zero LLM calls
+- 17 fields in the JSON schema, versioned at 1.0
+
+### Caveman Skill for Internal Output
+- `skills/caveman-internal/SKILL.md` (adapted from JuliusBrussee/caveman, MIT)
+- Three intensity modes (lite/full/ultra) auto-selected by task budget remaining
+- Auto-applied to internal state files, checkpoint context bundles, handoff notes, routine review/verification reports
+- Exclusions: source code, commits, specs, security warnings, user-facing errors
+- `formatCavemanValue()` exported from forge-tools.cjs
+- `skipCavemanFormat: true` option on writeState/writeCheckpoint for verbose override
+- Shipped behind `terse_internal: false` default until benchmark tuning (see `docs/benchmarks/caveman-integration.md`)
+
+### Test Suite
+- 100 tests across 9 suites, ~2.4s runtime
+- `node scripts/run-tests.cjs` runs all tests
+- `node tests/budget.test.cjs` runs single file
+- Zero dependencies, uses only `node:assert`
+- Covers: budget math, locks, state read/write, checkpoints, worktrees, headless query, route decisions, frontier parsing
+- See `docs/testing.md` for full guide
+
+## New Config Fields
+```json
+{
+  "session_budget_tokens": 500000,
+  "per_task_budget": { "quick": 5000, "standard": 15000, "thorough": 40000 },
+  "terse_internal": false,
+  "use_worktrees": true,
+  "headless_notify_url": null
+}
+```
+
+Full schema: `references/config-schema.md`
+
+## New Reference Docs
+- `references/config-schema.md` — all config fields with defaults
+- `references/state-machine.md` — phase transitions + ASCII diagram
+- `references/forge-directories.md` — complete .forge/ directory contract
+- `references/checkpoint-schema.md` — 13-field JSON schema with enum transitions
+- `references/headless-status-schema.md` — headless query JSON schema
+- `skills/caveman-internal/references/budget-thresholds.md` — intensity selection thresholds
+- `docs/benchmarks/caveman-integration.md` — caveman token savings measurements
+- `docs/benchmarks/worktree-overhead.md` — worktree create/remove timing
+- `docs/testing.md` — test runner usage
+
+## New forge-tools.cjs Functions (exported)
+- Budget: `registerTask`, `recordTaskTokens`, `checkTaskBudget`, `resolveTaskBudget`, `budgetStatusReport`
+- Locks: `acquireLock`, `releaseLock`, `heartbeat`, `detectStaleLock`, `readLock`
+- State: `writeState` (legacy 3-arg + partial 2-arg + `skipCavemanFormat` opt)
+- Checkpoints: `writeCheckpoint`, `readCheckpoint`, `updateCheckpoint`, `listCheckpoints`, `deleteCheckpoint`
+- Worktrees: `createTaskWorktree`, `removeTaskWorktree`, `listTaskWorktrees`, `completeTaskInWorktree`, `abortTaskInWorktree`
+- Conflicts: `detectFileConflicts`, `serializeConflictingTasks`, `planTierExecution`
+- Route: `checkSessionBudget`, `writeBudgetExhaustedHandoff`
+- Recovery: `performForensicRecovery`
+- Headless: `runHeadless`, `queryHeadlessState`, `HEADLESS_EXIT`, `HEADLESS_STATUS_SCHEMA_VERSION`
+- Caveman: `formatCavemanValue`
+
+## Parallel Edit Safety
+When multiple agents modify `forge-tools.cjs` concurrently:
+- Use `acquireLock(forgeDir, taskId)` before editing
+- Re-read file after edit failures (staleness)
+- Edit tool auto-detects staleness and rejects stale edits
+- Write integration tests alongside functions to catch regressions from parallel merges

@@ -88,6 +88,39 @@ Is the artifact connected to the rest of the system?
 
 A fully implemented module that is never imported or used is effectively dead code. It does not satisfy the spec.
 
+#### Level 4: Runtime (if CLI tools available)
+
+Check `.forge/capabilities.json` for `cli_tools`. If relevant tools are available, perform runtime verification to confirm the code actually works, not just that it exists and is wired:
+
+**If Playwright is available and the spec involves UI:**
+1. Start the dev server (`npm run dev` or equivalent from repo conventions)
+2. Run key user flows via Playwright (`npx playwright test` or targeted commands)
+3. Verify observable behavior matches acceptance criteria (page loads, forms submit, data displays)
+4. Take screenshots as evidence if verification passes
+
+**If Stripe CLI is available and spec involves payments:**
+1. Start `stripe listen --forward-to localhost:{port}/webhooks` in background
+2. Trigger relevant test events via `stripe trigger {event_type}` (e.g., `invoice.paid`, `checkout.session.completed`)
+3. Verify webhook handlers respond correctly (check logs, database state)
+
+**If Vercel CLI is available and spec involves deployment:**
+1. Run `vercel deploy --prebuilt` or `vercel` for preview deployment
+2. Verify the preview URL returns expected responses
+3. Check serverless function endpoints respond correctly
+
+**If FFmpeg is available and spec involves media:**
+1. Verify output files exist and have correct format (`ffprobe` for metadata inspection)
+2. Check duration, resolution, codec match acceptance criteria
+3. Generate thumbnail/preview to confirm media integrity
+
+**If gh CLI is available:**
+1. Verify CI checks pass on the committed code (`gh run list`)
+2. Check that any referenced issues are properly linked
+
+Level 4 failures are always **CRITICAL** — if runtime behavior does not match the spec, the implementation is broken regardless of how clean the code looks.
+
+If no CLI tools are available, skip Level 4 entirely. It is an enhancement, not a requirement.
+
 ### Step 3: Cross-Component Verification
 
 For multi-component or multi-repo specs, verify the integration points:
@@ -153,3 +186,38 @@ Note: The verifier does not use MINOR severity. Phase verification is about "doe
 - **Do not verify beyond the spec.** If the spec does not require it, do not flag its absence. The spec is the boundary.
 - **Check every requirement.** Do not sample. Check them all. Missing one gap defeats the purpose of verification.
 - **Report gaps, not suggestions.** The verifier reports what IS missing, not what COULD be better. Leave improvement suggestions to the reviewer.
+
+## Caveman Mode (Internal Output Compression)
+
+Routine verification chatter is internal token churn. Use the `caveman-internal` skill (`skills/caveman-internal/SKILL.md`) to compress these outputs. Caveman form drops articles, auxiliaries, and prose framing while preserving every load-bearing token (R-numbers, file paths, function names, counts, line numbers, severities). Pick intensity (lite / full / ultra) per the budget-aware rule in `skills/caveman-internal/SKILL.md#intensity-selection-logic`.
+
+### Use caveman form for:
+
+- Routine pass reports for individual requirements
+- Per-level check confirmations (existence, substantive, wired)
+- Verification state writes to `.forge/state.md` and intermediate scratch
+- Internal handoffs between verifier and scheduler (e.g., next-task signals, frontier updates)
+- Bulk requirement summaries when all criteria pass
+
+**Example (caveman pass):**
+```
+[R007 verified] lock primitives: 5 checks pass. atomic write confirmed. cross-platform ok.
+```
+
+### Always use full verbose form for:
+
+- Verification FAILURES that need human review
+- Ambiguous results requiring human judgment
+- Missing acceptance criteria reports (verbose detail required for backpropagation)
+- Security-related verification findings (auth, crypto, secrets, input validation)
+- Any user-facing verification report or the final `VERIFICATION:` block in Step 4
+- CRITICAL severity gaps
+
+**Example (verbose fail):**
+```
+R007 acceptance criterion "stale lock takeover" FAILED: when simulating a lock with heartbeat older than 5 minutes, acquireLock returned {acquired: false, reason: 'held_by_pid_X'} instead of taking over. Expected behavior is tookOverStale: true. Investigation needed: check detectStaleLock threshold comparison in forge-tools.cjs line ~1850.
+```
+
+### Rule of thumb
+
+If a downstream consumer (scheduler, next verifier pass, executor) needs only the fact and the identifier, go caveman. If a human or backpropagation pass needs to reconstruct intent, reproduce a failure, or weigh a trade-off, go verbose. When in doubt, go verbose. Never compress a CRITICAL gap.

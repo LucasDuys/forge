@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Forge -- Autonomous Coding System</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{background:#1A1410;color:#FDF6EC;font-family:'Inter',sans-serif;overflow:hidden;height:100vh}
+    code,.mono{font-family:'JetBrains Mono',monospace}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+    .cursor{display:inline-block;width:2px;height:1.1em;background:#F59E0B;vertical-align:middle;animation:blink 1.06s step-end infinite}
+    .code-box{background:#0f0c08;border:1px solid #3D2E1F;border-radius:8px;padding:14px 18px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.7;color:#FBBF24}
+    .card{background:#241e17;border:1px solid #3D2E1F;border-radius:10px;padding:16px 20px}
+    .tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;font-family:'JetBrains Mono',monospace}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useRef,useCallback}=React;
+
+/* ── Utils ── */
+const R=(p,s,e)=>Math.max(0,Math.min(1,(p-s)/(e-s)));
+const L=(a,b,t)=>a+(b-a)*Math.max(0,Math.min(1,t));
+const E=t=>1-Math.pow(1-t,3);
+const EIO=t=>t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
+
+/* ── Colors ── */
+const C={
+  bg:'#1A1410',s1:'#241e17',s2:'#0f0c08',
+  border:'#3D2E1F',text:'#FDF6EC',muted:'#B8845A',dim:'#8B6340',
+  amber:'#F59E0B',gold:'#FBBF24',coral:'#F97316',
+  teal:'#0D9488',sage:'#6B8F71',clay:'#C2815B',
+  amberD:'rgba(245,158,11,0.15)',tealD:'rgba(13,148,136,0.15)',
+  sageD:'rgba(107,143,113,0.15)',coralD:'rgba(249,115,22,0.15)',
+};
+
+/* ── Timeline: 14 scenes ── */
+const SCENES=[
+  {id:'hero',d:3000},
+  {id:'problem',d:4000},
+  {id:'loop',d:5000},
+  {id:'selfprompt',d:4500},
+  {id:'spec',d:4500},
+  {id:'research',d:4500},
+  {id:'dag',d:4500},
+  {id:'tokens',d:4000},
+  {id:'routing',d:4000},
+  {id:'breakers',d:4500},
+  {id:'backprop',d:4000},
+  {id:'verify',d:4000},
+  {id:'codex',d:4000},
+  {id:'cta',d:3500},
+];
+const TL=SCENES.reduce((a,s,i)=>{a.push({...s,start:i?a[i-1].start+a[i-1].d:0});return a;},[]);
+const TOTAL=TL[TL.length-1].start+TL[TL.length-1].d;
+
+const LABELS={hero:'',problem:'why forge exists',loop:'core architecture',selfprompt:'the engine',
+  spec:'brainstorm',research:'before execution',dag:'planning',tokens:'efficiency',
+  routing:'cost optimization',breakers:'safety',backprop:'feedback loop',
+  verify:'goal-backward',codex:'cross-model',cta:''};
+
+/* ── Shared Components ── */
+function Fade({show,children,y=20}){
+  const o=E(show);
+  return <div style={{opacity:o,transform:`translateY(${L(y,0,o)}px)`,transition:'none'}}>{children}</div>;
+}
+function Label({children,p}){return <Fade show={p}><p style={{fontSize:11,fontWeight:600,letterSpacing:'0.15em',textTransform:'uppercase',color:C.dim,marginBottom:12}}>{children}</p></Fade>}
+function Title({children,p}){return <Fade show={p}><h2 style={{fontSize:'clamp(26px,4.5vw,44px)',fontWeight:800,letterSpacing:'-0.02em',color:C.text,marginBottom:16,lineHeight:1.15}}>{children}</h2></Fade>}
+function Desc({children,p}){return <Fade show={p}><p style={{fontSize:15,color:C.muted,lineHeight:1.7,maxWidth:560,marginBottom:8}}>{children}</p></Fade>}
+function Tag({children,color,bg}){return <span className="tag" style={{color,background:bg}}>{children}</span>}
+function CardEl({children,style={}}){return <div className="card" style={style}>{children}</div>}
+
+/* ── Scene: Hero ── */
+function SceneHero({p}){
+  const fo=1-E(R(p,.85,1));
+  return <div style={{opacity:fo,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',textAlign:'center',padding:'0 24px'}}>
+    <Fade show={R(p,0,.25)} y={30}>
+      <h1 style={{fontSize:'clamp(52px,9vw,100px)',fontWeight:900,letterSpacing:'-0.04em',color:C.text,lineHeight:1.05}}>Forge</h1>
+    </Fade>
+    <Fade show={R(p,.15,.4)}>
+      <p className="mono" style={{fontSize:12,color:C.dim,marginTop:16,letterSpacing:'0.12em'}}>AUTONOMOUS CODING SYSTEM</p>
+    </Fade>
+    <Fade show={R(p,.3,.55)}>
+      <p style={{fontSize:'clamp(15px,2vw,19px)',color:C.muted,marginTop:14,maxWidth:420}}>Spec-driven development pipeline for Claude Code. Three commands. Idea to shipped code.</p>
+    </Fade>
+    <Fade show={R(p,.45,.65)}>
+      <div style={{display:'flex',gap:8,marginTop:24,alignItems:'center',flexWrap:'wrap',justifyContent:'center'}}>
+        <Tag color={C.amber} bg={C.amberD}>brainstorm</Tag>
+        <span style={{color:C.dim}}>&rarr;</span>
+        <Tag color={C.teal} bg={C.tealD}>plan</Tag>
+        <span style={{color:C.dim}}>&rarr;</span>
+        <Tag color={C.sage} bg={C.sageD}>execute</Tag>
+      </div>
+    </Fade>
+  </div>;
+}
+
+/* ── Scene: Problem ── */
+function SceneProblem({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const steps=['prompt the LLM','review output','fix what it missed','re-prompt again','lose context','start over...'];
+  const vis=Math.floor(R(p,.1,.6)*6);
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:20}}>
+    <Label p={R(p,.02,.12)}>Why Forge Exists</Label>
+    <Title p={R(p,.05,.2)}>You are the bottleneck.</Title>
+    <Desc p={R(p,.1,.25)}>For 12+ task features, the human doing prompt-review-reprompt is the slowest part. Forge eliminates the glue layer.</Desc>
+    <div style={{display:'flex',flexDirection:'column',gap:6,maxWidth:340,width:'100%'}}>
+      {steps.map((s,i)=><div key={i} style={{
+        opacity:i<vis?1:0,transform:`translateX(${i<vis?0:16}px)`,transition:'opacity 0.25s,transform 0.25s',
+        display:'flex',alignItems:'center',gap:10,padding:'7px 14px',borderRadius:7,fontSize:13,
+        background:i===5&&vis>=6?C.coralD:C.s1,border:`1px solid ${i===5&&vis>=6?C.coral+'40':C.border}`,
+        color:i===5?C.coral:C.muted,
+      }}><span className="mono" style={{color:C.dim,fontSize:11}}>{i+1}.</span>{s}</div>)}
+    </div>
+    <Fade show={R(p,.7,.85)}>
+      <div style={{padding:'10px 20px',borderRadius:8,background:C.sageD,border:`1px solid ${C.sage}30`,color:C.sage,fontSize:14,fontWeight:600}}>What if the AI ran the whole process?</div>
+    </Fade>
+  </div>;
+}
+
+/* ── Scene: Three-Tiered Loop ── */
+function SceneLoop({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const tiers=[
+    {name:'Outer',label:'Phase Progression',desc:'idle > executing > reviewing > verifying > idle',tag:C.amber,bg:C.amberD,p:R(p,.12,.3)},
+    {name:'Middle',label:'Task Progression',desc:'Streaming topological dispatch. Tasks start when their deps complete.',tag:C.teal,bg:C.tealD,p:R(p,.3,.5)},
+    {name:'Inner',label:'Quality Iteration',desc:'implement > test > fix (3x) > debug > Codex rescue > redecompose > blocked',tag:C.sage,bg:C.sageD,p:R(p,.5,.7)},
+  ];
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:16}}>
+    <Label p={R(p,.02,.1)}>Core Architecture</Label>
+    <Title p={R(p,.05,.18)}>The Three-Tiered Loop</Title>
+    <Desc p={R(p,.08,.22)}>Three nested loops, each with circuit breakers and escalation paths.</Desc>
+    <div style={{display:'flex',flexDirection:'column',gap:10,maxWidth:480,width:'100%'}}>
+      {tiers.map((t,i)=><Fade key={i} show={t.p}>
+        <CardEl><div style={{display:'flex',alignItems:'flex-start',gap:12}}>
+          <Tag color={t.tag} bg={t.bg}>{t.name}</Tag>
+          <div>
+            <div style={{fontWeight:700,fontSize:14,color:C.text}}>{t.label}</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:4}}>{t.desc}</div>
+          </div>
+        </div></CardEl>
+      </Fade>)}
+    </div>
+  </div>;
+}
+
+/* ── Scene: Self-Prompting ── */
+function SceneSelfPrompt({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const lines=[
+    {t:'# Stop hook fires on every Claude exit',c:C.dim,p:R(p,.1,.2)},
+    {t:'LOOP_DATA=$(cat .forge/.forge-loop.json)',c:C.gold,p:R(p,.18,.3)},
+    {t:'',c:'',p:0},
+    {t:'# Route: what should happen next?',c:C.dim,p:R(p,.28,.38)},
+    {t:'NEXT=$(node forge-tools.cjs route \\',c:C.gold,p:R(p,.35,.45)},
+    {t:'  --forge-dir .forge --iteration $N)',c:C.gold,p:R(p,.4,.5)},
+    {t:'',c:'',p:0},
+    {t:'# Block exit with new prompt',c:C.dim,p:R(p,.5,.6)},
+    {t:'echo \'{"decision":"block","reason":"$NEXT"}\'',c:C.amber,p:R(p,.58,.68)},
+    {t:'',c:'',p:0},
+    {t:'# Completion: <promise>FORGE_COMPLETE</promise>',c:C.dim,p:R(p,.68,.78)},
+    {t:'# Hook detects, generates summary, stops loop',c:C.dim,p:R(p,.75,.85)},
+  ];
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:16}}>
+    <Label p={R(p,.02,.1)}>The Engine</Label>
+    <Title p={R(p,.04,.16)}>Automatic Self-Prompting</Title>
+    <Desc p={R(p,.06,.18)}>The stop hook intercepts every exit. routeDecision() is a 200+ line state machine that determines the exact next action. Claude never waits for a human.</Desc>
+    <div className="code-box" style={{maxWidth:520,width:'100%',fontSize:11}}>
+      {lines.map((l,i)=>l.t?<div key={i} style={{opacity:E(l.p),color:l.c,transform:`translateX(${L(8,0,E(l.p))}px)`}}>{l.t}</div>:<div key={i} style={{height:6}}/>)}
+    </div>
+  </div>;
+}
+
+/* ── Scene: Spec ── */
+function SceneSpec({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const ideaP=R(p,.08,.25),morphP=EIO(R(p,.28,.42));
+  const specLines=[
+    {t:'---',c:C.dim,p:R(p,.38,.45)},
+    {t:'domain: auth',c:C.teal,p:R(p,.42,.5)},
+    {t:'status: approved',c:C.teal,p:R(p,.47,.55)},
+    {t:'---',c:C.dim,p:R(p,.52,.58)},
+    {t:'R001: POST /login returns JWT',c:C.sage,p:R(p,.55,.63)},
+    {t:'  [ ] valid creds > 200 + tokens',c:C.muted,p:R(p,.6,.68)},
+    {t:'  [ ] invalid creds > 401',c:C.muted,p:R(p,.65,.73)},
+    {t:'R002: Token refresh endpoint',c:C.sage,p:R(p,.72,.8)},
+    {t:'  [ ] expired token > new pair',c:C.muted,p:R(p,.77,.85)},
+  ];
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
+    <Label p={R(p,.02,.1)}>Brainstorm</Label>
+    <Title p={R(p,.04,.15)}>Spec-First Development</Title>
+    <Fade show={ideaP}>
+      <div style={{padding:'10px 20px',borderRadius:8,background:C.amberD,border:`1px solid ${C.amber}30`,color:C.amber,fontSize:14,
+        transform:`scale(${L(1,.7,morphP)})`,opacity:L(1,0,R(p,.35,.42))}}>
+        "I need user authentication"
+      </div>
+    </Fade>
+    <Fade show={R(p,.3,.4)}><div style={{color:C.dim,fontSize:18}}>&darr;</div></Fade>
+    <Fade show={R(p,.36,.46)}>
+      <div className="code-box" style={{maxWidth:380,width:'100%',fontSize:11}}>
+        {specLines.map((l,i)=><div key={i} style={{opacity:E(l.p),color:l.c,transform:`translateX(${L(8,0,E(l.p))}px)`}}>{l.t}</div>)}
+      </div>
+    </Fade>
+  </div>;
+}
+
+/* ── Scene: Research ── */
+function SceneResearch({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const tiers=[
+    {n:'Tier 1',s:'Official docs (Context7)',p:R(p,.15,.3)},
+    {n:'Tier 2',s:'Papers, RFCs (Semantic Scholar)',p:R(p,.25,.4)},
+    {n:'Tier 3',s:'Vendor blogs (Anthropic, Stripe)',p:R(p,.35,.5)},
+    {n:'Tier 4',s:'Community (GitHub, SO)',p:R(p,.45,.6)},
+    {n:'Tier 5',s:'Blog posts (corroboration req.)',p:R(p,.55,.7)},
+  ];
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
+    <Label p={R(p,.02,.1)}>Before Execution</Label>
+    <Title p={R(p,.04,.16)}>Deep Research First</Title>
+    <Desc p={R(p,.06,.2)}>forge-researcher investigates unfamiliar tech, security concerns, and APIs before the executor touches code. Tiered source hierarchy with trust levels.</Desc>
+    <div style={{display:'flex',flexDirection:'column',gap:6,maxWidth:420,width:'100%'}}>
+      {tiers.map((t,i)=><div key={i} style={{opacity:E(t.p),transform:`translateX(${L(12,0,E(t.p))}px)`,
+        display:'flex',alignItems:'center',gap:10,padding:'7px 14px',borderRadius:7,background:C.s1,border:`1px solid ${C.border}`}}>
+        <Tag color={C.amber} bg={C.amberD}>{t.n}</Tag>
+        <span style={{fontSize:12,color:C.muted}}>{t.s}</span>
+      </div>)}
+    </div>
+    <Fade show={R(p,.72,.85)}>
+      <CardEl style={{maxWidth:420,width:'100%'}}>
+        <div style={{fontWeight:700,fontSize:13,color:C.text,marginBottom:4}}>Legacy Codebase Detection</div>
+        <div style={{fontSize:11,color:C.muted}}>Auto-detects import style, naming conventions, error patterns, test framework. Follows existing patterns for consistency.</div>
+      </CardEl>
+    </Fade>
+  </div>;
+}
+
+/* ── Scene: DAG ── */
+function SceneDAG({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const nodes=[
+    {l:'DB Schema',x:50,y:45,t:1,c:C.teal},{l:'Auth Routes',x:190,y:15,t:2,c:C.amber},
+    {l:'Middleware',x:190,y:75,t:2,c:C.amber},{l:'Refresh',x:330,y:15,t:3,c:C.coral},
+    {l:'Rate Limit',x:330,y:75,t:3,c:C.coral},{l:'Integration',x:470,y:45,t:4,c:C.sage},
+  ];
+  const edges=[[0,1],[0,2],[1,3],[2,4],[1,5],[2,5],[3,5],[4,5]];
+  const tp=[R(p,.12,.28),R(p,.28,.46),R(p,.46,.64),R(p,.64,.78)];
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
+    <Label p={R(p,.02,.1)}>Planning</Label>
+    <Title p={R(p,.04,.15)}>Streaming Topological Dispatch</Title>
+    <Desc p={R(p,.06,.18)}>Tasks start when their specific deps complete. Not when the tier finishes. 20-40% faster.</Desc>
+    <svg viewBox="0 0 560 100" style={{width:'100%',maxWidth:560,height:'auto'}}>
+      {edges.map((e,i)=>{const f=nodes[e[0]],t=nodes[e[1]];
+        return <line key={`e${i}`} x1={f.x+40} y1={f.y+12} x2={t.x} y2={t.y+12} stroke={C.border} strokeWidth="1.2" strokeDasharray="4,3" opacity={E(tp[f.t-1]||0)*.5}/>})}
+      {nodes.map((n,i)=>{const np=E(tp[n.t-1]||0);const a=np>.5;
+        return <g key={i} opacity={np} transform={`translate(${n.x},${n.y})`}>
+          <rect width="80" height="24" rx="5" fill={a?n.c+'18':C.s1} stroke={a?n.c:C.border} strokeWidth={a?1.5:1}/>
+          <text x="40" y="15" textAnchor="middle" fill={a?n.c:C.dim} fontSize="9" fontFamily="'JetBrains Mono',monospace" fontWeight="500">{n.l}</text>
+        </g>})}
+    </svg>
+    <Fade show={R(p,.7,.82)}>
+      <div style={{display:'flex',gap:24,fontSize:12,color:C.muted,textAlign:'center'}}>
+        <div><span className="mono" style={{fontSize:20,fontWeight:700,color:C.amber}}>3</span><br/>max concurrent</div>
+        <div><span className="mono" style={{fontSize:20,fontWeight:700,color:C.teal}}>2</span><br/>per repo</div>
+        <div><span className="mono" style={{fontSize:20,fontWeight:700,color:C.coral}}>0</span><br/>file overlap</div>
+      </div>
+    </Fade>
+  </div>;
+}
+
+/* ── Scene: Token Saving ── */
+function SceneTokens({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const hooks=[
+    {name:'Test Output Filter',hook:'PostToolUse',desc:'Compresses test output >2000 chars. Keeps failures + context + summary. 90%+ reduction.',c:C.amber,bg:C.amberD,p:R(p,.12,.3)},
+    {name:'Tool Call Cache',hook:'PreToolUse',desc:'Caches idempotent calls (git status, ls, Read) with 2min TTL. Never caches mutations.',c:C.teal,bg:C.tealD,p:R(p,.3,.5)},
+    {name:'Progress Tracker',hook:'PostToolUse',desc:'Writes to disk + stderr only. Never stdout. Zero context token cost.',c:C.sage,bg:C.sageD,p:R(p,.5,.7)},
+  ];
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
+    <Label p={R(p,.02,.1)}>Efficiency</Label>
+    <Title p={R(p,.04,.15)}>Token-Saving Hooks</Title>
+    <Desc p={R(p,.06,.18)}>Three hooks at zero or near-zero context cost. Patterns derived from studying the Claude Code source.</Desc>
+    <div style={{display:'flex',flexDirection:'column',gap:8,maxWidth:480,width:'100%'}}>
+      {hooks.map((h,i)=><Fade key={i} show={h.p}>
+        <CardEl><div style={{display:'flex',alignItems:'flex-start',gap:10}}>
+          <Tag color={h.c} bg={h.bg}>{h.hook}</Tag>
+          <div>
+            <div style={{fontWeight:700,fontSize:13,color:C.text}}>{h.name}</div>
+            <div style={{fontSize:11,color:C.muted,marginTop:3}}>{h.desc}</div>
+          </div>
+        </div></CardEl>
+      </Fade>)}
+    </div>
+  </div>;
+}
+
+/* ── Scene: Model Routing ── */
+function SceneRouting({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const score=Math.floor(L(0,14,E(R(p,.15,.5))));
+  const models=[
+    {n:'haiku',r:'0-4',c:C.teal,a:score<=4},
+    {n:'sonnet',r:'5-10',c:C.amber,a:score>=5&&score<=10},
+    {n:'opus',r:'11+',c:C.coral,a:score>=11},
+  ];
+  const savings=Math.floor(L(0,37,E(R(p,.55,.75))));
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:16}}>
+    <Label p={R(p,.02,.1)}>Cost Optimization</Label>
+    <Title p={R(p,.04,.15)}>Intelligent Model Routing</Title>
+    <div style={{textAlign:'center'}}>
+      <div className="mono" style={{fontSize:44,fontWeight:700,color:score<=4?C.teal:score<=10?C.amber:C.coral,transition:'color 0.3s'}}>{score}</div>
+      <div style={{fontSize:11,color:C.dim}}>complexity score (0-20)</div>
+    </div>
+    <div style={{width:'100%',maxWidth:300,height:6,borderRadius:3,background:C.s1,overflow:'hidden'}}>
+      <div style={{height:'100%',borderRadius:3,width:`${(score/20)*100}%`,background:score<=4?C.teal:score<=10?C.amber:C.coral,transition:'width 0.15s,background 0.3s'}}/>
+    </div>
+    <div style={{display:'flex',gap:10,opacity:E(R(p,.35,.5))}}>
+      {models.map((m,i)=><div key={i} style={{padding:'10px 18px',borderRadius:8,background:m.a?m.c+'18':C.s1,
+        border:`1.5px solid ${m.a?m.c:C.border}`,transform:m.a?'scale(1.06)':'scale(1)',
+        transition:'all 0.35s cubic-bezier(0.22,1,0.36,1)',textAlign:'center'}}>
+        <div className="mono" style={{fontSize:13,fontWeight:600,color:m.a?m.c:C.dim}}>{m.n}</div>
+        <div style={{fontSize:10,color:C.dim,marginTop:2}}>{m.r}</div>
+      </div>)}
+    </div>
+    <Fade show={R(p,.6,.75)}>
+      <div style={{padding:'10px 20px',borderRadius:8,background:C.sageD,border:`1px solid ${C.sage}30`,textAlign:'center'}}>
+        <span className="mono" style={{fontSize:22,fontWeight:700,color:C.sage}}>{savings}%</span>
+        <span style={{fontSize:12,color:C.muted,marginLeft:8}}>cost reduction vs single model</span>
+      </div>
+    </Fade>
+  </div>;
+}
+
+/* ── Scene: Circuit Breakers ── */
+function SceneBreakers({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const bs=[
+    {n:'Test Failures',t:'3x',a:'DEBUG mode',c:C.amber},
+    {n:'Debug Attempts',t:'2x',a:'Codex rescue',c:C.teal},
+    {n:'Debug Exhaustion',t:'3x',a:'Redecompose into sub-tasks',c:C.coral},
+    {n:'Review Iterations',t:'3x',a:'Accept with warnings',c:C.sage},
+    {n:'No Progress',t:'2x',a:'Block for human',c:C.clay},
+    {n:'Max Iterations',t:'100',a:'Save state, exit',c:C.dim},
+    {n:'Budget',t:'100%',a:'Graceful handoff',c:C.dim},
+  ];
+  const vis=Math.floor(R(p,.1,.8)*7);
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
+    <Label p={R(p,.02,.1)}>Safety</Label>
+    <Title p={R(p,.04,.15)}>Circuit Breakers</Title>
+    <Desc p={R(p,.06,.18)}>Seven levels. Each escalates to the next when exhausted.</Desc>
+    <div style={{display:'flex',flexDirection:'column',gap:5,maxWidth:440,width:'100%'}}>
+      {bs.map((b,i)=><div key={i} style={{opacity:i<vis?1:0,transform:`translateX(${i<vis?0:12}px)`,
+        transition:'opacity 0.25s,transform 0.25s',display:'flex',alignItems:'center',gap:8,
+        padding:'6px 12px',borderRadius:6,background:C.s1,border:`1px solid ${C.border}`,fontSize:12}}>
+        <span className="mono" style={{color:b.c,fontWeight:700,width:16,textAlign:'center'}}>{i+1}</span>
+        <span style={{color:C.text,fontWeight:600,width:120}}>{b.n}</span>
+        <span className="mono" style={{color:C.dim,width:32}}>{b.t}</span>
+        <span style={{color:C.muted,flex:1}}>{b.a}</span>
+      </div>)}
+    </div>
+  </div>;
+}
+
+/* ── Scene: Backpropagation ── */
+function SceneBackprop({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const steps=[
+    {s:'TRACE',d:'Which spec + R-number does this bug map to?'},
+    {s:'ANALYZE',d:'Missing criterion, incomplete, or missing requirement?'},
+    {s:'PROPOSE',d:'Spec update for human approval'},
+    {s:'GENERATE',d:'Regression test that would have caught it'},
+    {s:'VERIFY',d:'Run test (should fail). Optionally re-execute tasks.'},
+    {s:'LOG',d:'3+ same category = suggest systemic fix to future brainstorming'},
+  ];
+  const vis=Math.floor(R(p,.1,.8)*6);
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
+    <Label p={R(p,.02,.1)}>Feedback Loop</Label>
+    <Title p={R(p,.04,.15)}>Backpropagation</Title>
+    <Desc p={R(p,.06,.18)}>Traces runtime bugs back to spec gaps. Generates regression tests. Learns from patterns.</Desc>
+    <div style={{display:'flex',flexDirection:'column',gap:5,maxWidth:460,width:'100%'}}>
+      {steps.map((s,i)=><div key={i} style={{opacity:i<vis?1:0,transform:`translateX(${i<vis?0:12}px)`,
+        transition:'opacity 0.25s,transform 0.25s',display:'flex',alignItems:'center',gap:10,
+        padding:'7px 14px',borderRadius:7,background:C.s1,border:`1px solid ${C.border}`}}>
+        <span className="mono" style={{color:C.amber,fontWeight:700,fontSize:10,width:64}}>{s.s}</span>
+        <span style={{fontSize:12,color:C.muted}}>{s.d}</span>
+      </div>)}
+    </div>
+  </div>;
+}
+
+/* ── Scene: Verification ── */
+function SceneVerify({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  const levels=[
+    {n:'Existence',d:'Do expected files, functions, routes exist?',c:C.teal,p:R(p,.12,.3)},
+    {n:'Substantive',d:'Real code, not stubs? No TODO, no hardcoded returns, no empty catch.',c:C.amber,p:R(p,.28,.46)},
+    {n:'Wired',d:'Module imported where used? Route registered? Middleware applied? Dead code = not satisfied.',c:C.coral,p:R(p,.44,.62)},
+    {n:'Runtime',d:'Playwright E2E, Stripe webhooks, Vercel deploy, CI checks -- if tools available.',c:C.sage,p:R(p,.6,.78)},
+  ];
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
+    <Label p={R(p,.02,.1)}>Goal-Backward</Label>
+    <Title p={R(p,.04,.15)}>Four-Level Verification</Title>
+    <Desc p={R(p,.06,.18)}>The verifier checks observable truths, not task checkboxes. Works backwards from the spec.</Desc>
+    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,maxWidth:480,width:'100%'}}>
+      {levels.map((l,i)=><Fade key={i} show={l.p}>
+        <CardEl><div style={{fontWeight:700,fontSize:13,color:l.c,marginBottom:4}}>{i+1}. {l.n}</div>
+          <div style={{fontSize:11,color:C.muted}}>{l.d}</div>
+        </CardEl>
+      </Fade>)}
+    </div>
+  </div>;
+}
+
+/* ── Scene: Codex Hybrid ── */
+function SceneCodex({p}){
+  const fi=E(R(p,0,.1)),fo=1-E(R(p,.88,1)),o=Math.min(fi,fo);
+  return <div style={{opacity:o,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',padding:'0 24px',gap:14}}>
+    <Label p={R(p,.02,.1)}>Cross-Model</Label>
+    <Title p={R(p,.04,.15)}>Codex Hybrid Integration</Title>
+    <Desc p={R(p,.06,.2)}>Different model for review = different blind spots caught. Optional. Silently skips when Codex not installed.</Desc>
+    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,maxWidth:480,width:'100%'}}>
+      <Fade show={R(p,.2,.4)}>
+        <CardEl><div style={{fontWeight:700,fontSize:13,color:C.text,marginBottom:4}}>Adversarial Review</div>
+          <div style={{fontSize:11,color:C.muted}}>After Claude passes, Codex reviews the same diff for race conditions, edge cases, hidden assumptions. ~6% cost.</div>
+          <div className="mono" style={{fontSize:10,color:C.amber,marginTop:8}}>Claude > Claude review > Codex review > commit</div>
+        </CardEl>
+      </Fade>
+      <Fade show={R(p,.35,.55)}>
+        <CardEl><div style={{fontWeight:700,fontSize:13,color:C.text,marginBottom:4}}>Debug Rescue</div>
+          <div style={{fontSize:11,color:C.muted}}>Claude stuck after 2 attempts? Codex gets structured diagnosis. Different model, fresh perspective. $0.50 vs $1.50+.</div>
+          <div className="mono" style={{fontSize:10,color:C.teal,marginTop:8}}>Claude stuck (2x) > Codex rescue > fixed</div>
+        </CardEl>
+      </Fade>
+    </div>
+  </div>;
+}
+
+/* ── Scene: CTA ── */
+function SceneCTA({p}){
+  const fi=E(R(p,0,.2));
+  return <div style={{opacity:fi,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',textAlign:'center',padding:'0 24px',gap:16}}>
+    <Fade show={R(p,.05,.25)} y={30}>
+      <h2 style={{fontSize:'clamp(24px,4vw,40px)',fontWeight:800,color:C.text}}>You approve. Forge builds.</h2>
+    </Fade>
+    <Fade show={R(p,.2,.4)}>
+      <div className="code-box" style={{maxWidth:420,textAlign:'left',fontSize:12}}>
+        <div><span style={{color:C.coral}}>claude</span> plugin install forge</div>
+        <div><span style={{color:C.coral}}>/forge</span> brainstorm <span style={{color:C.gold}}>"your feature idea"</span></div>
+        <div><span style={{color:C.coral}}>/forge</span> plan</div>
+        <div><span style={{color:C.coral}}>/forge</span> execute <span style={{color:C.amber}}>--autonomy</span> full</div>
+      </div>
+    </Fade>
+    <Fade show={R(p,.4,.6)}>
+      <a href="https://github.com/LucasDuys/forge" target="_blank" rel="noopener noreferrer"
+        style={{display:'inline-flex',alignItems:'center',gap:8,padding:'12px 28px',borderRadius:10,
+          background:C.amber,color:C.bg,fontWeight:700,fontSize:14,textDecoration:'none',
+          boxShadow:'0 0 30px rgba(245,158,11,0.25)'}}>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+        View on GitHub
+      </a>
+    </Fade>
+  </div>;
+}
+
+/* ── Video Player ── */
+function VideoPlayer(){
+  const[elapsed,setElapsed]=useState(0);
+  const[playing,setPlaying]=useState(true);
+  const rafRef=useRef(null);
+  const lastRef=useRef(null);
+  const speed=useRef(new URLSearchParams(window.location.search).get('record')==='1'?.4:1);
+
+  const playingRef=useRef(true);
+
+  const tick=useCallback((ts)=>{
+    if(!playingRef.current){rafRef.current=requestAnimationFrame(tick);return;}
+    if(lastRef.current===null)lastRef.current=ts;
+    const dt=(ts-lastRef.current)*speed.current;
+    lastRef.current=ts;
+    setElapsed(prev=>{const next=prev+dt;return next>=TOTAL?TOTAL:next;});
+    rafRef.current=requestAnimationFrame(tick);
+  },[]);
+
+  useEffect(()=>{
+    rafRef.current=requestAnimationFrame(tick);
+    return()=>{if(rafRef.current)cancelAnimationFrame(rafRef.current)};
+  },[tick]);
+
+  const toggle=()=>{
+    if(elapsed>=TOTAL){setElapsed(0);playingRef.current=true;setPlaying(true);lastRef.current=null;}
+    else{const next=!playing;playingRef.current=next;setPlaying(next);if(next)lastRef.current=null;}
+  };
+  const restart=()=>{setElapsed(0);playingRef.current=true;setPlaying(true);lastRef.current=null;};
+
+  // Arrow keys + space
+  useEffect(()=>{
+    const handler=(e)=>{
+      if(e.key==='ArrowRight'){
+        e.preventDefault();
+        setElapsed(prev=>{
+          let idx=0;for(let i=0;i<TL.length;i++)if(prev>=TL[i].start)idx=i;
+          const next=Math.min(idx+1,TL.length-1);
+          lastRef.current=null;
+          return TL[next].start;
+        });
+      }else if(e.key==='ArrowLeft'){
+        e.preventDefault();
+        setElapsed(prev=>{
+          let idx=0;for(let i=0;i<TL.length;i++)if(prev>=TL[i].start)idx=i;
+          const next=Math.max(idx-1,0);
+          lastRef.current=null;
+          return TL[next].start;
+        });
+      }else if(e.key===' '){
+        e.preventDefault();
+        toggle();
+      }
+    };
+    window.addEventListener('keydown',handler);
+    return()=>window.removeEventListener('keydown',handler);
+  },[playing,elapsed]);
+
+  let active=TL[0];
+  for(const s of TL)if(elapsed>=s.start)active=s;
+  const sp=Math.min(1,(elapsed-active.start)/active.d);
+  const tp=elapsed/TOTAL;
+
+  const scenes={hero:SceneHero,problem:SceneProblem,loop:SceneLoop,selfprompt:SceneSelfPrompt,
+    spec:SceneSpec,research:SceneResearch,dag:SceneDAG,tokens:SceneTokens,
+    routing:SceneRouting,breakers:SceneBreakers,backprop:SceneBackprop,
+    verify:SceneVerify,codex:SceneCodex,cta:SceneCTA};
+  const Comp=scenes[active.id];
+
+  // Scene nav dots
+  const sceneIdx=TL.indexOf(active);
+
+  return <div style={{width:'100vw',height:'100vh',background:C.bg,position:'relative',overflow:'hidden'}}>
+    {/* Scene */}
+    <div style={{width:'100%',height:'calc(100% - 44px)',position:'relative'}}>
+      {Comp&&<Comp p={sp}/>}
+    </div>
+
+    {/* Scene dots (left side) */}
+    <div style={{position:'absolute',left:12,top:'50%',transform:'translateY(-50%)',display:'flex',flexDirection:'column',gap:6,zIndex:10}}>
+      {TL.map((s,i)=><div key={i} onClick={()=>{setElapsed(s.start);setPlaying(true)}} style={{
+        width:i===sceneIdx?8:5,height:i===sceneIdx?8:5,borderRadius:'50%',cursor:'pointer',
+        background:i===sceneIdx?C.amber:i<sceneIdx?C.dim:C.border,
+        transition:'all 0.25s ease',
+      }}/>)}
+    </div>
+
+    {/* Controls */}
+    <div style={{position:'absolute',bottom:0,left:0,right:0,height:44,background:'rgba(26,20,16,0.92)',
+      backdropFilter:'blur(8px)',borderTop:`1px solid ${C.border}`,display:'flex',alignItems:'center',padding:'0 14px',gap:10}}>
+      <button onClick={toggle} style={{background:'none',border:'none',cursor:'pointer',color:C.text,display:'flex',padding:4}}>
+        {playing?<svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><rect x="1" y="1" width="4" height="12" rx="1"/><rect x="9" y="1" width="4" height="12" rx="1"/></svg>
+          :<svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><polygon points="2,0 13,7 2,14"/></svg>}
+      </button>
+      <button onClick={restart} style={{background:'none',border:'none',cursor:'pointer',color:C.dim,display:'flex',padding:4}}>
+        <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M1 7a6 6 0 1011.5-2.5M1 1v4h4"/></svg>
+      </button>
+      <div onClick={e=>{const r=e.currentTarget.getBoundingClientRect();setElapsed((e.clientX-r.left)/r.width*TOTAL)}}
+        style={{flex:1,height:4,borderRadius:2,background:C.border,cursor:'pointer',position:'relative'}}>
+        <div style={{height:'100%',borderRadius:2,background:C.amber,width:`${tp*100}%`,transition:'width 0.08s linear'}}/>
+        {TL.slice(1).map((s,i)=><div key={i} style={{position:'absolute',top:-1,width:1,height:6,background:C.dim,left:`${(s.start/TOTAL)*100}%`}}/>)}
+      </div>
+      <span className="mono" style={{fontSize:10,color:C.dim,minWidth:70,textAlign:'right'}}>{Math.floor(elapsed/1000)}s / {Math.floor(TOTAL/1000)}s</span>
+      <span className="mono" style={{fontSize:10,color:C.muted,minWidth:70}}>{LABELS[active.id]||''}</span>
+    </div>
+  </div>;
+}
+
+ReactDOM.render(<VideoPlayer/>,document.getElementById('root'));
+</script>
+</body>
+</html>
