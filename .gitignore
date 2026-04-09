@@ -1,5 +1,7 @@
 # Forge runtime state (per-project, not part of the plugin)
 .forge/
+# TUI dashboard log — explicit entry for discoverability (already covered above)
+.forge/.tui-log.jsonl
 
 # OS
 .DS_Store
