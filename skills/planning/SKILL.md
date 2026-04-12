@@ -14,6 +14,8 @@ You will receive:
 - **Depth**: `quick`, `standard`, or `thorough`
 - **Repo config**: From `.forge/config.json` (may include multiple repos with ordering)
 - **Capabilities**: From `.forge/capabilities.json` (optional, informs task design)
+- **Knowledge graph**: `graphify-out/graph.json` (optional, enables architecture-aware decomposition)
+- **Design system**: DESIGN.md (optional, enables design-tagged UI tasks)
 
 ## Procedure
 
@@ -38,6 +40,19 @@ Reference `references/token-profiles.md` for depth-specific settings:
 | TDD enforcement | No | If skill available | Always |
 | Phase verification | Skip | Quick check | Full goal-backward |
 
+### Step 2.5: Load Architecture Context (optional)
+
+**Knowledge Graph**: If `graphify-out/graph.json` exists, load it and extract:
+- God nodes (highest-connectivity concepts) for task prioritization
+- Community structure for aligning task boundaries with module boundaries
+- Cross-module dependencies for implicit dependency edges in the DAG
+
+See `skills/graphify-integration/SKILL.md` for details.
+
+**Design System**: If the spec has a `design:` field or DESIGN.md exists in the project root, load it. UI tasks will be tagged with `design: DESIGN.md` in the frontier, and a design verification task will be added for depth >= standard.
+
+See `skills/design-system/SKILL.md` for details.
+
 ### Step 3: Dispatch Planner Agent Per Spec
 
 For each approved spec, dispatch a **forge-planner** agent (via the `Agent` tool) with:
@@ -45,6 +60,8 @@ For each approved spec, dispatch a **forge-planner** agent (via the `Agent` tool
 - The resolved depth level
 - The repo configuration (which repos are available, their roles and ordering)
 - The capabilities map (which MCP servers and skills are available)
+- The knowledge graph summary (if available: god nodes, communities, key dependencies)
+- The design system reference (if available: DESIGN.md path)
 
 The agent returns a frontier file in the template format. See `templates/plan.md`.
 

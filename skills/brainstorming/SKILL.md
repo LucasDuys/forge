@@ -88,6 +88,23 @@ Tell the user the detected complexity and how many questions you will ask. Examp
 8. What constraints exist? (time, team size, infrastructure)
 9-12. Domain-specific deep-dive questions based on earlier answers
 
+**For projects with UI components, add a design system question:**
+> Does this project have a design system or brand guidelines?
+> A) Yes, I have a DESIGN.md file (specify path)
+> B) I want to base it on an existing brand (e.g., Stripe, Linear, Claude)
+> C) No specific design requirements -- use sensible defaults
+> D) I'll provide design specs later
+
+If option B, generate a DESIGN.md using the template from `skills/design-system/SKILL.md` and write it to the project root. Reference the awesome-design-md catalog (github.com/VoltAgent/awesome-design-md) for established brand design systems.
+
+### Phase 3.5: Knowledge Graph Context (if available)
+
+If `graphify-out/graph.json` exists, load it before proposing approaches:
+1. Query god nodes to understand core architectural concepts
+2. Query community structure to identify module boundaries
+3. Use this context to propose approaches that align with existing architecture
+4. Reference specific modules and dependencies in approach proposals
+
 ### Phase 4: Approach Proposals
 
 After gathering requirements, propose **2-3 approaches** with clear trade-offs:
@@ -126,6 +143,7 @@ status: approved
 created: {YYYY-MM-DD}
 complexity: {simple|medium|complex}
 linked_repos: [{repo names if multi-repo, otherwise empty}]
+design: {path to DESIGN.md if UI project, otherwise omit}
 ---
 
 # {Domain Title} Spec

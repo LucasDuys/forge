@@ -1,7 +1,7 @@
 {
   "name": "forge",
-  "version": "0.1.0",
-  "description": "Autonomous spec-driven development loop for Claude Code. Three commands: brainstorm, plan, execute.",
+  "version": "0.2.0",
+  "description": "Autonomous spec-driven development loop for Claude Code with behavioral guardrails, knowledge graph integration, and design system support.",
   "author": {
     "name": "Lucas Duys"
   },
@@ -12,6 +12,10 @@
     "development",
     "loop",
     "agent",
-    "tdd"
+    "tdd",
+    "karpathy-guardrails",
+    "graphify",
+    "design-system",
+    "knowledge-graph"
   ]
 }

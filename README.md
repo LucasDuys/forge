@@ -49,6 +49,41 @@ claude plugin install forge@forge-marketplace
 
 Then walk away.
 
+## v0.2.0: Guardrails, Knowledge Graphs, Design Systems
+
+Three new cross-cutting skills that make Forge smarter about what it builds, how it plans, and how it reviews.
+
+### Karpathy Guardrails
+
+Behavioral principles from [andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills) baked into every agent. Four rules enforced across the entire pipeline:
+
+1. **Think Before Coding** -- Surface ambiguity before guessing. Flag NEEDS_CONTEXT, not silent assumptions.
+2. **Simplicity First** -- Build only what acceptance criteria require. No speculative features.
+3. **Surgical Changes** -- Every changed line traces to a criterion. No adjacent improvements.
+4. **Goal-Driven Execution** -- Verifiable success criteria before writing code.
+
+The reviewer now flags violations of these principles as IMPORTANT issues.
+
+### Graphify Integration
+
+Optional [graphify](https://github.com/safishamsi/graphify) knowledge graph support. When `graphify-out/graph.json` exists:
+
+- **Planner** aligns task boundaries with community clusters and orders by node connectivity
+- **Researcher** queries the graph for architecture context before external docs
+- **Reviewer** uses the graph for blast radius analysis
+- **Executor** gets focused context (relevant subgraph) instead of the full codebase
+
+Degrades gracefully -- no graph, no change in behavior.
+
+### DESIGN.md Support
+
+Design system integration inspired by [awesome-design-md](https://github.com/VoltAgent/awesome-design-md). When a project has a DESIGN.md:
+
+- **Brainstorm** asks about design requirements and can generate DESIGN.md from brand catalogs
+- **Planner** tags UI tasks with `design:` and adds design verification tasks
+- **Executor** loads design tokens (colors, typography, spacing) as implementation constraints
+- **Reviewer** runs a design compliance pass checking palette, typography, and spacing
+
 ## How it works under the hood
 
 Forge is a state machine that lives inside your Claude Code session. Brainstorm a spec, plan a tier-ordered task DAG, then run an autonomous loop that dispatches parallel executors in git worktrees, gates each task through review and verification, and squash-merges atomically. Hooks watch every tool call to keep tokens in budget, condense test output, cache repeat reads, and trigger auto-backprop when test failures hit a spec gap. State files under `.forge/` are the single source of truth — the TUI dashboard and headless query both read them without writing. Crash recovery rebuilds state from the lock file + checkpoints + git log, so a kernel panic mid-feature is just a `/forge resume` away.

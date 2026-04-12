@@ -10,8 +10,8 @@ to take an idea from concept to working code with minimal human intervention.
 forge/
 ├── .claude-plugin/plugin.json     — Plugin manifest
 ├── commands/                      — Slash commands (/forge brainstorm, plan, execute, etc.)
-├── skills/                        — Procedural workflows (brainstorming, planning, executing, etc.)
-├── agents/                        — Specialized subagents (speccer, planner, executor, reviewer, verifier)
+├── skills/                        — Procedural workflows + cross-cutting skills (guardrails, graphify, design-system)
+├── agents/                        — Specialized subagents (speccer, planner, executor, reviewer, verifier, researcher)
 ├── hooks/                         — Stop hook (loop engine), token monitor (PostToolUse)
 ├── scripts/                       — JS utility (forge-tools.cjs) + bash helpers
 ├── templates/                     — Output file templates (spec, plan, state, summary)
@@ -138,6 +138,31 @@ forge/
 ```
 
 Full schema: `references/config-schema.md`
+
+## New in v0.2.0 (Karpathy + Graphify + Design System)
+
+### Karpathy Behavioral Guardrails
+- `skills/karpathy-guardrails/SKILL.md` — four principles enforced across all agents
+- Think Before Coding, Simplicity First, Surgical Changes, Goal-Driven Execution
+- Executor: checks before coding, builds only what AC requires, traces every changed line
+- Reviewer: flags over-engineering, scope creep, silent assumptions, goal misalignment
+- Planner: rejects gold-plated tasks, enforces one concern per task
+
+### Graphify Knowledge Graph Integration
+- `skills/graphify-integration/SKILL.md` — optional codebase knowledge graph support
+- Planner: aligns task boundaries with community clusters, orders by node connectivity
+- Researcher: queries graph for architecture context before external docs
+- Reviewer: graph-based blast radius analysis
+- Executor: focused context from relevant subgraph
+- Graceful degradation: no graph = standard behavior unchanged
+
+### DESIGN.md Design System Support
+- `skills/design-system/SKILL.md` — design specification integration for UI tasks
+- Brainstorming: asks about design requirements, can generate DESIGN.md from brand catalogs
+- Planning: tags UI tasks with `design:`, adds design verification tasks
+- Execution: loads design tokens as implementation constraints
+- Review: design compliance pass checking palette, typography, spacing
+- Graceful degradation: no DESIGN.md = standard behavior unchanged
 
 ## New Reference Docs
 - `references/config-schema.md` — all config fields with defaults

@@ -40,9 +40,24 @@ Produce a **research report** in this format:
 - Source: {URL or doc reference}
 - Confidence: {HIGH/MEDIUM/LOW}
 
+### Codebase Architecture (Graph)
+{If graphify-out/graph.json exists: god nodes, community structure, relevant subgraph for this task}
+{If no graph: skip this section}
+- God nodes relevant to task: {list}
+- Community: {cluster this task's files belong to}
+- Dependencies discovered: {graph edges not obvious from spec}
+- Blast radius: {downstream consumers of files to be modified}
+
 ### Codebase Conventions (Inferred)
 {How this codebase currently handles similar patterns}
 - Evidence: {file paths and patterns observed}
+
+### Design System Context
+{If DESIGN.md exists: relevant design tokens for this task}
+{If no DESIGN.md: skip this section}
+- Colors: {relevant palette entries}
+- Typography: {relevant type specs}
+- Components: {relevant component styling}
 
 ### Security Considerations
 {OWASP, CVE, or framework-specific security guidance}
@@ -87,6 +102,17 @@ For complex tasks, dispatch parallel research queries:
 2. **Codebase scan**: Grep for existing patterns that handle similar concerns
 3. **Security check**: WebSearch for "{framework} {feature} security best practices OWASP"
 4. **Academic/RFC check** (if applicable): Search Semantic Scholar or arXiv for relevant papers
+
+### Step 3.5: Knowledge Graph Queries (if available)
+
+If `graphify-out/graph.json` exists, query it before scanning the codebase manually. See `skills/graphify-integration/SKILL.md`.
+
+1. **Architecture scan**: Query the graph for the task's target modules to understand their connections
+2. **Impact analysis**: Query paths between the task's target and related concepts to find hidden coupling
+3. **Pattern discovery**: Find similar implementations in the same community to use as templates
+4. **Dependency map**: List all files that import from or export to the task's target files
+
+Graph queries replace manual grep for dependency discovery (more complete, faster). Manual codebase scanning (Step 4) still runs for convention inference since the graph does not capture style details.
 
 ### Step 4: Codebase Convention Inference
 

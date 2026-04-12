@@ -30,10 +30,32 @@ when working on the Forge project.
 **Files it owns:** `references/backprop-patterns.md`
 **Key behavior:** Checks observable truths (not task checkboxes), detects stubs/placeholders, verifies cross-component wiring. Returns PASSED or GAPS_FOUND.
 
+### forge-researcher
+**When to use:** Before complex/unfamiliar tasks during `/forge execute` — research before implementation.
+**Files it owns:** None (produces ephemeral research reports)
+**Key behavior:** Multi-source research: official docs (Context7), codebase conventions, security best practices, knowledge graph queries. Returns structured research reports with source citations.
+
 ### forge-complexity
 **When to use:** On startup of any `/forge` command — auto-detecting task complexity.
 **Files it owns:** `references/complexity-heuristics.md`, `scripts/forge-tools.cjs` (complexity scoring)
 **Key behavior:** Analyzes the task/spec and recommends depth level (quick/standard/thorough). Can be overridden by user flags.
+
+## Skills (Cross-Cutting)
+
+### karpathy-guardrails
+**Files:** `skills/karpathy-guardrails/SKILL.md`
+**Referenced by:** forge-executor, forge-reviewer, forge-planner
+**Purpose:** Four behavioral principles that prevent over-engineering, silent assumptions, scope creep, and unfocused execution. Based on Andrej Karpathy's observations about LLM coding mistakes.
+
+### graphify-integration
+**Files:** `skills/graphify-integration/SKILL.md`
+**Referenced by:** forge-planner, forge-researcher, forge-reviewer, forge-executor
+**Purpose:** Graph-aware planning and research using codebase knowledge graphs. Enables architecture-aware task decomposition, dependency discovery, and context reduction. Optional -- degrades gracefully when no graph is available.
+
+### design-system
+**Files:** `skills/design-system/SKILL.md`
+**Referenced by:** brainstorming skill, forge-planner, forge-executor, forge-reviewer
+**Purpose:** DESIGN.md integration for visual consistency across UI tasks. Supports design-tagged tasks, design compliance review, and design system generation from the awesome-design-md catalog.
 
 ## Routing Rules
 
@@ -44,6 +66,7 @@ when working on the Forge project.
 | User runs `/forge execute` (per task) | forge-executor | Scales with --depth |
 | After task implementation (depth >= standard) | forge-reviewer | standard: 1 pass, thorough: until clean |
 | After all tasks complete | forge-verifier | standard: quick check, thorough: full verification |
+| Before complex tasks (thorough depth, unfamiliar tech) | forge-researcher | Scales with task complexity |
 | On any `/forge` command startup | forge-complexity | Always runs (lightweight) |
 | `/forge backprop` | forge-verifier + forge-speccer | Always thorough |
 
@@ -63,5 +86,7 @@ When context resets at 60%, the handoff includes:
 - `.forge/plans/{spec}-frontier.md` — remaining tasks
 - `.forge/token-ledger.json` — budget remaining
 - `.forge/capabilities.json` — available tools
+- `graphify-out/graph.json` — codebase knowledge graph (if available)
+- `DESIGN.md` — design system specifications (if available)
 
 Each new session reads these files FIRST, then continues from the exact task where the previous session left off. No re-reading completed work.
