@@ -12,6 +12,8 @@ Tests in `tests/state-machine/` should encode each transition listed here.
 | Phase                 | Category    | Agent active | Terminal? |
 |-----------------------|-------------|--------------|-----------|
 | `idle`                | stable      | none         | no        |
+| `brainstorming`       | stable      | speccer      | no        |
+| `planning`            | stable      | planner      | no        |
 | `executing`           | stable      | executor     | no        |
 | `reviewing_branch`    | stable      | reviewer     | no        |
 | `verifying`           | stable      | verifier     | no        |
@@ -27,7 +29,29 @@ Tests in `tests/state-machine/` should encode each transition listed here.
                         |  idle   |<-------------------+
                         +---------+                    |
                              |                         |
+                  /forge brainstorm                    |
+                             |                         |
+                             v                         |
+                     +---------------+                 |
+                     | brainstorming |                 |
+                     +---------------+                 |
+                             |                         |
+                    spec approved by user              |
+                             |                         |
+                             v                         |
+                  /forge plan                          |
+                             |                         |
+                             v                         |
+                       +----------+                    |
+                       | planning |                    |
+                       +----------+                    |
+                             |                         |
+                    frontier written                   |
+                             |                         |
+                             v                         |
                   /forge execute                       |
+                    (validates approved                |
+                     specs + frontiers)                |
                              |                         |
                              v                         |
                        +-----------+                   |
@@ -85,7 +109,11 @@ Tests in `tests/state-machine/` should encode each transition listed here.
 
 | From               | Trigger                          | To                 |
 |--------------------|----------------------------------|--------------------|
-| `idle`             | `/forge execute`                 | `executing`        |
+| `idle`             | `/forge brainstorm`              | `brainstorming`    |
+| `brainstorming`    | user approves spec               | `idle`             |
+| `idle`             | `/forge plan`                    | `planning`         |
+| `planning`         | frontiers written                | `idle`             |
+| `idle`             | `/forge execute` (with approved specs + frontiers) | `executing` |
 | `executing`        | task committed                   | `reviewing_branch` |
 | `executing`        | frontier empty                   | `idle`             |
 | `reviewing_branch` | review pass                      | `verifying`        |

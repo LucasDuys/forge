@@ -42,6 +42,31 @@ Score 0-3 = Simple, 4-7 = Medium, 8+ = Complex.
 
 Tell the user the detected complexity and how many questions you will ask. Example: "This looks like a **medium** complexity project. I'll ask about 8-10 questions to nail down the spec."
 
+### CRITICAL: User Approval Gate
+
+**The brainstorming workflow MUST NOT write a spec file with `status: approved` until the user has EXPLICITLY approved an approach.** This is the primary enforcement mechanism that prevents the Forge pipeline from being bypassed.
+
+The approval gate works as follows:
+1. You MUST ask clarifying questions (Phase 3) before proposing approaches
+2. You MUST present 2-3 approaches with trade-offs (Phase 4)
+3. You MUST wait for the user to explicitly say which approach they want
+4. Only AFTER explicit user approval do you write the spec with `status: approved`
+
+**What counts as explicit approval:**
+- User says "go with A", "I pick approach B", "yes, do that", "approved", "let's go with the second one"
+- User modifies an approach and says "do this version"
+
+**What does NOT count as approval:**
+- User provides no response (do NOT assume approval from silence)
+- User asks a follow-up question (answer it, then re-ask for approval)
+- Agent decides an approach is "obvious" (still must present options and wait)
+- User's original prompt seems to imply a preference (still must confirm explicitly)
+
+**If the user tries to skip brainstorming** (e.g., "just do it", "skip the questions"), respond:
+> The Forge workflow requires a spec with approved requirements before implementation. This prevents wasted work and scope creep. I'll keep the questions brief -- let me ask the most critical ones.
+
+Then ask at minimum 3 questions before proposing approaches.
+
 ### Phase 2: Handle Special Modes
 
 #### --from-code mode
@@ -49,16 +74,16 @@ Tell the user the detected complexity and how many questions you will ask. Examp
 2. Read key files (package.json, config files, main entry points, CLAUDE.md)
 3. Identify the tech stack, architecture patterns, existing conventions
 4. Generate an initial spec draft based on what you find
-5. Present the draft to the user and ask clarifying questions to refine it
-6. Skip to Phase 4 (approach proposals) with the refined spec
+5. Present the draft to the user and **ask at least 3-5 clarifying questions** to refine it
+6. Proceed to Phase 4 (approach proposals) with the refined spec -- do NOT skip the approval gate
 
 #### --from-docs mode
 1. Read all files from the specified PATH (markdown, text, PDF, CSV)
 2. Extract requirements, user stories, acceptance criteria from the documents
 3. Organize into domains and R-numbered requirements
 4. Present the extracted spec to the user for validation
-5. Ask clarifying questions for any ambiguous requirements
-6. Skip to Phase 4 (approach proposals) with the refined spec
+5. **Ask at least 3-5 clarifying questions** for any ambiguous requirements
+6. Proceed to Phase 4 (approach proposals) with the refined spec -- do NOT skip the approval gate
 
 ### Phase 3: Interactive Q&A
 

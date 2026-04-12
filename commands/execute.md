@@ -20,17 +20,33 @@ Launch the autonomous implementation loop. Reads the frontier, implements tasks 
 
 ## Pre-flight Check
 
+**The Forge workflow is strictly sequential: brainstorm -> plan -> execute.** These pre-flight checks enforce that the prior phases completed correctly. If any check fails, stop and tell the user what to run first.
+
 1. Verify `.forge/` exists. If it does not, stop and tell the user:
    > `.forge/` not found. Run `/forge brainstorm` first to generate specifications, then `/forge plan` to create task frontiers.
 
 2. Verify `.forge/specs/` contains at least one spec file. If not, stop and tell the user:
    > No specs found. Run `/forge brainstorm` first.
 
-3. Verify `.forge/plans/` contains at least one `*-frontier.md` file. If not, stop and tell the user:
+3. **Verify ALL spec files have `status: approved` in their YAML frontmatter.** Read each `spec-*.md` file and parse its frontmatter. If ANY spec does not have `status: approved`, stop and tell the user:
+   > Unapproved specs found: {list}. The brainstorm workflow must complete with explicit user approval before execution. Run `/forge brainstorm` and approve an approach.
+
+   This is the critical gate that prevents skipping the interactive brainstorm Q&A. A spec only gets `status: approved` when the brainstorming skill writes it after the user explicitly approves an approach.
+
+4. Verify `.forge/plans/` contains at least one `*-frontier.md` file. If not, stop and tell the user:
    > No task frontiers found. Run `/forge plan` first to decompose specs into tasks.
 
-4. Check for Ralph Loop conflict: if `.claude/ralph-loop.local.md` exists, stop and tell the user:
+5. **Verify each approved spec has a corresponding frontier file.** For each `spec-{domain}.md`, check that `.forge/plans/{domain}-frontier.md` exists. If any spec is missing a frontier, stop:
+   > Spec "{domain}" has no task frontier. Run `/forge plan` to decompose it into tasks.
+
+6. Check for Ralph Loop conflict: if `.claude/ralph-loop.local.md` exists, stop and tell the user:
    > Ralph Loop is active. Run `/cancel-ralph` first — only one loop plugin should be active at a time.
+
+7. **Run programmatic validation** as a final safety check:
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" validate-workflow --forge-dir .forge
+   ```
+   If this returns errors, stop and report them. This validates the same checks in code, preventing agent-level bypasses.
 
 ## Parse Arguments
 

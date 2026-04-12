@@ -19,6 +19,17 @@ forge/
 └── docs/superpowers/specs/        — Design specs for this project
 ```
 
+## Workflow Enforcement (CRITICAL)
+
+The Forge workflow is strictly sequential: **brainstorm -> plan -> execute**. This is enforced at multiple levels:
+
+1. **Spec approval gate**: Only the brainstorming skill writes `status: approved` specs, and only after explicit user approval of an approach. The execute command validates this.
+2. **Frontier requirement**: `/forge execute` validates that every approved spec has a corresponding frontier file from `/forge plan`.
+3. **Programmatic validation**: `forge-tools.cjs setup-state` runs `validateWorkflowPrerequisites()` which checks spec approval status and frontier existence before allowing execution.
+4. **State machine phases**: `brainstorming` and `planning` are formal phases in the state machine (see `references/state-machine.md`).
+
+**Never skip brainstorming.** Even if the user's request seems clear, the interactive Q&A surfaces hidden assumptions, the approach proposals prevent over-engineering, and the approved spec provides verifiable acceptance criteria for the reviewer and verifier.
+
 ## Architecture
 - **Lean plugin** — installable via `claude plugin install forge`, no npm dependency for users
 - **Smart loop** — Stop hook reads state and routes to the correct next action (not dumb re-feed)

@@ -2073,6 +2073,64 @@ ${commitLog || 'No commits found'}
 // reality (git commits, task registry). Auto-fixes simple inconsistencies
 // like a task marked complete in registry but not in state, or vice versa.
 
+/**
+ * Validates that the Forge workflow prerequisites are met before execution.
+ * Enforces: brainstorm (approved specs) -> plan (valid frontiers) -> execute.
+ * Returns an array of error strings. Empty array = all clear.
+ */
+function validateWorkflowPrerequisites(forgeDir) {
+  const errors = [];
+  const specsDir = path.join(forgeDir, 'specs');
+  const plansDir = path.join(forgeDir, 'plans');
+
+  // 1. Check specs directory exists and has spec files
+  if (!fs.existsSync(specsDir)) {
+    errors.push('No specs directory found. Run /forge brainstorm first.');
+    return errors;
+  }
+
+  const specFiles = fs.readdirSync(specsDir).filter(f => f.startsWith('spec-') && f.endsWith('.md'));
+  if (specFiles.length === 0) {
+    errors.push('No spec files found in .forge/specs/. Run /forge brainstorm first.');
+    return errors;
+  }
+
+  // 2. Check ALL spec files have status: approved
+  const unapproved = [];
+  for (const specFile of specFiles) {
+    const content = fs.readFileSync(path.join(specsDir, specFile), 'utf8');
+    const parsed = parseFrontmatter(content);
+    if (!parsed.data || parsed.data.status !== 'approved') {
+      unapproved.push(specFile + ' (status: ' + (parsed.data && parsed.data.status || 'missing') + ')');
+    }
+  }
+  if (unapproved.length > 0) {
+    errors.push('Unapproved specs found: ' + unapproved.join(', ') + '. The brainstorm workflow must complete with user approval before planning/executing.');
+  }
+
+  // 3. Check plans directory exists and has frontier files
+  if (!fs.existsSync(plansDir)) {
+    errors.push('No plans directory found. Run /forge plan first to decompose specs into tasks.');
+    return errors;
+  }
+
+  const frontierFiles = fs.readdirSync(plansDir).filter(f => f.endsWith('-frontier.md'));
+  if (frontierFiles.length === 0) {
+    errors.push('No frontier files found in .forge/plans/. Run /forge plan first.');
+  }
+
+  // 4. Check each approved spec has a corresponding frontier
+  for (const specFile of specFiles) {
+    const domain = specFile.replace(/^spec-/, '').replace(/\.md$/, '');
+    const hasFrontier = frontierFiles.some(f => f.includes(domain));
+    if (!hasFrontier) {
+      errors.push('Spec "' + domain + '" has no corresponding frontier file. Run /forge plan for this spec.');
+    }
+  }
+
+  return errors;
+}
+
 function verifyStateConsistency(forgeDir, state) {
   const issues = [];
   const registry = readTaskRegistry(forgeDir);
@@ -3596,6 +3654,18 @@ if (require.main === module) {
     process.stdout.write(JSON.stringify(caps, null, 2));
   }
 
+  // === Spec approval validation ===
+  // Prevents /forge execute from running without approved specs and valid frontiers.
+  if (command === 'validate-workflow') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const errors = validateWorkflowPrerequisites(forgeDir);
+    if (errors.length > 0) {
+      process.stderr.write(JSON.stringify({ valid: false, errors }));
+      process.exit(1);
+    }
+    process.stdout.write(JSON.stringify({ valid: true }));
+  }
+
   if (command === 'setup-state') {
     const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
     const spec = args.find((a, i) => args[i - 1] === '--spec') || '';
@@ -3604,6 +3674,17 @@ if (require.main === module) {
     const maxIter = args.find((a, i) => args[i - 1] === '--max-iterations') || '100';
     const budget = args.find((a, i) => args[i - 1] === '--token-budget') || '500000';
     const promise = args.find((a, i) => args[i - 1] === '--completion-promise') || 'FORGE_COMPLETE';
+
+    // === WORKFLOW GATE: Validate specs are approved and frontiers exist ===
+    const workflowErrors = validateWorkflowPrerequisites(forgeDir);
+    if (workflowErrors.length > 0) {
+      process.stderr.write('\nForge workflow validation failed:\n');
+      for (const err of workflowErrors) {
+        process.stderr.write('  - ' + err + '\n');
+      }
+      process.stderr.write('\nRun /forge brainstorm first, then /forge plan, then /forge execute.\n');
+      process.exit(1);
+    }
 
     // Create loop state
     const loopState = {
@@ -3874,5 +3955,6 @@ module.exports = {
   getProgressSnapshot, checkProgress, getNoProgressCount,
   verifyStateConsistency,
   runHeadless, queryHeadlessState, HEADLESS_EXIT, HEADLESS_STATUS_SCHEMA_VERSION,
-  performForensicRecovery
+  performForensicRecovery,
+  validateWorkflowPrerequisites
 };
