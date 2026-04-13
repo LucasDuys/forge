@@ -247,21 +247,108 @@ function updateGitInstall(root) {
   return { ok: true, action: 'updated' };
 }
 
+// The upstream GitHub repo URL. Used for marketplace cache updates.
+const UPSTREAM_REPO = 'https://github.com/LucasDuys/forge.git';
+
 function updateMarketplaceInstall(root) {
-  process.stdout.write([
-    'Detected marketplace cache install at:',
-    `  ${root}`,
-    '',
-    'Marketplace installs cannot be updated by this script directly — Claude',
-    'Code manages the cache. Run these in your terminal to update:',
-    '',
-    '  claude plugin marketplace update forge-marketplace',
-    '  claude plugin install forge@forge-marketplace',
-    '',
-    'Then run /reload-plugins inside Claude Code to pick up the new version.',
-    '',
-  ].join('\n'));
-  return { ok: false, reason: 'marketplace install — manual update required', exitCode: 2 };
+  process.stdout.write(`Detected marketplace cache install at:\n  ${root}\n\n`);
+
+  const gitBin = resolveGit();
+  if (!gitBin) {
+    process.stderr.write('git not found — cannot update marketplace install without git.\n');
+    return { ok: false, reason: 'git not found', exitCode: 1 };
+  }
+
+  // Create a temp directory for the clone
+  const os = require('os');
+  const tmpDir = path.join(os.tmpdir(), 'forge-update-' + Date.now());
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  process.stdout.write(`Cloning latest from ${UPSTREAM_REPO}...\n`);
+  const clone = spawnSync(gitBin, ['clone', '--depth', '1', '--single-branch', UPSTREAM_REPO, tmpDir], {
+    encoding: 'utf8', timeout: 120000
+  });
+
+  if (clone.status !== 0) {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+    return { ok: false, reason: `git clone failed: ${(clone.stderr || '').trim()}` };
+  }
+
+  // Read the remote version before copying
+  const remoteVer = readVersion(tmpDir);
+  const localVer = readVersion(root);
+
+  if (remoteVer.ok && localVer.ok && remoteVer.version === localVer.version) {
+    // Check if there are actual file differences despite same version
+    // (version might not have been bumped)
+    const localPluginJson = fs.readFileSync(path.join(root, '.claude-plugin', 'plugin.json'), 'utf8');
+    const remotePluginJson = fs.readFileSync(path.join(tmpDir, '.claude-plugin', 'plugin.json'), 'utf8');
+
+    // Quick diff: compare a few key files
+    let hasChanges = false;
+    const checkFiles = ['scripts/forge-tools.cjs', 'CLAUDE.md', 'agents/forge-executor.md'];
+    for (const f of checkFiles) {
+      try {
+        const local = fs.statSync(path.join(root, f));
+        const remote = fs.statSync(path.join(tmpDir, f));
+        if (local.size !== remote.size) { hasChanges = true; break; }
+      } catch (e) { hasChanges = true; break; }
+    }
+
+    if (!hasChanges) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+      return { ok: true, action: 'already-up-to-date' };
+    }
+  }
+
+  if (args.check) {
+    // Show what would change
+    const gitLog = spawnSync(gitBin, ['log', '--oneline', '-10'], {
+      cwd: tmpDir, encoding: 'utf8'
+    });
+    if (gitLog.ok !== false && gitLog.stdout) {
+      process.stdout.write('\nLatest commits on upstream:\n');
+      process.stdout.write(gitLog.stdout.split('\n').map(l => '  ' + l).join('\n') + '\n');
+    }
+    process.stdout.write(`\nRemote version: ${remoteVer.ok ? remoteVer.version : 'unknown'}\n`);
+    process.stdout.write(`Local version:  ${localVer.ok ? localVer.version : 'unknown'}\n`);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+    return { ok: true, action: 'check-only', updatesAvailable: 1 };
+  }
+
+  // Sync files from clone to marketplace cache (excluding .git)
+  process.stdout.write('Syncing files to plugin cache...\n');
+  try {
+    syncDirectory(tmpDir, root, ['.git', '.forge', 'node_modules']);
+    process.stdout.write('Sync complete.\n');
+  } catch (e) {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e2) {}
+    return { ok: false, reason: `file sync failed: ${e.message}` };
+  }
+
+  // Cleanup temp dir
+  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+
+  return { ok: true, action: 'updated' };
+}
+
+/**
+ * Recursively sync srcDir into destDir, skipping excluded directories.
+ * Creates missing directories, overwrites existing files, adds new files.
+ */
+function syncDirectory(srcDir, destDir, excludes) {
+  const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (excludes.includes(entry.name)) continue;
+    const srcPath = path.join(srcDir, entry.name);
+    const destPath = path.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      fs.mkdirSync(destPath, { recursive: true });
+      syncDirectory(srcPath, destPath, excludes);
+    } else {
+      fs.copyFileSync(srcPath, destPath);
+    }
+  }
 }
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────
