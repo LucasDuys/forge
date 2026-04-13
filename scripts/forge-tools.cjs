@@ -58,9 +58,9 @@ const DEFAULT_CONFIG = {
   // a task that blows past its budget instead of letting it consume the whole
   // session budget. (R001)
   per_task_budget: {
-    quick: 5000,
-    standard: 15000,
-    thorough: 40000
+    quick: 8000,
+    standard: 20000,
+    thorough: 45000
   },
   // When true, internal prompts dispatched to subagents are run through the
   // caveman/terse-prompt skill to reduce token cost. Opt-in until validated
@@ -1012,7 +1012,7 @@ function updateTokenLedger(forgeDir, iterationTokens, lastTranscriptTokens) {
 // === Per-Task Token Budget Ledger (R001) ===
 //
 // Extends token-ledger.json with a `tasks` map keyed by task_id so the loop
-// can enforce per-task ceilings (quick=5k, standard=15k, thorough=40k by
+// can enforce per-task ceilings (quick=8k, standard=20k, thorough=45k by
 // default). Each entry tracks: tokens used, depth, budget snapshot at the
 // time the task was registered, started_at and last_update timestamps.
 //

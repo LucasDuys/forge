@@ -63,4 +63,40 @@ Completion signal: Claude outputs `<promise>FORGE_COMPLETE</promise>` only when 
   DONE: all tasks committed, branch ready, lock released
 ```
 
+## Cross-Cutting Skills (v0.2.0)
+
+Three skills that run automatically across all agents. No explicit invocation needed.
+
+**Karpathy Guardrails** (`skills/karpathy-guardrails/SKILL.md`):
+- Inlined into executor, reviewer, and planner agent definitions
+- Executor: checks for ambiguity before coding, builds only what AC requires, traces every changed line
+- Reviewer: flags over-engineering, scope creep, silent assumptions, goal misalignment as IMPORTANT
+- Planner: rejects gold-plated tasks, enforces one concern per task
+
+**Graphify Integration** (`skills/graphify-integration/SKILL.md`):
+- Auto-detected by brainstorm, plan, and execute commands (checks for `graphify-out/graph.json`)
+- Stored in `state.md` frontmatter as `knowledge_graph:` path
+- Planner: aligns task boundaries with community clusters, orders by node connectivity
+- Researcher: queries graph for architecture context before external docs
+- Reviewer: graph-based blast radius analysis
+- Executor: focused context from relevant subgraph instead of full codebase scan
+- Degrades gracefully: no graph = standard behavior unchanged
+
+**DESIGN.md Support** (`skills/design-system/SKILL.md`):
+- Auto-detected by brainstorm, plan, and execute commands (checks for DESIGN.md in project root)
+- Stored in `state.md` frontmatter as `design_system:` path
+- Brainstorm: asks about design requirements, can generate DESIGN.md from brand catalogs
+- Planner: tags UI tasks with `design:`, adds design verification task
+- Executor: loads design tokens as implementation constraints
+- Reviewer: design compliance pass checking palette, typography, spacing
+- Degrades gracefully: no DESIGN.md = standard behavior unchanged
+
+## Workflow Enforcement (v0.2.0)
+
+The pipeline is strictly sequential: brainstorm -> plan -> execute. Enforced at multiple levels:
+- **Spec approval gate**: Only brainstorming writes `status: approved` after explicit user approval
+- **Frontier requirement**: `/forge execute` validates each spec has a frontier
+- **Programmatic validation**: `validateWorkflowPrerequisites()` runs in `setup-state` before execution starts
+- **State machine phases**: `brainstorming` and `planning` are formal phases
+
 See also: [state-machine.md](../references/state-machine.md) for full phase transition diagram.

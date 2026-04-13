@@ -88,7 +88,7 @@ The Forge workflow is strictly sequential: **brainstorm -> plan -> execute**. Th
 ## New in v2.1 (GSD-2 + Caveman Integration)
 
 ### Token Budgets with Hard Ceilings
-- Per-task budgets: quick=5k, standard=15k, thorough=40k (configurable via `per_task_budget`)
+- Per-task budgets: quick=8k, standard=20k, thorough=45k (configurable via `per_task_budget`)
 - Session budget: `session_budget_tokens` (default 500000)
 - Enforced at every state machine transition via `checkSessionBudget()`
 - At 80% per-task: warning injected into next prompt
@@ -141,7 +141,7 @@ The Forge workflow is strictly sequential: **brainstorm -> plan -> execute**. Th
 ```json
 {
   "session_budget_tokens": 500000,
-  "per_task_budget": { "quick": 5000, "standard": 15000, "thorough": 40000 },
+  "per_task_budget": { "quick": 8000, "standard": 20000, "thorough": 45000 },
   "terse_internal": false,
   "use_worktrees": true,
   "headless_notify_url": null

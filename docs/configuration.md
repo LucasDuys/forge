@@ -11,9 +11,9 @@
   "token_budget": 500000,
   "session_budget_tokens": 500000,
   "per_task_budget": {
-    "quick":    5000,
-    "standard": 15000,
-    "thorough": 40000
+    "quick":    8000,
+    "standard": 20000,
+    "thorough": 45000
   },
   "terse_internal": false,
   "use_worktrees": true,
@@ -28,8 +28,11 @@ See [config-schema.md](../references/config-schema.md) for the full field refere
 ```
 forge/
   commands/           Slash commands (brainstorm, plan, execute, resume, backprop, status)
-  skills/             Procedural workflows (brainstorming, planning, executing, reviewing)
+  skills/             Procedural workflows + cross-cutting skills
     caveman-internal/   Token optimization skill (adapted from JuliusBrussee/caveman)
+    karpathy-guardrails/ Behavioral guardrails (auto-enforced by executor, reviewer, planner)
+    graphify-integration/ Knowledge graph support (auto-detected, graceful degradation)
+    design-system/      DESIGN.md integration (auto-detected, graceful degradation)
   agents/             Specialized subagents with model routing + artifact contracts
   hooks/              Self-prompting engine (stop hook state machine + token hooks)
   scripts/            Core utilities (state machine, routing, budgeting, locks, worktrees)

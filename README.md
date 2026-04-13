@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/LucasDuys/forge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
   <a href="https://github.com/LucasDuys/forge/stargazers"><img src="https://img.shields.io/github/stars/LucasDuys/forge?style=flat" alt="Stars"></a>
-  <a href="https://github.com/LucasDuys/forge/releases"><img src="https://img.shields.io/badge/version-2.1-green" alt="Version"></a>
+  <a href="https://github.com/LucasDuys/forge/releases"><img src="https://img.shields.io/badge/version-0.2.0-green" alt="Version"></a>
   <a href="https://github.com/LucasDuys/forge/tree/main/docs"><img src="https://img.shields.io/badge/tests-100%20passing-brightgreen" alt="Tests"></a>
   <a href="https://lucasduys.github.io/forge/"><img src="https://img.shields.io/badge/docs-architecture_video-orange" alt="Docs"></a>
 </p>
@@ -83,6 +83,17 @@ Design system integration inspired by [awesome-design-md](https://github.com/Vol
 - **Planner** tags UI tasks with `design:` and adds design verification tasks
 - **Executor** loads design tokens (colors, typography, spacing) as implementation constraints
 - **Reviewer** runs a design compliance pass checking palette, typography, and spacing
+
+### Workflow Enforcement
+
+The pipeline is strictly sequential: **brainstorm -> plan -> execute**. This is enforced programmatically, not just by convention:
+
+- `/forge execute` validates that all specs have `status: approved` (set only after user explicitly approves an approach during brainstorming)
+- `/forge execute` validates that every spec has a corresponding frontier from `/forge plan`
+- `setup-state` runs `validateWorkflowPrerequisites()` before allowing execution to start
+- Brainstorming requires minimum 3 clarifying questions and explicit user approval, even with `--from-code`
+
+You cannot skip brainstorming, skip planning, or bypass the approval gate. The whole point is that the spec is the contract.
 
 ## How it works under the hood
 

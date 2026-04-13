@@ -49,18 +49,18 @@ budget.
 ```json
 {
   "per_task_budget": {
-    "quick": 5000,
-    "standard": 15000,
-    "thorough": 40000
+    "quick": 8000,
+    "standard": 20000,
+    "thorough": 45000
   }
 }
 ```
 
 | Sub-field | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `quick` | number | `5000` | Token ceiling for tasks at `quick` depth. |
-| `standard` | number | `15000` | Token ceiling for tasks at `standard` depth. |
-| `thorough` | number | `40000` | Token ceiling for tasks at `thorough` depth. |
+| `quick` | number | `8000` | Token ceiling for tasks at `quick` depth. Increased from 5000 in v0.2.0 to accommodate agent context growth from cross-cutting skills (guardrails, graphify, design-system). |
+| `standard` | number | `20000` | Token ceiling for tasks at `standard` depth. Increased from 15000 in v0.2.0 to provide headroom for review iterations with new guardrail checks. |
+| `thorough` | number | `45000` | Token ceiling for tasks at `thorough` depth. Increased from 40000 in v0.2.0 to support multi-pass review with design compliance and guardrail enforcement. |
 
 ## `cross_repo_rules`
 
