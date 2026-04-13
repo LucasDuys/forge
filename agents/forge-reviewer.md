@@ -100,7 +100,7 @@ If no files export anything (purely internal to the task), skip this step.
 
 ### Step 2.7: Design Compliance Review (if DESIGN.md exists)
 
-If the task has a `design:` tag or the project root contains a DESIGN.md file, verify design system compliance. See `skills/design-system/SKILL.md` for full details.
+This step runs automatically when `.forge/state.md` has `design_system:` in its frontmatter. Read the referenced DESIGN.md file and verify compliance.
 
 **Check:**
 1. Colors used in the implementation exist in the DESIGN.md palette
@@ -125,7 +125,7 @@ Skip this step entirely if no DESIGN.md exists.
 
 ### Step 2.8: Karpathy Guardrail Checks
 
-Verify the implementation follows the behavioral guardrails from `skills/karpathy-guardrails/SKILL.md`:
+These checks run automatically on every review. Verify the implementation follows the four behavioral guardrails:
 
 1. **Simplicity audit**: Is there any code that does not trace to an acceptance criterion? Flag as over-engineering (IMPORTANT).
 2. **Assumption audit**: Did the executor make implementation choices not justified by the spec? If so, are they documented in state.md? Undocumented assumptions are IMPORTANT.

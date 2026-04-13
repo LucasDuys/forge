@@ -35,6 +35,23 @@ If `--depth` is not provided and the project config has `auto_detect_depth: true
 1. Read `.forge/config.json` for project settings (repos, depth, cross_repo_rules).
 2. Read `.forge/capabilities.json` if it exists, to inform the planner about available MCP servers and skills.
 
+## Auto-Detect Project Context
+
+These checks run automatically before planning. Do not skip them.
+
+**Knowledge graph:** Check if `graphify-out/graph.json` exists. If found, read it and extract:
+- God nodes (top 5-10 highest-connectivity concepts)
+- Community structure (number of clusters, their dominant themes)
+- Cross-community edges (potential integration points)
+
+Pass this summary to the planner agent. The planner uses it to align task boundaries with module boundaries and order tasks by architectural impact.
+
+**Design system:** Check if `DESIGN.md`, `design.md`, or `docs/DESIGN.md` exists. If found, check each spec for UI-related requirements. For specs with UI tasks:
+- Pass the DESIGN.md path to the planner
+- The planner will tag UI tasks with `design: DESIGN.md` and add a design verification task
+
+Neither is required. If absent, planning proceeds with standard spec-only decomposition.
+
 ## Invoke Planning
 
 Invoke the **forge:planning** skill with the following context:
@@ -42,6 +59,8 @@ Invoke the **forge:planning** skill with the following context:
 - The resolved depth level
 - The repo configuration (filtered if `--repos` was used)
 - Capabilities (if discovered)
+- Knowledge graph summary (if `graphify-out/graph.json` exists)
+- Design system path (if DESIGN.md exists)
 
 The planning skill will:
 1. Dispatch a **forge-planner** agent for each spec

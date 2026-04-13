@@ -41,8 +41,8 @@ Produce a **research report** in this format:
 - Confidence: {HIGH/MEDIUM/LOW}
 
 ### Codebase Architecture (Graph)
-{If graphify-out/graph.json exists: god nodes, community structure, relevant subgraph for this task}
-{If no graph: skip this section}
+{Auto-populated when .forge/state.md has knowledge_graph: set. Read graphify-out/graph.json and extract relevant subgraph.}
+{If state.md has no knowledge_graph field: skip this section}
 - God nodes relevant to task: {list}
 - Community: {cluster this task's files belong to}
 - Dependencies discovered: {graph edges not obvious from spec}
@@ -53,8 +53,8 @@ Produce a **research report** in this format:
 - Evidence: {file paths and patterns observed}
 
 ### Design System Context
-{If DESIGN.md exists: relevant design tokens for this task}
-{If no DESIGN.md: skip this section}
+{Auto-populated when .forge/state.md has design_system: set. Read the DESIGN.md file.}
+{If state.md has no design_system field: skip this section}
 - Colors: {relevant palette entries}
 - Typography: {relevant type specs}
 - Components: {relevant component styling}
@@ -103,9 +103,9 @@ For complex tasks, dispatch parallel research queries:
 3. **Security check**: WebSearch for "{framework} {feature} security best practices OWASP"
 4. **Academic/RFC check** (if applicable): Search Semantic Scholar or arXiv for relevant papers
 
-### Step 3.5: Knowledge Graph Queries (if available)
+### Step 3.5: Knowledge Graph Queries (runs automatically when graph available)
 
-If `graphify-out/graph.json` exists, query it before scanning the codebase manually. See `skills/graphify-integration/SKILL.md`.
+If `.forge/state.md` has `knowledge_graph:` in its frontmatter, read `graphify-out/graph.json` and query it before scanning the codebase manually.
 
 1. **Architecture scan**: Query the graph for the task's target modules to understand their connections
 2. **Impact analysis**: Query paths between the task's target and related concepts to find hidden coupling

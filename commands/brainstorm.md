@@ -24,11 +24,21 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" discover --forge-dir .forge
 
 This writes `.forge/capabilities.json` with available tools that can enhance brainstorming and execution.
 
+## Step 2.5: Auto-Detect Project Context
+
+Before starting the interactive Q&A, automatically detect available context:
+
+**Design system:** Check if `DESIGN.md`, `design.md`, or `docs/DESIGN.md` exists. If found, pass its path to the brainstorming skill so it can reference existing design constraints in the spec. If not found, the brainstorming skill will ask whether the user wants one (for UI projects).
+
+**Knowledge graph:** Check if `graphify-out/graph.json` exists. If found, load the god nodes and community structure to inform the brainstorming Q&A with architecture context. This helps propose approaches that align with existing codebase structure.
+
+Neither requires any user action. Detection is automatic and silent.
+
 ## Step 3: Start brainstorming
 
 **IMPORTANT: The brainstorm phase is mandatory before planning and execution.** The spec files produced by this workflow are the ONLY way to get `status: approved` specs, which are required by `/forge plan` and `/forge execute`. Do NOT skip this step. Do NOT write spec files directly without going through the full interactive brainstorm flow.
 
-Now invoke the `forge:brainstorming` skill with the user's arguments.
+Now invoke the `forge:brainstorming` skill with the user's arguments, plus any auto-detected context (design system path, graph summary).
 
 **User arguments:** $ARGUMENTS
 

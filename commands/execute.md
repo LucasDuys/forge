@@ -69,6 +69,16 @@ If a flag is not provided, fall back to `.forge/config.json`, then to the built-
 3. Read all frontier files from `.forge/plans/` (filtered by `--filter` if provided).
 4. Identify the first spec to execute: use `--filter` domain if given, otherwise the first frontier file alphabetically.
 
+## Auto-Detect Project Context
+
+These checks run automatically. Do not skip them.
+
+**Design system:** Check if `DESIGN.md`, `design.md`, or `docs/DESIGN.md` exists in the project root. If found, read it and store the path in `.forge/state.md` frontmatter as `design_system: {path}`. All UI tasks will automatically receive design constraints during execution and review.
+
+**Knowledge graph:** Check if `graphify-out/graph.json` exists. If found, note it in `.forge/state.md` frontmatter as `knowledge_graph: graphify-out/graph.json`. The executor will use it for focused context loading, the reviewer for blast radius analysis.
+
+Neither is required. If absent, execution proceeds with standard behavior. If present, they enhance every task automatically without any user action.
+
 ## Initialize Loop State
 
 Run `setup-state` to create `.forge/.forge-loop.json` and prepare `.forge/state.md` for execution:

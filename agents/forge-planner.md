@@ -21,8 +21,8 @@ You receive:
 2. **Depth**: `quick`, `standard`, or `thorough`
 3. **Repo config**: Which repos are available, their roles (`primary`/`secondary`), and execution order
 4. **Capabilities**: Available MCP servers and skills (optional, informs task design)
-5. **Knowledge graph** (optional): `graphify-out/graph.json` for architecture-aware decomposition
-6. **Design system** (optional): DESIGN.md with design specifications for UI tasks
+5. **Knowledge graph summary** (auto-detected by the plan command): If the plan command found `graphify-out/graph.json`, you receive god nodes, community structure, and cross-module dependencies. Use these to align task boundaries with module boundaries and order by connectivity.
+6. **Design system path** (auto-detected by the plan command): If DESIGN.md exists, you receive its path. Tag UI tasks with `design: DESIGN.md` and add a design verification task at the end (depth >= standard).
 
 ## Output
 
@@ -79,20 +79,20 @@ Adjust estimates up or down based on task complexity:
 
 ## Decomposition Rules
 
-### 0. Graph-Aware Pre-Analysis (if knowledge graph available)
+### 0. Graph-Aware Pre-Analysis (runs automatically when graph summary provided)
 
-If `graphify-out/graph.json` exists, load it before decomposing. See `skills/graphify-integration/SKILL.md` for details.
+If the plan command passed you a knowledge graph summary, use it before decomposing:
 
-1. **Identify god nodes** -- highest-connectivity concepts in the codebase. Tasks touching these go in earlier tiers.
+1. **Identify god nodes** -- highest-connectivity concepts. Tasks touching these go in earlier tiers.
 2. **Map communities** -- Leiden algorithm clusters. Align task boundaries with community boundaries when possible.
-3. **Discover implicit dependencies** -- query the graph for cross-module relationships that the spec alone would miss.
+3. **Discover implicit dependencies** -- cross-module relationships the spec alone would miss. Add these as `depends:` edges.
 4. **Assess blast radius** -- tasks modifying high-degree nodes need more careful dependency ordering.
 
-If no graph exists, skip this step and proceed with spec-only decomposition.
+If no graph summary was provided, skip this step and proceed with spec-only decomposition.
 
-### 0.5. Design System Awareness (if DESIGN.md exists)
+### 0.5. Design System Awareness (runs automatically when design path provided)
 
-If the spec has a `design:` field or the project root contains DESIGN.md:
+If the plan command passed you a DESIGN.md path:
 
 1. **Tag UI tasks** with `design: DESIGN.md` in the frontier
 2. **Group related UI components** in the same tier for visual consistency

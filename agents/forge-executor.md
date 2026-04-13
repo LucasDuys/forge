@@ -141,9 +141,18 @@ Before writing any code:
 1. **Read the spec** for the R-numbered requirements this task covers. Extract the exact acceptance criteria checkboxes. **Write checkpoint:** `current_step: spec_loaded`.
 2. **Read the frontier** to understand dependencies — what prior tasks produced, what files they created or modified.
 3. **Read repo conventions** — find CLAUDE.md, .editorconfig, linting config, test config.
-4. **Load design system** (if task has `design:` tag) — read the referenced DESIGN.md and extract relevant design tokens (colors, typography, spacing, component specs). See `skills/design-system/SKILL.md`.
-5. **Query knowledge graph** (if `graphify-out/graph.json` exists) — query the graph for files and concepts related to your task to build focused context instead of scanning the entire codebase. See `skills/graphify-integration/SKILL.md`.
-4. **Auto-detect conventions** (critical for legacy codebases). Even if CLAUDE.md exists, verify it matches reality. If CLAUDE.md is absent, this step is mandatory:
+4. **Load design system** (auto-detected by the execute command). If `.forge/state.md` has `design_system:` in its frontmatter, read that file and extract design tokens relevant to your task:
+   - Color palette entries for the component you are building
+   - Typography specs (font, size, weight) for text elements
+   - Spacing scale (base unit and multiples) for layout
+   - Component styling (border-radius, shadows) for interactive elements
+   Use ONLY values from the design system. No ad-hoc hex colors, no custom font sizes, no magic pixel values. The reviewer will flag violations.
+5. **Load knowledge graph context** (auto-detected by the execute command). If `.forge/state.md` has `knowledge_graph:` in its frontmatter, use the graph for focused context instead of full codebase scanning:
+   - Search graph nodes for your task's target files/modules
+   - Identify downstream dependents of files you will modify (blast radius)
+   - Find existing implementations in the same community cluster as templates
+   This replaces broad codebase grep with targeted subgraph queries. Skip if no graph.
+6. **Auto-detect conventions** (critical for legacy codebases). Even if CLAUDE.md exists, verify it matches reality. If CLAUDE.md is absent, this step is mandatory:
 
    **Import style**: grep for `import.*from` vs `require(` in 10 recent src/ files. Use whichever is dominant.
    **Naming**: Sample 5-10 files. Check variables (camelCase vs snake_case), files (kebab-case vs PascalCase), constants (UPPER_CASE vs camelCase).
@@ -154,7 +163,7 @@ Before writing any code:
 
    **Critical rule for legacy code:** If the codebase uses patterns that differ from modern best practices (callbacks instead of async/await, var instead of const, jQuery instead of React), **follow the existing conventions**. Consistency within a codebase is more important than modernity. Only modernize if the spec explicitly requires it. Document any convention conflicts in state.md under "Key Decisions."
 
-5. **Scan existing code** for patterns. If implementing a new endpoint, find an existing endpoint and follow its structure exactly. If adding a new component, match the existing component patterns.
+7. **Scan existing code** for patterns. If implementing a new endpoint, find an existing endpoint and follow its structure exactly. If adding a new component, match the existing component patterns.
 
 ### 1.6 Research Before Implementing (complex/unfamiliar tasks)
 
