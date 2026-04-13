@@ -37,6 +37,7 @@ check_tool "supabase"    "supabase --version"       "winget install Supabase.CLI
 check_tool "firebase"    "firebase --version"       "npm i -g firebase-tools"                          "App hosting, Firestore, cloud functions"
 check_tool "docker"      "docker --version"         "winget install Docker.DockerDesktop"              "Container management"
 check_tool "wrangler"    "wrangler --version"       "npm i -g wrangler"                                "Cloudflare Workers, KV"
+check_tool "graphify"     "graphify -h"              "pip install graphifyy"                             "Codebase knowledge graphs for architecture-aware planning"
 check_tool "cli-anything" "cli-anything --version"  "pip install cli-anything"                         "Agent-native CLIs for desktop software"
 
 echo -e "$tools_status"

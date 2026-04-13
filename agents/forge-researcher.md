@@ -105,12 +105,20 @@ For complex tasks, dispatch parallel research queries:
 
 ### Step 3.5: Knowledge Graph Queries (runs automatically when graph available)
 
-If `.forge/state.md` has `knowledge_graph:` in its frontmatter, read `graphify-out/graph.json` and query it before scanning the codebase manually.
+If `.forge/state.md` has `knowledge_graph:` in its frontmatter, use the graph CLI commands before scanning the codebase manually:
 
-1. **Architecture scan**: Query the graph for the task's target modules to understand their connections
-2. **Impact analysis**: Query paths between the task's target and related concepts to find hidden coupling
-3. **Pattern discovery**: Find similar implementations in the same community to use as templates
-4. **Dependency map**: List all files that import from or export to the task's target files
+1. **Architecture scan**: Get the overall structure and identify core concepts:
+   ```bash
+   node scripts/forge-tools.cjs graph-summary --graph graphify-out/graph.json
+   ```
+2. **Target context**: Query for nodes related to the task's target module:
+   ```bash
+   node scripts/forge-tools.cjs graph-query --graph graphify-out/graph.json --term "{module-name}"
+   ```
+3. **Dependency map**: List all files that depend on the task's target files:
+   ```bash
+   node scripts/forge-tools.cjs graph-dependents --graph graphify-out/graph.json --file "{target-file}"
+   ```
 
 Graph queries replace manual grep for dependency discovery (more complete, faster). Manual codebase scanning (Step 4) still runs for convention inference since the graph does not capture style details.
 

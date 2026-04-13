@@ -15,29 +15,46 @@ Graphify integration is **optional but recommended** for projects with:
 - Cross-component dependencies
 - Unfamiliar codebases (new contributor scenario)
 
-## Detection
+## Installation
 
-At the start of `/forge plan` or `/forge execute`, check for an existing knowledge graph:
-
-```bash
-# Check for existing graphify output
-ls graphify-out/graph.json 2>/dev/null
-```
-
-If `graph.json` exists, load it. If not, check if graphify is available:
+Graphify is bundled as part of Forge's tool ecosystem. Install via:
 
 ```bash
-# Check if graphify is installed as a skill or CLI
-which graphify 2>/dev/null || python -m graphify --help 2>/dev/null
+pip install graphifyy
 ```
 
-If graphify is available but no graph exists, suggest generating one:
-```
-Note: No knowledge graph found. Run `graphify .` to build one for architecture-aware planning.
-Proceeding without graph context.
+Or use `/forge setup-tools` which detects and offers to install graphify automatically.
+
+## Detection and Auto-Build
+
+At the start of `/forge plan` or `/forge execute`, the commands auto-detect and build:
+
+```bash
+# Check if graphify is installed
+node scripts/forge-tools.cjs graph-status
+
+# If installed and no graph exists, build one automatically
+node scripts/forge-tools.cjs graph-build --project-dir .
+
+# Extract summary for planning context (god nodes, communities, stats)
+node scripts/forge-tools.cjs graph-summary --graph graphify-out/graph.json
 ```
 
-Never block on graph availability. All graph-enhanced features degrade gracefully to standard behavior when no graph is present.
+The build runs `graphify .` which processes the codebase through: detect -> extract (tree-sitter AST) -> build (NetworkX) -> cluster (Leiden) -> analyze -> export. Output goes to `graphify-out/` (graph.json, graph.html, GRAPH_REPORT.md).
+
+Never block on graph availability. If graphify is not installed or the build fails, all commands proceed with standard behavior.
+
+## CLI Commands
+
+Agents use these node one-liners to query the graph (no Python needed at query time):
+
+| Command | Purpose |
+|---------|---------|
+| `graph-status` | Check if graphify CLI is installed |
+| `graph-build --project-dir .` | Build knowledge graph from codebase |
+| `graph-summary --graph graphify-out/graph.json` | Get god nodes, communities, stats |
+| `graph-query --graph graphify-out/graph.json --term "auth"` | Search for nodes matching a term |
+| `graph-dependents --graph graphify-out/graph.json --file "src/auth.ts"` | Find all files that depend on a file |
 
 ## Graph-Enhanced Planning
 

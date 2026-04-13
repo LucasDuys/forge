@@ -58,7 +58,11 @@ Before reviewing code quality, verify that changes do not break code outside the
 
 **For each file modified that exports functions, classes, types, or constants:**
 
-1. **Find all dependents:**
+1. **Find all dependents.** If a knowledge graph is available (`.forge/state.md` has `knowledge_graph:`), use it first -- it's faster and more complete than grep:
+   ```bash
+   node scripts/forge-tools.cjs graph-dependents --graph graphify-out/graph.json --file "{modified-file}"
+   ```
+   If no graph, fall back to grep:
    ```
    grep -r "from.*{modified-file}" src/ --include="*.{js,ts,jsx,tsx,py}"
    grep -r "require.*{modified-file}" src/ --include="*.{js,ts,jsx,tsx}"

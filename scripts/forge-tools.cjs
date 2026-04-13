@@ -1823,6 +1823,7 @@ function discoverCapabilities(projectDir, claudeJsonPath) {
     { name: 'firebase', check: 'firebase --version', use_for: 'app hosting, auth, Firestore, and cloud functions' },
     { name: 'docker', check: 'docker --version', use_for: 'container management and isolated environments' },
     { name: 'wrangler', check: 'wrangler --version', use_for: 'Cloudflare Workers deployment and KV management' },
+    { name: 'graphify', check: 'graphify -h', use_for: 'codebase knowledge graphs for architecture-aware planning' },
   ];
 
   caps.cli_tools = {};
@@ -3666,6 +3667,46 @@ if (require.main === module) {
     process.stdout.write(JSON.stringify({ valid: true }));
   }
 
+  // === Graphify CLI commands ===
+  // Agents call these via: node scripts/forge-tools.cjs graph-{cmd} [args]
+
+  if (command === 'graph-status') {
+    const result = graphifyAvailable();
+    process.stdout.write(JSON.stringify(result));
+  }
+
+  if (command === 'graph-build') {
+    const projectDir = args.find((a, i) => args[i - 1] === '--project-dir') || '.';
+    const result = graphifyBuild(projectDir);
+    process.stdout.write(JSON.stringify(result));
+    process.exit(result.success ? 0 : 1);
+  }
+
+  if (command === 'graph-summary') {
+    const graphPath = args.find((a, i) => args[i - 1] === '--graph') || 'graphify-out/graph.json';
+    const result = graphifySummary(graphPath);
+    if (result) {
+      process.stdout.write(JSON.stringify(result, null, 2));
+    } else {
+      process.stderr.write('Could not load or parse graph at: ' + graphPath);
+      process.exit(1);
+    }
+  }
+
+  if (command === 'graph-query') {
+    const graphPath = args.find((a, i) => args[i - 1] === '--graph') || 'graphify-out/graph.json';
+    const term = args.find((a, i) => args[i - 1] === '--term') || args[args.length - 1] || '';
+    const result = graphifyQuery(graphPath, term);
+    process.stdout.write(JSON.stringify(result, null, 2));
+  }
+
+  if (command === 'graph-dependents') {
+    const graphPath = args.find((a, i) => args[i - 1] === '--graph') || 'graphify-out/graph.json';
+    const file = args.find((a, i) => args[i - 1] === '--file') || '';
+    const result = graphifyDependents(graphPath, file);
+    process.stdout.write(JSON.stringify(result, null, 2));
+  }
+
   if (command === 'setup-state') {
     const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
     const spec = args.find((a, i) => args[i - 1] === '--spec') || '';
@@ -3929,6 +3970,203 @@ if (require.main === module) {
   }
 }
 
+// ============================================================
+// Graphify Integration — codebase knowledge graph operations
+// ============================================================
+// These functions shell out to the `graphify` CLI (pip install graphifyy).
+// All functions degrade gracefully if graphify is not installed.
+
+/**
+ * Check if graphify is installed and available.
+ * Returns { available: boolean, version?: string }
+ */
+function graphifyAvailable() {
+  try {
+    const out = execSync('graphify -h', { stdio: 'pipe', timeout: 5000 }).toString();
+    return { available: true };
+  } catch (e) {
+    return { available: false };
+  }
+}
+
+/**
+ * Build a knowledge graph from the project directory.
+ * Calls `graphify .` which runs: detect -> extract -> build -> cluster -> analyze -> export.
+ * Output goes to graphify-out/ (graph.json, graph.html, GRAPH_REPORT.md).
+ * Returns { success: boolean, graphPath?: string, error?: string }
+ */
+function graphifyBuild(projectDir) {
+  if (!graphifyAvailable().available) {
+    return { success: false, error: 'graphify not installed. Run: pip install graphifyy' };
+  }
+  try {
+    execSync('graphify .', { cwd: projectDir, stdio: 'pipe', timeout: 300000 }); // 5 min timeout
+    const graphPath = path.join(projectDir, 'graphify-out', 'graph.json');
+    if (fs.existsSync(graphPath)) {
+      return { success: true, graphPath };
+    }
+    return { success: false, error: 'graphify ran but graph.json was not produced' };
+  } catch (e) {
+    return { success: false, error: String(e.message || e).slice(0, 500) };
+  }
+}
+
+/**
+ * Load graph.json and extract a compact summary for planning context.
+ * Returns god nodes, community structure, and basic stats without loading
+ * the full graph into LLM context.
+ * Returns { nodes, edges, communities, godNodes, stats } or null.
+ */
+function graphifySummary(graphJsonPath) {
+  try {
+    const raw = fs.readFileSync(graphJsonPath, 'utf8');
+    const graph = JSON.parse(raw);
+    const nodes = graph.nodes || [];
+    const links = graph.links || graph.edges || [];
+
+    // Count communities
+    const communityMap = {};
+    for (const n of nodes) {
+      const c = n.community != null ? n.community : 'unclustered';
+      if (!communityMap[c]) communityMap[c] = [];
+      communityMap[c].push(n.label || n.id);
+    }
+
+    // Compute degree per node
+    const degree = {};
+    for (const e of links) {
+      degree[e.source] = (degree[e.source] || 0) + 1;
+      degree[e.target] = (degree[e.target] || 0) + 1;
+    }
+
+    // God nodes = top 10 by degree
+    const godNodes = Object.entries(degree)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([id, deg]) => {
+        const node = nodes.find(n => n.id === id);
+        return {
+          id,
+          label: node ? (node.label || id) : id,
+          degree: deg,
+          community: node ? node.community : null,
+          source: node ? node.source_file || node.source : null
+        };
+      });
+
+    // Community summary
+    const communities = Object.entries(communityMap)
+      .sort((a, b) => b[1].length - a[1].length)
+      .map(([id, members]) => ({
+        id,
+        size: members.length,
+        sample: members.slice(0, 5)
+      }));
+
+    // Confidence breakdown
+    const confidence = { EXTRACTED: 0, INFERRED: 0, AMBIGUOUS: 0 };
+    for (const e of links) {
+      const c = (e.confidence || 'EXTRACTED').toUpperCase();
+      confidence[c] = (confidence[c] || 0) + 1;
+    }
+
+    return {
+      stats: {
+        nodes: nodes.length,
+        edges: links.length,
+        communities: Object.keys(communityMap).length,
+        confidence
+      },
+      godNodes,
+      communities: communities.slice(0, 15) // top 15 communities
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Query the graph for nodes related to a search term.
+ * Uses simple label/source matching (no LLM needed).
+ * Returns matching nodes with their neighbors and community context.
+ */
+function graphifyQuery(graphJsonPath, searchTerm) {
+  try {
+    const raw = fs.readFileSync(graphJsonPath, 'utf8');
+    const graph = JSON.parse(raw);
+    const nodes = graph.nodes || [];
+    const links = graph.links || graph.edges || [];
+    const term = searchTerm.toLowerCase();
+
+    // Find matching nodes
+    const matches = nodes.filter(n => {
+      const label = (n.label || '').toLowerCase();
+      const source = (n.source_file || n.source || '').toLowerCase();
+      return label.includes(term) || source.includes(term);
+    });
+
+    // For each match, find neighbors
+    const results = matches.slice(0, 20).map(node => {
+      const neighbors = [];
+      for (const e of links) {
+        if (e.source === node.id) {
+          const target = nodes.find(n => n.id === e.target);
+          neighbors.push({ label: target ? target.label : e.target, type: e.type, direction: 'outgoing' });
+        } else if (e.target === node.id) {
+          const source = nodes.find(n => n.id === e.source);
+          neighbors.push({ label: source ? source.label : e.source, type: e.type, direction: 'incoming' });
+        }
+      }
+      return {
+        label: node.label,
+        type: node.type || node.file_type,
+        source: node.source_file || node.source,
+        community: node.community,
+        neighbors: neighbors.slice(0, 20)
+      };
+    });
+
+    return { matches: results.length, results };
+  } catch (e) {
+    return { matches: 0, results: [], error: String(e.message || e) };
+  }
+}
+
+/**
+ * Find all downstream dependents of a file (for blast radius analysis).
+ * Returns list of files that import from or depend on the given file.
+ */
+function graphifyDependents(graphJsonPath, filePath) {
+  try {
+    const raw = fs.readFileSync(graphJsonPath, 'utf8');
+    const graph = JSON.parse(raw);
+    const nodes = graph.nodes || [];
+    const links = graph.links || graph.edges || [];
+    const fp = filePath.toLowerCase();
+
+    // Find nodes in this file
+    const fileNodes = nodes.filter(n =>
+      (n.source_file || n.source || '').toLowerCase().includes(fp)
+    );
+    const fileNodeIds = new Set(fileNodes.map(n => n.id));
+
+    // Find all nodes that depend on (point to) these nodes
+    const dependents = new Set();
+    for (const e of links) {
+      if (fileNodeIds.has(e.target) && !fileNodeIds.has(e.source)) {
+        const sourceNode = nodes.find(n => n.id === e.source);
+        if (sourceNode) {
+          dependents.add(sourceNode.source_file || sourceNode.source || e.source);
+        }
+      }
+    }
+
+    return { file: filePath, dependentFiles: [...dependents], count: dependents.size };
+  } catch (e) {
+    return { file: filePath, dependentFiles: [], count: 0, error: String(e.message || e) };
+  }
+}
+
 module.exports = {
   parseFrontmatter, serializeFrontmatter,
   loadConfig, DEFAULT_CONFIG, deepMerge, getConfig,
@@ -3956,5 +4194,6 @@ module.exports = {
   verifyStateConsistency,
   runHeadless, queryHeadlessState, HEADLESS_EXIT, HEADLESS_STATUS_SCHEMA_VERSION,
   performForensicRecovery,
-  validateWorkflowPrerequisites
+  validateWorkflowPrerequisites,
+  graphifyAvailable, graphifyBuild, graphifySummary, graphifyQuery, graphifyDependents
 };

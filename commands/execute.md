@@ -75,7 +75,15 @@ These checks run automatically. Do not skip them.
 
 **Design system:** Check if `DESIGN.md`, `design.md`, or `docs/DESIGN.md` exists in the project root. If found, read it and store the path in `.forge/state.md` frontmatter as `design_system: {path}`. All UI tasks will automatically receive design constraints during execution and review.
 
-**Knowledge graph:** Check if `graphify-out/graph.json` exists. If found, note it in `.forge/state.md` frontmatter as `knowledge_graph: graphify-out/graph.json`. The executor will use it for focused context loading, the reviewer for blast radius analysis.
+**Knowledge graph:** Check if `graphify-out/graph.json` exists. If not, check if graphify is installed and build a graph:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" graph-status
+# If available and no graph exists:
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" graph-build --project-dir .
+```
+
+If a graph exists (either pre-existing or just built), note it in `.forge/state.md` frontmatter as `knowledge_graph: graphify-out/graph.json`. The executor will query it for focused context, the reviewer for blast radius analysis, using the `graph-query` and `graph-dependents` CLI commands.
 
 Neither is required. If absent, execution proceeds with standard behavior. If present, they enhance every task automatically without any user action.
 

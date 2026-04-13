@@ -147,10 +147,15 @@ Before writing any code:
    - Spacing scale (base unit and multiples) for layout
    - Component styling (border-radius, shadows) for interactive elements
    Use ONLY values from the design system. No ad-hoc hex colors, no custom font sizes, no magic pixel values. The reviewer will flag violations.
-5. **Load knowledge graph context** (auto-detected by the execute command). If `.forge/state.md` has `knowledge_graph:` in its frontmatter, use the graph for focused context instead of full codebase scanning:
-   - Search graph nodes for your task's target files/modules
-   - Identify downstream dependents of files you will modify (blast radius)
-   - Find existing implementations in the same community cluster as templates
+5. **Load knowledge graph context** (auto-detected by the execute command). If `.forge/state.md` has `knowledge_graph:` in its frontmatter, query the graph for focused context:
+   ```bash
+   # Get architecture overview (god nodes, communities)
+   node scripts/forge-tools.cjs graph-summary --graph graphify-out/graph.json
+   # Search for nodes related to your task target
+   node scripts/forge-tools.cjs graph-query --graph graphify-out/graph.json --term "{module-name}"
+   # Check blast radius: who depends on the file you're about to modify?
+   node scripts/forge-tools.cjs graph-dependents --graph graphify-out/graph.json --file "{file-path}"
+   ```
    This replaces broad codebase grep with targeted subgraph queries. Skip if no graph.
 6. **Auto-detect conventions** (critical for legacy codebases). Even if CLAUDE.md exists, verify it matches reality. If CLAUDE.md is absent, this step is mandatory:
 

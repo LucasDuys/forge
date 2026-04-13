@@ -39,12 +39,23 @@ If `--depth` is not provided and the project config has `auto_detect_depth: true
 
 These checks run automatically before planning. Do not skip them.
 
-**Knowledge graph:** Check if `graphify-out/graph.json` exists. If found, read it and extract:
-- God nodes (top 5-10 highest-connectivity concepts)
-- Community structure (number of clusters, their dominant themes)
-- Cross-community edges (potential integration points)
+**Knowledge graph:** First check if `graphify-out/graph.json` already exists. If not, check if graphify is installed:
 
-Pass this summary to the planner agent. The planner uses it to align task boundaries with module boundaries and order tasks by architectural impact.
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" graph-status
+```
+
+If graphify is available and no graph exists, build one:
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" graph-build --project-dir .
+```
+
+Once a graph exists, extract the summary:
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" graph-summary --graph graphify-out/graph.json
+```
+
+This returns god nodes (top 10 most-connected concepts), community structure, and stats. Pass this summary to the planner agent. The planner uses it to align task boundaries with module boundaries and order tasks by architectural impact.
 
 **Design system:** Check if `DESIGN.md`, `design.md`, or `docs/DESIGN.md` exists. If found, check each spec for UI-related requirements. For specs with UI tasks:
 - Pass the DESIGN.md path to the planner
