@@ -1505,15 +1505,146 @@ function logConflictEvent(forgeDir, conflicts) {
 //   3. Scheduler falls back to sequential execution for remaining tasks
 //      in the same tier (treat the whole tier as one chain).
 //   4. Human or rescue agent resolves the conflict, then scheduler resumes.
-function planTierExecution(forgeDir, tierTasks) {
+function planTierExecution(forgeDir, tierTasks, graphJsonPath) {
   const conflicts = detectFileConflicts(tierTasks);
   if (conflicts.length > 0 && forgeDir) {
     logConflictEvent(forgeDir, conflicts);
   }
+
+  // R003: Run detectParallelConflicts for deeper analysis when forgeDir is available.
+  let parallelConflicts = null;
+  if (forgeDir && Array.isArray(tierTasks) && tierTasks.length >= 2) {
+    const taskIds = tierTasks.map(t => t.id);
+    parallelConflicts = detectParallelConflicts(forgeDir, taskIds, graphJsonPath || null);
+
+    // If detectParallelConflicts found serialization needs beyond what
+    // detectFileConflicts already caught, log them to state.md.
+    if (parallelConflicts.must_serialize.length > 0 && forgeDir) {
+      const extraConflicts = parallelConflicts.must_serialize.map(entry => ({
+        taskIds: [entry[0], entry[1]].sort(),
+        overlapFiles: [entry[2]]
+      }));
+      // Only log entries not already covered by the file-level conflicts.
+      const existingKeys = new Set(conflicts.map(c => c.taskIds.join(',')));
+      const novel = extraConflicts.filter(c => !existingKeys.has(c.taskIds.join(',')));
+      if (novel.length > 0) {
+        logConflictEvent(forgeDir, novel);
+      }
+    }
+  }
+
   return {
     chains: serializeConflictingTasks(tierTasks),
-    conflicts
+    conflicts,
+    parallelConflicts
   };
+}
+
+// === T003 (R003): Parallel Conflict Detection ===
+// Detects whether tasks scheduled for parallel execution would conflict,
+// using two levels of analysis:
+//   Level 1 (always): file-path overlap from filesTouched in frontier entries.
+//   Level 2 (when graph JSON exists): export-level dependency via graphifyDependents.
+
+function detectParallelConflicts(forgeDir, taskIds, graphJsonPath) {
+  // 1. Load all tasks from all frontier files and filter to the requested IDs.
+  const requestedSet = new Set(Array.isArray(taskIds) ? taskIds : []);
+  let allTasks = [];
+  try {
+    const planDir = path.join(forgeDir, 'plans');
+    const plans = fs.readdirSync(planDir).filter(f => f.endsWith('-frontier.md'));
+    for (const plan of plans) {
+      const text = fs.readFileSync(path.join(planDir, plan), 'utf8');
+      allTasks.push(...parseFrontier(text));
+    }
+  } catch (e) {
+    // If we cannot read frontiers, return all tasks as safe (no data to conflict on).
+    return { safe_parallel: [...requestedSet], must_serialize: [] };
+  }
+
+  const tasks = allTasks.filter(t => requestedSet.has(t.id));
+  if (tasks.length < 2) {
+    return { safe_parallel: tasks.map(t => t.id), must_serialize: [] };
+  }
+
+  const must_serialize = [];
+  const serializedPairs = new Set(); // track "A|B" to avoid duplicates
+
+  // --- Level 1: File-path overlap (O(n^2) on task count, acceptable for <=20) ---
+  for (let i = 0; i < tasks.length; i++) {
+    const a = tasks[i];
+    const aFiles = a.filesTouched || [];
+    if (aFiles.length === 0) continue;
+    const aSet = new Set(aFiles);
+    for (let j = i + 1; j < tasks.length; j++) {
+      const b = tasks[j];
+      const bFiles = b.filesTouched || [];
+      if (bFiles.length === 0) continue;
+      const overlap = bFiles.filter(f => aSet.has(f));
+      if (overlap.length > 0) {
+        const key = [a.id, b.id].sort().join('|');
+        if (!serializedPairs.has(key)) {
+          serializedPairs.add(key);
+          must_serialize.push([a.id, b.id, `file overlap: ${overlap.join(', ')}`]);
+        }
+      }
+    }
+  }
+
+  // --- Level 2: Export-level dependency via graphifyDependents ---
+  let graphValid = false;
+  if (graphJsonPath) {
+    try {
+      fs.accessSync(graphJsonPath, fs.constants.R_OK);
+      // Quick sanity check: must parse as JSON with nodes array
+      const raw = fs.readFileSync(graphJsonPath, 'utf8');
+      const graph = JSON.parse(raw);
+      if (Array.isArray(graph.nodes)) graphValid = true;
+    } catch (e) {
+      // Graph file missing or invalid -- skip Level 2.
+    }
+  }
+
+  if (graphValid) {
+    for (let i = 0; i < tasks.length; i++) {
+      const a = tasks[i];
+      const aFiles = a.filesTouched || [];
+      if (aFiles.length === 0) continue;
+      for (let j = 0; j < tasks.length; j++) {
+        if (i === j) continue;
+        const b = tasks[j];
+        const bFiles = b.filesTouched || [];
+        if (bFiles.length === 0) continue;
+        const bSet = new Set(bFiles.map(f => f.toLowerCase()));
+
+        // Check if any file modified by task A has dependents that are
+        // target files of task B. If so, B consumes exports from A's files.
+        for (const aFile of aFiles) {
+          const result = graphifyDependents(graphJsonPath, aFile);
+          if (result.error || result.count === 0) continue;
+          for (const dep of result.dependentFiles) {
+            if (bSet.has(dep.toLowerCase())) {
+              const key = [a.id, b.id].sort().join('|');
+              if (!serializedPairs.has(key)) {
+                serializedPairs.add(key);
+                must_serialize.push([a.id, b.id, `export dep: ${a.id} modifies ${aFile} -> consumed by ${b.id} via ${dep}`]);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Build safe_parallel: task IDs that do not appear in any must_serialize entry.
+  const conflictedIds = new Set();
+  for (const entry of must_serialize) {
+    conflictedIds.add(entry[0]);
+    conflictedIds.add(entry[1]);
+  }
+  const safe_parallel = tasks.map(t => t.id).filter(id => !conflictedIds.has(id));
+
+  return { safe_parallel, must_serialize };
 }
 
 // === Artifact Contracts ===
@@ -3968,6 +4099,237 @@ if (require.main === module) {
       process.stdout.write(`Task ${taskId} marked complete`);
     }
   }
+
+  // R004: trajectory stats CLI command
+  if (command === 'trajectory-stats') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const json = args.includes('--json');
+    const stats = trajectoryStats(forgeDir);
+    if (json) {
+      process.stdout.write(JSON.stringify(stats, null, 2) + '\n');
+    } else {
+      const lines = [];
+      lines.push('=== Trajectory Stats ===');
+      lines.push('');
+      if (stats.total_events === 0) {
+        lines.push('No trajectory events recorded yet.');
+      } else {
+        lines.push('Total events: ' + stats.total_events);
+        lines.push('');
+        if (Object.keys(stats.avg_tokens_by_depth).length > 0) {
+          lines.push('Avg tokens per task by depth:');
+          for (const [depth, avg] of Object.entries(stats.avg_tokens_by_depth)) {
+            lines.push('  ' + depth + ': ' + Math.round(avg));
+          }
+          lines.push('');
+        }
+        if (stats.avg_review_cycles !== null) {
+          lines.push('Avg review cycles: ' + stats.avg_review_cycles.toFixed(2));
+          lines.push('');
+        }
+        if (stats.common_error_categories.length > 0) {
+          lines.push('Most common error categories:');
+          for (const [cat, count] of stats.common_error_categories) {
+            lines.push('  ' + cat + ': ' + count);
+          }
+          lines.push('');
+        }
+        if (stats.avg_tasks_per_spec !== null) {
+          lines.push('Avg tasks per spec: ' + stats.avg_tasks_per_spec.toFixed(2));
+        }
+      }
+      process.stdout.write(lines.join('\n') + '\n');
+    }
+  }
+}
+
+// ============================================================
+// Trajectory Capture — append-only event logging (R004)
+// ============================================================
+
+/**
+ * Capture a trajectory event by appending a JSON line to .forge/trajectories.jsonl.
+ * The file is append-only and never read during execution (zero context cost).
+ *
+ * @param {string} forgeDir - Path to the .forge directory
+ * @param {object} event - Event object with at least { type: string }
+ *   Supported types: spec_approved, plan_created, task_started,
+ *   task_completed, task_failed, phase_complete
+ * @returns {{ captured: boolean, path: string }}
+ */
+function captureTrajectory(forgeDir, event) {
+  const trajPath = path.join(forgeDir, 'trajectories.jsonl');
+
+  const record = Object.assign({}, event, {
+    timestamp: new Date().toISOString(),
+    session_id: process.env.CLAUDE_CODE_SESSION_ID || ''
+  });
+
+  // Ensure domain is present — derive from spec if not provided
+  if (!record.domain) {
+    try {
+      record.domain = _deriveSpecDomain(forgeDir) || 'unknown';
+    } catch (e) {
+      record.domain = 'unknown';
+    }
+  }
+
+  try {
+    fs.mkdirSync(forgeDir, { recursive: true });
+  } catch (e) { /* already exists */ }
+
+  fs.appendFileSync(trajPath, JSON.stringify(record) + '\n');
+
+  // Auto-promote to global learning on phase_complete events
+  if (event.type === 'phase_complete') {
+    try { promoteToGlobalLearning(forgeDir); } catch (e) { /* best effort */ }
+  }
+
+  return { captured: true, path: trajPath };
+}
+
+/**
+ * Read the JSONL trajectory file and compute aggregate statistics.
+ *
+ * @param {string} forgeDir - Path to the .forge directory
+ * @returns {object} Aggregate stats:
+ *   - total_events: number
+ *   - avg_tokens_by_depth: { quick?: number, standard?: number, thorough?: number }
+ *   - avg_review_cycles: number | null
+ *   - common_error_categories: [category, count][] (sorted desc, top 10)
+ *   - avg_tasks_per_spec: number | null
+ */
+function trajectoryStats(forgeDir) {
+  const trajPath = path.join(forgeDir, 'trajectories.jsonl');
+  const empty = {
+    total_events: 0,
+    avg_tokens_by_depth: {},
+    avg_review_cycles: null,
+    common_error_categories: [],
+    avg_tasks_per_spec: null
+  };
+
+  if (!fs.existsSync(trajPath)) return empty;
+
+  let raw;
+  try {
+    raw = fs.readFileSync(trajPath, 'utf8').trim();
+  } catch (e) {
+    return empty;
+  }
+  if (!raw) return empty;
+
+  const events = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      events.push(JSON.parse(line));
+    } catch (e) { /* skip malformed lines */ }
+  }
+
+  if (events.length === 0) return empty;
+
+  // Avg tokens per task by depth (from task_completed events)
+  const tokensByDepth = {};
+  const reviewCycles = [];
+
+  for (const ev of events) {
+    if (ev.type === 'task_completed') {
+      const depth = ev.depth || 'unknown';
+      if (!tokensByDepth[depth]) tokensByDepth[depth] = [];
+      if (typeof ev.actual_tokens === 'number') {
+        tokensByDepth[depth].push(ev.actual_tokens);
+      }
+      if (typeof ev.review_cycles === 'number') {
+        reviewCycles.push(ev.review_cycles);
+      }
+    }
+  }
+
+  const avgTokensByDepth = {};
+  for (const [depth, arr] of Object.entries(tokensByDepth)) {
+    if (arr.length > 0) {
+      avgTokensByDepth[depth] = arr.reduce((a, b) => a + b, 0) / arr.length;
+    }
+  }
+
+  // Avg review cycles
+  const avgReviewCycles = reviewCycles.length > 0
+    ? reviewCycles.reduce((a, b) => a + b, 0) / reviewCycles.length
+    : null;
+
+  // Most common error categories (from task_failed events)
+  const errorCounts = {};
+  for (const ev of events) {
+    if (ev.type === 'task_failed' && ev.error_category) {
+      errorCounts[ev.error_category] = (errorCounts[ev.error_category] || 0) + 1;
+    }
+  }
+  const commonErrors = Object.entries(errorCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10);
+
+  // Avg tasks per spec (from phase_complete events)
+  const phaseEvents = events.filter(e => e.type === 'phase_complete');
+  const avgTasksPerSpec = phaseEvents.length > 0
+    ? phaseEvents.reduce((sum, e) => sum + (e.tasks_completed || 0) + (e.tasks_failed || 0), 0) / phaseEvents.length
+    : null;
+
+  return {
+    total_events: events.length,
+    avg_tokens_by_depth: avgTokensByDepth,
+    avg_review_cycles: avgReviewCycles,
+    common_error_categories: commonErrors,
+    avg_tasks_per_spec: avgTasksPerSpec
+  };
+}
+
+/**
+ * Promote aggregate trajectory stats to the global learning directory.
+ * Writes stats to ~/.claude/forge-learning/stats.json.
+ * Called automatically on phase_complete events to persist generalizable patterns.
+ *
+ * @param {string} forgeDir - Path to the .forge directory
+ * @returns {{ promoted: boolean, path?: string, error?: string }}
+ */
+function promoteToGlobalLearning(forgeDir) {
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (!home) return { promoted: false, error: 'no_home_dir' };
+
+  const learningDir = path.join(home, '.claude', 'forge-learning');
+  const statsPath = path.join(learningDir, 'stats.json');
+
+  const stats = trajectoryStats(forgeDir);
+  if (stats.total_events === 0) {
+    return { promoted: false, error: 'no_events' };
+  }
+
+  try {
+    fs.mkdirSync(learningDir, { recursive: true });
+  } catch (e) { /* already exists */ }
+
+  // Merge with existing global stats if present
+  let existing = {};
+  if (fs.existsSync(statsPath)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(statsPath, 'utf8'));
+    } catch (e) { /* overwrite if corrupt */ }
+  }
+
+  const merged = Object.assign({}, existing, {
+    last_updated: new Date().toISOString(),
+    avg_tokens_by_depth: stats.avg_tokens_by_depth,
+    avg_review_cycles: stats.avg_review_cycles,
+    common_error_categories: stats.common_error_categories,
+    avg_tasks_per_spec: stats.avg_tasks_per_spec,
+    total_events_seen: (existing.total_events_seen || 0) + stats.total_events
+  });
+
+  const tmp = statsPath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2));
+  fs.renameSync(tmp, statsPath);
+
+  return { promoted: true, path: statsPath };
 }
 
 // ============================================================
@@ -4167,13 +4529,299 @@ function graphifyDependents(graphJsonPath, filePath) {
   }
 }
 
+// === Error Classification & Recovery (R002) ===
+// Pure-function error taxonomy for Hermes recovery patterns.
+// No LLM calls -- pattern matching on error text + exit codes.
+
+const ERROR_TAXONOMY = {
+  test_failure: {
+    retryable: true,
+    max_retries: 3,
+    default_recovery: 'retry',
+    severity: 'medium',
+    patterns: [
+      /FAIL\s+.*\.test\./i,
+      /Test Suites?:\s+\d+\s+failed/i,
+      /\d+ failing/,
+      /AssertionError/i,
+      /expect\(.*\)\.(to|not)/i,
+      /FAILED\s+tests?\//i,
+      /pytest.*FAILED/i,
+      /test.*failed/i
+    ]
+  },
+  build_error: {
+    retryable: false,
+    max_retries: 0,
+    default_recovery: 'escalate_to_human',
+    severity: 'high',
+    patterns: [
+      /Build failed/i,
+      /Compilation failed/i,
+      /ERROR in.*\.tsx?/,
+      /SyntaxError:/,
+      /Module build failed/i,
+      /Failed to compile/i,
+      /esbuild.*error/i,
+      /tsc.*error TS/i
+    ]
+  },
+  type_error: {
+    retryable: false,
+    max_retries: 0,
+    default_recovery: 'redecompose_task',
+    severity: 'medium',
+    patterns: [
+      /TypeError:/,
+      /error TS\d+:/,
+      /Type '.*' is not assignable/,
+      /Property '.*' does not exist on type/,
+      /Cannot find name '.*'/,
+      /type.*mismatch/i
+    ]
+  },
+  runtime_error: {
+    retryable: true,
+    max_retries: 2,
+    default_recovery: 'retry',
+    severity: 'high',
+    patterns: [
+      /ReferenceError:/,
+      /RangeError:/,
+      /EvalError:/,
+      /URIError:/,
+      /Segmentation fault/,
+      /SIGABRT/,
+      /SIGSEGV/,
+      /Unhandled promise rejection/i,
+      /uncaught exception/i,
+      /FATAL ERROR/i
+    ]
+  },
+  timeout: {
+    retryable: true,
+    max_retries: 2,
+    default_recovery: 'retry_with_backoff',
+    severity: 'medium',
+    patterns: [
+      /timed?\s*out/i,
+      /ETIMEDOUT/,
+      /ESOCKETTIMEDOUT/,
+      /TimeoutError/i,
+      /deadline exceeded/i,
+      /operation timed out/i,
+      /exceeded.*timeout/i
+    ]
+  },
+  rate_limit: {
+    retryable: true,
+    max_retries: 5,
+    default_recovery: 'retry_with_backoff',
+    severity: 'low',
+    patterns: [
+      /rate.?limit/i,
+      /429\s/,
+      /Too Many Requests/i,
+      /RATE_LIMIT_EXCEEDED/i,
+      /throttl/i,
+      /quota exceeded/i,
+      /overloaded/i
+    ]
+  },
+  context_overflow: {
+    retryable: false,
+    max_retries: 0,
+    default_recovery: 'compress_context',
+    severity: 'medium',
+    patterns: [
+      /context.*(length|window|limit|overflow)/i,
+      /maximum context/i,
+      /token limit/i,
+      /too many tokens/i,
+      /context_length_exceeded/i,
+      /max_tokens/i
+    ]
+  },
+  dependency_missing: {
+    retryable: false,
+    max_retries: 0,
+    default_recovery: 'install_dependency',
+    severity: 'high',
+    patterns: [
+      /Cannot find module/i,
+      /Module not found/i,
+      /No module named/i,
+      /ImportError/,
+      /ModuleNotFoundError/,
+      /ENOENT.*node_modules/,
+      /Could not resolve/i,
+      /package.*not found/i,
+      /command not found/i
+    ]
+  },
+  permission_denied: {
+    retryable: false,
+    max_retries: 0,
+    default_recovery: 'escalate_to_human',
+    severity: 'high',
+    patterns: [
+      /EACCES/,
+      /Permission denied/i,
+      /EPERM/,
+      /Access denied/i,
+      /Forbidden/i,
+      /403\s/,
+      /insufficient permissions/i,
+      /not authorized/i
+    ]
+  },
+  unknown: {
+    retryable: false,
+    max_retries: 0,
+    default_recovery: 'escalate_to_human',
+    severity: 'medium',
+    patterns: []
+  }
+};
+
+/**
+ * Classify an error into a category using pattern matching on error text.
+ * Pure function -- no LLM call, no network, no side effects.
+ *
+ * @param {string} errorText - The error message or stack trace
+ * @param {object} [context] - Optional context: { exit_code, file, task_id }
+ * @returns {{ category: string, retryable: boolean, recovery_action: string, severity: string }}
+ */
+function classifyError(errorText, context) {
+  const text = String(errorText || '');
+  const ctx = context || {};
+
+  // Check exit codes first for quick classification
+  if (ctx.exit_code !== undefined && ctx.exit_code !== null) {
+    const code = Number(ctx.exit_code);
+    if (code === 137 || code === 124) {
+      // 137 = OOM/killed, 124 = timeout
+      const cat = code === 124 ? 'timeout' : 'runtime_error';
+      const entry = ERROR_TAXONOMY[cat];
+      return {
+        category: cat,
+        retryable: entry.retryable,
+        recovery_action: entry.default_recovery,
+        severity: entry.severity
+      };
+    }
+  }
+
+  // Pattern match against taxonomy in priority order
+  const categoryOrder = [
+    'context_overflow',   // Check first -- specific and actionable
+    'rate_limit',         // Transient, high priority to detect
+    'timeout',            // Transient
+    'permission_denied',  // Access issue
+    'dependency_missing', // Missing dep
+    'type_error',         // Before build_error (more specific)
+    'build_error',        // Compilation issues
+    'test_failure',       // Test results
+    'runtime_error'       // Catch-all runtime errors
+  ];
+
+  for (const cat of categoryOrder) {
+    const entry = ERROR_TAXONOMY[cat];
+    for (const pattern of entry.patterns) {
+      if (pattern.test(text)) {
+        return {
+          category: cat,
+          retryable: entry.retryable,
+          recovery_action: entry.default_recovery,
+          severity: entry.severity
+        };
+      }
+    }
+  }
+
+  // No pattern matched
+  const unknown = ERROR_TAXONOMY.unknown;
+  return {
+    category: 'unknown',
+    retryable: unknown.retryable,
+    recovery_action: unknown.default_recovery,
+    severity: unknown.severity
+  };
+}
+
+/**
+ * Get recovery action scaled by autonomy setting.
+ *
+ * - full: attempt all auto-recoveries before escalating
+ * - gated: auto-recover transient errors, escalate logic errors
+ * - supervised: classify and report, let human decide
+ *
+ * @param {string} category - Error category from classifyError
+ * @param {string} autonomy - One of 'full', 'gated', 'supervised'
+ * @returns {string} The recovery action to take
+ */
+function getRecoveryAction(category, autonomy) {
+  const entry = ERROR_TAXONOMY[category] || ERROR_TAXONOMY.unknown;
+  const action = entry.default_recovery;
+  const mode = autonomy || 'gated';
+
+  if (mode === 'supervised') {
+    // Supervised: always escalate, just classify for the human
+    return 'escalate_to_human';
+  }
+
+  if (mode === 'gated') {
+    // Gated: auto-recover transient errors, escalate logic/structural errors
+    const transientActions = ['retry', 'retry_with_backoff'];
+    const autoRecoverActions = ['compress_context', 'install_dependency'];
+    if (transientActions.includes(action) || autoRecoverActions.includes(action)) {
+      return action;
+    }
+    // Logic errors (redecompose, skip) and escalations go to human
+    return 'escalate_to_human';
+  }
+
+  // Full autonomy: use default recovery action as-is
+  return action;
+}
+
+/**
+ * Log an error classification result to .forge/error-log.jsonl for trajectory capture.
+ *
+ * @param {string} forgeDir - Path to .forge directory
+ * @param {object} classification - Result from classifyError()
+ * @param {object} [meta] - Optional metadata: { task_id, error_text, attempt, file }
+ */
+function logError(forgeDir, classification, meta) {
+  const logPath = path.join(forgeDir, 'error-log.jsonl');
+  const entry = {
+    timestamp: new Date().toISOString(),
+    category: classification.category,
+    retryable: classification.retryable,
+    recovery_action: classification.recovery_action,
+    severity: classification.severity
+  };
+  if (meta) {
+    if (meta.task_id) entry.task_id = meta.task_id;
+    if (meta.error_text) entry.error_text = String(meta.error_text).slice(0, 500);
+    if (meta.attempt !== undefined) entry.attempt = meta.attempt;
+    if (meta.file) entry.file = meta.file;
+  }
+
+  try {
+    fs.appendFileSync(logPath, JSON.stringify(entry) + '\n');
+  } catch (e) {
+    // Best-effort logging -- don't crash the caller
+  }
+}
+
 module.exports = {
   parseFrontmatter, serializeFrontmatter,
   loadConfig, DEFAULT_CONFIG, deepMerge, getConfig,
   estimateTokensFromTranscript, readState, writeState, formatCavemanValue,
   acquireLock, releaseLock, heartbeat, detectStaleLock, readLock,
   updateTokenLedger, parseFrontier,
-  detectFileConflicts, serializeConflictingTasks, logConflictEvent, planTierExecution,
+  detectFileConflicts, serializeConflictingTasks, logConflictEvent, planTierExecution, detectParallelConflicts,
   readLedger, writeLedgerAtomic, resolveTaskBudget,
   registerTask, recordTaskTokens, checkTaskBudget,
   getTaskBudgetRemaining, budgetStatusReport,
@@ -4195,5 +4843,7 @@ module.exports = {
   runHeadless, queryHeadlessState, HEADLESS_EXIT, HEADLESS_STATUS_SCHEMA_VERSION,
   performForensicRecovery,
   validateWorkflowPrerequisites,
-  graphifyAvailable, graphifyBuild, graphifySummary, graphifyQuery, graphifyDependents
+  graphifyAvailable, graphifyBuild, graphifySummary, graphifyQuery, graphifyDependents,
+  ERROR_TAXONOMY, classifyError, getRecoveryAction, logError,
+  captureTrajectory, trajectoryStats, promoteToGlobalLearning
 };
