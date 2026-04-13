@@ -4838,7 +4838,8 @@ const ERROR_TAXONOMY = {
       /expect\(.*\)\.(to|not)/i,
       /FAILED\s+tests?\//i,
       /pytest.*FAILED/i,
-      /test.*failed/i
+      /test.*failed/i,
+      /^FAIL\s+/m
     ]
   },
   build_error: {
@@ -4883,6 +4884,7 @@ const ERROR_TAXONOMY = {
       /URIError:/,
       /Segmentation fault/,
       /SIGABRT/,
+      /SIGKILL/,
       /SIGSEGV/,
       /Unhandled promise rejection/i,
       /uncaught exception/i,
