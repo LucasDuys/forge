@@ -63,9 +63,9 @@ const DEFAULT_CONFIG = {
     thorough: 45000
   },
   // When true, internal prompts dispatched to subagents are run through the
-  // caveman/terse-prompt skill to reduce token cost. Opt-in until validated
-  // against quality regressions. (R002)
-  terse_internal: false,
+  // caveman/terse-prompt skill to reduce token cost. Default on since R005;
+  // set to false to opt out. (R002, R005)
+  terse_internal: true,
   // When true, each task is implemented inside its own git worktree to
   // isolate changes and allow parallel execution. (R004)
   use_worktrees: true,
@@ -1658,7 +1658,12 @@ function writeArtifact(forgeDir, taskId, artifact) {
     task_id: taskId,
     status: artifact.status || 'complete',
     commit: artifact.commit || null,
-    artifacts: artifact.artifacts || {},
+    // R005: artifact summary values use caveman compression for compact handoffs
+    artifacts: Object.fromEntries(
+      Object.entries(artifact.artifacts || {}).map(([k, v]) =>
+        [k, typeof v === 'string' ? formatCavemanValue(v) : v]
+      )
+    ),
     files_created: artifact.files_created || [],
     files_modified: artifact.files_modified || [],
     key_decisions: artifact.key_decisions || [],
@@ -1854,7 +1859,10 @@ function updateCheckpoint(forgeDir, taskId, updates, opts) {
   return writeCheckpoint(forgeDir, taskId, merged, opts);
 }
 
-// Build a context bundle file for a task, assembling only relevant context
+// Build a compact context bundle for a task handoff (R005).
+// Includes only: task_id, spec_domain, acceptance_criteria (verbatim),
+// key_decisions (caveman-compressed), file list. No full spec re-inclusion.
+// This keeps handoff context tight and avoids redundant spec loading.
 function buildContextBundle(forgeDir, task, specContent, frontierTasks) {
   const bundleDir = path.join(forgeDir, 'context-bundles');
   try { fs.mkdirSync(bundleDir, { recursive: true }); } catch (e) {}
@@ -1862,35 +1870,43 @@ function buildContextBundle(forgeDir, task, specContent, frontierTasks) {
   const sections = [];
   sections.push(`# Context for ${task.id}: ${task.name}\n`);
 
-  // Extract relevant spec requirements (match R-numbers from task name/description)
+  // Spec domain (from state, not full spec content)
+  const state = readState(forgeDir);
+  const specDomain = (state && state.data && state.data.spec) || 'main';
+  sections.push(`**Spec domain:** ${specDomain}`);
+
+  // Extract only acceptance criteria (verbatim) -- no full requirement blocks
   if (specContent) {
-    const reqBlocks = [];
-    const reqMatches = specContent.match(/### R\d+:[\s\S]*?(?=### R\d+:|## Future|$)/g);
-    if (reqMatches) {
-      // Include requirements referenced in task consumes or all if none specified
-      for (const block of reqMatches) {
-        reqBlocks.push(block.trim());
+    const acLines = [];
+    const acMatches = specContent.match(/- \[[ x]\] .+/g);
+    if (acMatches && acMatches.length > 0) {
+      acLines.push(...acMatches);
+    }
+    if (acLines.length > 0) {
+      sections.push('## Acceptance Criteria\n' + acLines.join('\n'));
+    }
+  }
+
+  // Key decisions from dependency artifacts (caveman-compressed)
+  if (task.depends && task.depends.length > 0) {
+    const decisions = [];
+    const fileList = [];
+    for (const depId of task.depends) {
+      const artifact = readArtifact(forgeDir, depId);
+      if (!artifact) continue;
+      if (artifact.key_decisions && artifact.key_decisions.length > 0) {
+        for (const d of artifact.key_decisions) {
+          decisions.push(`- ${depId}: ${formatCavemanValue(d)}`);
+        }
       }
+      if (artifact.files_created) fileList.push(...artifact.files_created);
+      if (artifact.files_modified) fileList.push(...artifact.files_modified);
     }
-    if (reqBlocks.length > 0) {
-      sections.push('## Relevant Requirements\n' + reqBlocks.join('\n\n'));
+    if (decisions.length > 0) {
+      sections.push('## Key Decisions (from deps)\n' + decisions.join('\n'));
     }
-  }
-
-  // Artifact summaries from dependencies
-  if (task.depends.length > 0) {
-    const summary = buildArtifactSummary(forgeDir, task.depends);
-    if (summary) sections.push('## ' + summary);
-  }
-
-  // Remaining frontier overview (compact)
-  if (frontierTasks) {
-    const remaining = frontierTasks.filter(t => t.id !== task.id && t.status !== 'complete');
-    if (remaining.length > 0) {
-      const overview = remaining.slice(0, 10).map(t =>
-        `- ${t.id}: ${t.name}${t.depends.length ? ` (depends: ${t.depends.join(', ')})` : ''}`
-      ).join('\n');
-      sections.push(`## Remaining Tasks (${remaining.length} total)\n${overview}`);
+    if (fileList.length > 0) {
+      sections.push('## Files (from deps)\n' + fileList.join('\n'));
     }
   }
 
@@ -4335,6 +4351,45 @@ function promoteToGlobalLearning(forgeDir) {
 // ============================================================
 // Graphify Integration — codebase knowledge graph operations
 // ============================================================
+/**
+ * Truncate a graphify result object to fit within a character budget (~2k tokens).
+ * Truncates arrays (godNodes, communities, results, dependentFiles) from the end,
+ * adding truncated/omitted fields to indicate how many entries were dropped.
+ * @param {object} result - The graphify result object
+ * @param {number} maxChars - Max characters for JSON.stringify output (default 8000 ~ 2k tokens)
+ * @returns {object} Possibly truncated result
+ */
+function truncateGraphOutput(result, maxChars = 8000) {
+  if (!result || typeof result !== 'object') return result;
+  if (JSON.stringify(result).length <= maxChars) return result;
+
+  const truncated = JSON.parse(JSON.stringify(result));
+  const arrayKeys = ['godNodes', 'communities', 'results', 'dependentFiles'];
+  let totalOmitted = 0;
+
+  // Iteratively trim arrays until under budget
+  for (let pass = 0; pass < 10; pass++) {
+    const size = JSON.stringify(truncated).length;
+    if (size <= maxChars) break;
+
+    for (const key of arrayKeys) {
+      if (!Array.isArray(truncated[key]) || truncated[key].length <= 1) continue;
+      const before = truncated[key].length;
+      const removeCount = Math.max(1, Math.floor(truncated[key].length / 2));
+      truncated[key] = truncated[key].slice(0, truncated[key].length - removeCount);
+      totalOmitted += removeCount;
+      if (JSON.stringify(truncated).length <= maxChars) break;
+    }
+  }
+
+  if (totalOmitted > 0) {
+    truncated.truncated = true;
+    truncated.omitted = totalOmitted;
+  }
+
+  return truncated;
+}
+
 // These functions shell out to the `graphify` CLI (pip install graphifyy).
 // All functions degrade gracefully if graphify is not installed.
 
@@ -4422,7 +4477,7 @@ function graphifySummary(graphJsonPath) {
       .map(([id, members]) => ({
         id,
         size: members.length,
-        sample: members.slice(0, 5)
+        sample: members.slice(0, 3)
       }));
 
     // Confidence breakdown
@@ -4440,8 +4495,9 @@ function graphifySummary(graphJsonPath) {
         confidence
       },
       godNodes,
-      communities: communities.slice(0, 15) // top 15 communities
+      communities: communities.slice(0, 10) // top 10 communities
     };
+    return truncateGraphOutput(summary);
   } catch (e) {
     return null;
   }
@@ -4468,7 +4524,7 @@ function graphifyQuery(graphJsonPath, searchTerm) {
     });
 
     // For each match, find neighbors
-    const results = matches.slice(0, 20).map(node => {
+    const results = matches.slice(0, 10).map(node => {
       const neighbors = [];
       for (const e of links) {
         if (e.source === node.id) {
@@ -4484,11 +4540,11 @@ function graphifyQuery(graphJsonPath, searchTerm) {
         type: node.type || node.file_type,
         source: node.source_file || node.source,
         community: node.community,
-        neighbors: neighbors.slice(0, 20)
+        neighbors: neighbors.slice(0, 10)
       };
     });
 
-    return { matches: results.length, results };
+    return truncateGraphOutput({ matches: results.length, results });
   } catch (e) {
     return { matches: 0, results: [], error: String(e.message || e) };
   }
@@ -4523,7 +4579,7 @@ function graphifyDependents(graphJsonPath, filePath) {
       }
     }
 
-    return { file: filePath, dependentFiles: [...dependents], count: dependents.size };
+    return truncateGraphOutput({ file: filePath, dependentFiles: [...dependents], count: dependents.size });
   } catch (e) {
     return { file: filePath, dependentFiles: [], count: 0, error: String(e.message || e) };
   }
@@ -4815,6 +4871,206 @@ function logError(forgeDir, classification, meta) {
   }
 }
 
+// === Context Compression (T004, R001) ===
+// Produces a structured summary from the current session state to survive
+// context resets without re-reading specs/frontiers. The summary is written
+// to .forge/context-summary.md and can be injected into resume prompts.
+//
+// Compression triggers at context_reset_threshold * 0.7 (default 42%).
+// If compression extends past the reset threshold the session continues.
+// If context hits 60% after compression, the existing reset fires with
+// the structured summary as the handoff payload.
+// Subsequent compressions within the same session update the prior summary
+// iteratively (append new decisions/tasks, preserve prior content).
+
+/**
+ * Returns the compression trigger threshold as a context-percent value.
+ * Default: context_reset_threshold * 0.7 (e.g. 60 * 0.7 = 42%).
+ *
+ * @param {string} forgeDir - Path to .forge directory
+ * @returns {number} Compression threshold as a percentage (0-100)
+ */
+function getCompressionThreshold(forgeDir) {
+  const projectDir = path.dirname(forgeDir);
+  let config;
+  try {
+    config = loadConfig(projectDir);
+  } catch (e) {
+    config = DEFAULT_CONFIG;
+  }
+  const resetThreshold = config.context_reset_threshold || 60;
+  return resetThreshold * 0.7;
+}
+
+/**
+ * Checks whether the current context usage has reached the compression
+ * trigger point. Returns true when contextPercent >= threshold * 0.7.
+ *
+ * @param {string} forgeDir - Path to .forge directory
+ * @param {number} contextPercent - Current context window usage (0-100)
+ * @returns {boolean}
+ */
+function shouldCompress(forgeDir, contextPercent) {
+  if (typeof contextPercent !== 'number' || isNaN(contextPercent)) return false;
+  var threshold = getCompressionThreshold(forgeDir);
+  return contextPercent >= threshold;
+}
+
+/**
+ * Compresses current session context into a structured summary written to
+ * .forge/context-summary.md. On subsequent calls within the same session
+ * the prior summary is updated iteratively -- new decisions and completed
+ * tasks are appended, prior content is preserved.
+ *
+ * @param {string} forgeDir - Path to .forge directory
+ * @param {object} state - Result of readState(forgeDir), or null to read fresh
+ * @param {string} [transcriptPath] - Path to transcript for token estimation
+ * @returns {{ compressed: boolean, summaryPath: string, tokenEstimate: number }}
+ */
+function compressContext(forgeDir, state, transcriptPath) {
+  var summaryPath = path.join(forgeDir, 'context-summary.md');
+
+  // Read state if not provided
+  if (!state) {
+    state = readState(forgeDir);
+  }
+
+  var stateData = state.data || {};
+  var stateContent = state.content || '';
+
+  // --- Gather completed tasks from registry ---
+  var registry = readTaskRegistry(forgeDir);
+  var completedTasks = [];
+  for (var _e of Object.entries(registry.tasks || {})) {
+    var id = _e[0], info = _e[1];
+    if (info.status === 'complete') {
+      completedTasks.push({ id: id, commit: info.commit || null, completed_at: info.completed_at || null });
+    }
+  }
+
+  // --- Extract key decisions from state.md content ---
+  var keyDecisions = '';
+  var decisionsMatch = stateContent.match(/(?:^|\n)##?\s*(?:Key )?Decisions?\s*\n([\s\S]*?)(?=\n##?\s|\n---|\s*$)/i);
+  if (decisionsMatch) {
+    keyDecisions = decisionsMatch[1].trim();
+  }
+
+  // --- Read frontier for remaining tasks ---
+  var remainingFrontier = [];
+  try {
+    var planDir = path.join(forgeDir, 'plans');
+    var plans = fs.readdirSync(planDir).filter(function (f) { return f.endsWith('-frontier.md'); });
+    for (var plan of plans) {
+      var text = fs.readFileSync(path.join(planDir, plan), 'utf8');
+      var tasks = parseFrontier(text);
+      for (var t of tasks) {
+        var regEntry = (registry.tasks || {})[t.id];
+        if (regEntry && regEntry.status === 'complete') continue;
+        remainingFrontier.push(t);
+      }
+    }
+  } catch (e) { /* plans dir may not exist */ }
+
+  // --- Read test results from state content ---
+  var testResults = '';
+  var testMatch = stateContent.match(/(?:^|\n)##?\s*(?:Test|Tests|Test Results)\s*\n([\s\S]*?)(?=\n##?\s|\n---|\s*$)/i);
+  if (testMatch) {
+    testResults = testMatch[1].trim();
+  }
+
+  // --- Read prior summary for iterative updates ---
+  var priorSummary = null;
+  var priorDecisions = '';
+  var priorNotes = '';
+  var priorCompCount = 0;
+  try {
+    var existing = fs.readFileSync(summaryPath, 'utf8');
+    priorSummary = existing;
+    var countMatch = existing.match(/compression_count:\s*(\d+)/);
+    if (countMatch) priorCompCount = parseInt(countMatch[1], 10);
+    var priorDecMatch = existing.match(/(?:^|\n)##?\s*Key Decisions\s*\n([\s\S]*?)(?=\n##?\s|\s*$)/i);
+    if (priorDecMatch) priorDecisions = priorDecMatch[1].trim();
+    var priorNotesMatch = existing.match(/(?:^|\n)##?\s*Notes\s*\n([\s\S]*?)(?=\n##?\s|\s*$)/i);
+    if (priorNotesMatch) priorNotes = priorNotesMatch[1].trim();
+  } catch (e) { /* no prior summary */ }
+
+  // --- Merge decisions (prior + current, deduplicated by line) ---
+  var allDecisionLines = new Set();
+  if (priorDecisions) {
+    for (var line of priorDecisions.split('\n')) {
+      if (line.trim()) allDecisionLines.add(line.trim());
+    }
+  }
+  if (keyDecisions) {
+    for (var line of keyDecisions.split('\n')) {
+      if (line.trim()) allDecisionLines.add(line.trim());
+    }
+  }
+  var mergedDecisions = Array.from(allDecisionLines).join('\n');
+
+  // --- Build completed tasks section ---
+  var completedSection = completedTasks.length > 0
+    ? completedTasks.map(function (t) { return '- ' + t.id + ': complete' + (t.commit ? ' (' + t.commit + ')' : ''); }).join('\n')
+    : '- None yet';
+
+  // --- Build remaining frontier section ---
+  var remainingSection = remainingFrontier.length > 0
+    ? remainingFrontier.map(function (t) {
+        return '- ' + t.id + ': ' + (t.name || 'unnamed') + (t.depends.length ? ' | depends: ' + t.depends.join(', ') : '');
+      }).join('\n')
+    : '- None';
+
+  // --- Build current task progress ---
+  var currentTask = stateData.current_task || 'none';
+  var taskStatus = stateData.task_status || 'unknown';
+  var phase = stateData.phase || 'unknown';
+
+  // --- Estimate token savings ---
+  // Compression saves re-reading specs/frontiers on resume (est 2-4k tokens per reset avoided)
+  var tokenEstimate = 0;
+  if (transcriptPath) {
+    tokenEstimate = estimateTokensFromTranscript(transcriptPath);
+  }
+
+  // --- Assemble summary (caveman form for internal sections) ---
+  var summary = '---\n'
+    + 'goal: ' + (stateData.spec || stateData.goal || 'unknown') + '\n'
+    + 'phase: ' + phase + '\n'
+    + 'current_task: ' + currentTask + '\n'
+    + 'task_status: ' + taskStatus + '\n'
+    + 'compressed_at: ' + new Date().toISOString() + '\n'
+    + 'compression_count: ' + (priorCompCount + 1) + '\n'
+    + '---\n'
+    + '\n'
+    + '# Context Summary\n'
+    + '\n'
+    + '## Goal\n'
+    + (stateData.spec || stateData.goal || 'Spec not identified') + '\n'
+    + '\n'
+    + '## Completed Tasks\n'
+    + completedSection + '\n'
+    + '\n'
+    + '## Current Task Progress\n'
+    + '- task: ' + currentTask + '\n'
+    + '- status: ' + taskStatus + '\n'
+    + '- iteration: ' + (stateData.iteration || 0) + '\n'
+    + '\n'
+    + '## Key Decisions\n'
+    + (mergedDecisions || '- None recorded') + '\n'
+    + '\n'
+    + '## Active Test Results\n'
+    + (testResults || '- No test results captured') + '\n'
+    + '\n'
+    + '## Remaining Frontier\n'
+    + remainingSection + '\n'
+    + (priorNotes ? '\n## Notes\n' + priorNotes + '\n' : '');
+
+  // Write summary atomically
+  _atomicWriteFile(summaryPath, summary);
+
+  return { compressed: true, summaryPath: summaryPath, tokenEstimate: tokenEstimate };
+}
+
 module.exports = {
   parseFrontmatter, serializeFrontmatter,
   loadConfig, DEFAULT_CONFIG, deepMerge, getConfig,
@@ -4843,7 +5099,9 @@ module.exports = {
   runHeadless, queryHeadlessState, HEADLESS_EXIT, HEADLESS_STATUS_SCHEMA_VERSION,
   performForensicRecovery,
   validateWorkflowPrerequisites,
+  truncateGraphOutput,
   graphifyAvailable, graphifyBuild, graphifySummary, graphifyQuery, graphifyDependents,
   ERROR_TAXONOMY, classifyError, getRecoveryAction, logError,
-  captureTrajectory, trajectoryStats, promoteToGlobalLearning
+  captureTrajectory, trajectoryStats, promoteToGlobalLearning,
+  compressContext, shouldCompress, getCompressionThreshold
 };
