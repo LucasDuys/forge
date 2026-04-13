@@ -1234,6 +1234,7 @@ function markTaskComplete(forgeDir, taskId, commitHash) {
     commit: commitHash || null
   };
   writeTaskRegistry(forgeDir, registry);
+  try { captureTrajectory(forgeDir, { type: 'task_completed', task_id: taskId, commit: commitHash || null }); } catch (e) { /* best-effort */ }
 }
 
 function initTaskRegistry(forgeDir, tasks) {
@@ -1242,6 +1243,7 @@ function initTaskRegistry(forgeDir, tasks) {
     registry.tasks[task.id] = { status: 'pending', completed_at: null, commit: null };
   }
   writeTaskRegistry(forgeDir, registry);
+  try { captureTrajectory(forgeDir, { type: 'plan_created', task_count: tasks.length }); } catch (e) { /* best-effort */ }
 }
 
 // === Progress Detection ===
@@ -1533,6 +1535,13 @@ function planTierExecution(forgeDir, tierTasks, graphJsonPath) {
     }
   }
 
+  // T008: Write parallel constraints to disk so the stop hook and
+  // findAllUnblockedTasks/findNextUnblockedTask can check them without
+  // re-computing.
+  if (forgeDir && parallelConflicts) {
+    writeParallelConstraints(forgeDir, parallelConflicts);
+  }
+
   return {
     chains: serializeConflictingTasks(tierTasks),
     conflicts,
@@ -1645,6 +1654,52 @@ function detectParallelConflicts(forgeDir, taskIds, graphJsonPath) {
   const safe_parallel = tasks.map(t => t.id).filter(id => !conflictedIds.has(id));
 
   return { safe_parallel, must_serialize };
+}
+
+// === T008: Parallel Constraints I/O ===
+// Write/read must_serialize pairs to .forge/parallel-constraints.json so the
+// stop hook and task-dispatch functions can enforce serialization without
+// re-running detectParallelConflicts every time.
+
+function writeParallelConstraints(forgeDir, parallelConflicts) {
+  const filePath = path.join(forgeDir, 'parallel-constraints.json');
+  const data = {
+    generated_at: new Date().toISOString(),
+    safe_parallel: parallelConflicts.safe_parallel || [],
+    must_serialize: (parallelConflicts.must_serialize || []).map(entry => ({
+      task_a: entry[0],
+      task_b: entry[1],
+      reason: entry[2] || 'unknown'
+    }))
+  };
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  return data;
+}
+
+function readParallelConstraints(forgeDir) {
+  const filePath = path.join(forgeDir, 'parallel-constraints.json');
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    // File doesn't exist or is invalid -- no constraints (backward compatible).
+    return null;
+  }
+}
+
+// Check whether a candidate task is blocked by a serialization constraint
+// because a conflicting task is currently running.
+// Returns true if the task should be held back.
+function isBlockedByParallelConstraint(taskId, runningTasks, constraints) {
+  if (!constraints || !constraints.must_serialize) return false;
+  const runningSet = runningTasks instanceof Set ? runningTasks : new Set(runningTasks);
+  if (runningSet.size === 0) return false;
+  for (const entry of constraints.must_serialize) {
+    const a = entry.task_a;
+    const b = entry.task_b;
+    if (taskId === a && runningSet.has(b)) return true;
+    if (taskId === b && runningSet.has(a)) return true;
+  }
+  return false;
 }
 
 // === Artifact Contracts ===
@@ -2336,11 +2391,17 @@ function findAllUnblockedTasks(tasks, forgeDir) {
     if (match) doneTasks.add(match[1]);
   }
 
+  // T008: Load parallel constraints to enforce must_serialize pairs.
+  const constraints = readParallelConstraints(forgeDir);
+
   const unblocked = [];
   for (const task of tasks) {
     if (doneTasks.has(task.id) || runningTasks.has(task.id)) continue;
     const allDepsComplete = task.depends.every(d => doneTasks.has(d));
-    if (allDepsComplete) unblocked.push(task);
+    if (!allDepsComplete) continue;
+    // T008: If a conflicting task is currently running, hold this one back.
+    if (isBlockedByParallelConstraint(task.id, runningTasks, constraints)) continue;
+    unblocked.push(task);
   }
   return unblocked;
 }
@@ -2818,25 +2879,88 @@ function routeDecision(forgeDir, iteration, transcriptPath) {
       if (effectiveTaskStatus === 'debugging') {
         const debugAttempts = state.data.debug_attempts || 0;
 
+        // --- T007: Classify the error and route recovery by category ---
+        const errorText = state.data.last_error
+          || state.data.blocked_reason
+          || state.content.match(/error[:\s](.{0,500})/i)?.[1]
+          || '';
+        const classification = classifyError(errorText, {
+          task_id: currentTask,
+          exit_code: state.data.last_exit_code
+        });
+        const recoveryAction = getRecoveryAction(classification.category, autonomy);
+
+        // Log every classification to error-log.jsonl for trajectory capture
+        logError(forgeDir, { ...classification, recovery_action: recoveryAction }, {
+          task_id: currentTask,
+          error_text: errorText,
+          attempt: debugAttempts
+        });
+
+        // Per-category circuit breaker threshold (falls back to global config)
+        const categoryEntry = ERROR_TAXONOMY[classification.category] || ERROR_TAXONOMY.unknown;
+        const maxRetries = categoryEntry.max_retries > 0
+          ? categoryEntry.max_retries
+          : config.loop.circuit_breaker_debug_attempts;
+
         // Codex rescue: try before exhausting debug circuit breaker
         if (shouldRunCodexRescue(forgeDir, debugAttempts)) {
           const currentTaskObj = tasks.find(t => t.id === currentTask);
           if (currentTaskObj) {
             state.data.task_status = 'codex-rescuing';
             writeState(forgeDir, state.data, state.content);
-            const errorContext = state.data.blocked_reason || state.content.match(/error[:\s](.{0,200})/i)?.[1] || 'unknown';
+            const errorContext = errorText || 'unknown';
             return buildCodexRescuePrompt(currentTaskObj, errorContext, debugAttempts);
           }
         }
 
-        if (debugAttempts >= config.loop.circuit_breaker_debug_attempts) {
+        // --- T007: Route by recovery action ---
+        if (recoveryAction === 'escalate_to_human') {
+          // Non-retryable or supervised: block immediately
+          state.data.task_status = 'blocked';
+          state.data.blocked_reason = `error_classified:${classification.category}`;
+          writeState(forgeDir, state.data, state.content);
+          try { captureTrajectory(forgeDir, { type: 'task_failed', task_id: currentTask, error_category: classification.category, recovery_action: 'escalate_to_human' }); } catch (e) { /* best-effort */ }
+          return `Task ${currentTask} blocked: error classified as "${classification.category}" (severity: ${classification.severity}). Recovery action: escalate to human.\n\nError: ${String(errorText).slice(0, 300)}\n\nThe loop will exit and wait for human intervention.`;
+        }
+
+        if (recoveryAction === 'compress_context') {
+          // Context overflow: compress and retry
+          try {
+            compressContext(forgeDir, state, transcriptPath);
+          } catch (e) { /* best-effort compression */ }
+          state.data.debug_attempts = debugAttempts + 1;
+          state.data.task_status = 'implementing';
+          writeState(forgeDir, state.data, state.content);
+          return `Context overflow detected for ${currentTask}. Context has been compressed to .forge/context-summary.md. Re-read the summary and retry the implementation. Debug attempt ${debugAttempts + 1}/${maxRetries}.`;
+        }
+
+        if (recoveryAction === 'install_dependency') {
+          // Missing dependency: generate install prompt
+          state.data.debug_attempts = debugAttempts + 1;
+          writeState(forgeDir, state.data, state.content);
+          return `Missing dependency detected for ${currentTask}. Error: ${String(errorText).slice(0, 300)}\n\nAttempt to install the missing dependency:\n1. Identify the exact package name from the error message\n2. Install it using the project's package manager (check package.json for npm/yarn/pnpm)\n3. Re-run the failing command to verify the fix\n4. Update .forge/state.md task_status to "testing" if tests pass\n\nDebug attempt ${debugAttempts + 1}/${maxRetries}.`;
+        }
+
+        if (recoveryAction === 'redecompose_task') {
+          // Type errors / structural issues: flag for re-decomposition
+          state.data.task_status = 'blocked';
+          state.data.blocked_reason = `needs_redecomposition:${classification.category}`;
+          writeState(forgeDir, state.data, state.content);
+          try { captureTrajectory(forgeDir, { type: 'task_failed', task_id: currentTask, error_category: classification.category, recovery_action: 'redecompose_task' }); } catch (e) { /* best-effort */ }
+          return `Task ${currentTask} has a structural error (${classification.category}) that may require re-decomposition.\n\nError: ${String(errorText).slice(0, 300)}\n\nThis task will be flagged for re-decomposition into smaller sub-tasks.`;
+        }
+
+        // --- Retryable errors (retry / retry_with_backoff) ---
+        if (debugAttempts >= maxRetries) {
           // --- Fix #10: Auto-invoke backprop before giving up ---
           // Instead of immediately blocking, give Claude one chance to trace
           // the failure back to a spec gap and self-correct.
           state.data.task_status = 'blocked';
-          state.data.blocked_reason = 'debug_exhausted';
+          state.data.blocked_reason = `debug_exhausted:${classification.category}`;
           writeState(forgeDir, state.data, state.content);
-          return `Debug circuit breaker triggered for ${currentTask} (${debugAttempts} attempts exhausted).
+          try { captureTrajectory(forgeDir, { type: 'task_failed', task_id: currentTask, error_category: classification.category, recovery_action: 'backprop' }); } catch (e) { /* best-effort */ }
+          return `Debug circuit breaker triggered for ${currentTask} (${debugAttempts}/${maxRetries} attempts exhausted, category: ${classification.category}).
 
 Before marking as blocked, run backpropagation to trace this failure to a spec gap:
 
@@ -2855,7 +2979,10 @@ If the issue is not a spec gap (infrastructure, environment, dependency):
         }
         state.data.debug_attempts = debugAttempts + 1;
         writeState(forgeDir, state.data, state.content);
-        return `Debug attempt ${debugAttempts + 1}/${config.loop.circuit_breaker_debug_attempts} for ${currentTask}. Investigate the root cause systematically: 1) Read error messages carefully, 2) Find a working example of similar code, 3) Form a hypothesis, 4) Test it minimally. Do NOT guess — investigate first.`;
+        const backoffNote = recoveryAction === 'retry_with_backoff'
+          ? ' Note: this is a transient error (e.g., timeout/rate-limit). Wait a moment before retrying the failing operation.'
+          : '';
+        return `Debug attempt ${debugAttempts + 1}/${maxRetries} for ${currentTask} (error category: ${classification.category}).${backoffNote} Investigate the root cause systematically: 1) Read error messages carefully, 2) Find a working example of similar code, 3) Form a hypothesis, 4) Test it minimally. Do NOT guess — investigate first.`;
       }
 
       if (effectiveTaskStatus === 'blocked') {
@@ -2884,6 +3011,7 @@ Sub-tasks should:
 After creating sub-tasks, update .forge/task-status.json to mark ${currentTask} as "redecomposed" and add the new sub-task entries as "pending". Then update state.md task_status to "complete" so the loop advances to the next ready task.`;
           }
         }
+        try { captureTrajectory(forgeDir, { type: 'task_failed', task_id: currentTask, error_category: state.data.blocked_reason || 'blocked', recovery_action: 'human_escalation' }); } catch (e) { /* best-effort */ }
         return ''; // Allow exit — needs human
       }
 
@@ -2968,12 +3096,14 @@ After review, update .forge/state.md phase to "verifying".`;
 // with a more flexible regex fallback for state.md content.
 function findNextUnblockedTask(tasks, state, forgeDir) {
   const doneTasks = new Set();
+  const runningTasks = new Set();
 
   // Primary: task registry (programmatic, reliable)
   if (forgeDir) {
     const registry = readTaskRegistry(forgeDir);
     for (const [id, info] of Object.entries(registry.tasks)) {
       if (info.status === 'complete') doneTasks.add(id);
+      if (info.status === 'running') runningTasks.add(id);
     }
   }
 
@@ -2985,11 +3115,17 @@ function findNextUnblockedTask(tasks, state, forgeDir) {
     if (match) doneTasks.add(match[1]);
   }
 
+  // T008: Load parallel constraints to enforce must_serialize pairs.
+  const constraints = forgeDir ? readParallelConstraints(forgeDir) : null;
+
   for (const task of tasks) {
     if (doneTasks.has(task.id)) continue;
     if (task.status === 'complete') continue;
     const allDepsComplete = task.depends.every(d => doneTasks.has(d));
-    if (allDepsComplete) return task;
+    if (!allDepsComplete) continue;
+    // T008: If a conflicting task is currently running, skip this one.
+    if (isBlockedByParallelConstraint(task.id, runningTasks, constraints)) continue;
+    return task;
   }
   return null;
 }
@@ -3099,6 +3235,11 @@ function advanceToNextTask(tasks, state, forgeDir, currentSpec, overrideMessage)
     state.data.task_status = null;
     state.data.review_iterations = 0;
     writeState(forgeDir, state.data, state.content);
+    try {
+      const registry = readTaskRegistry(forgeDir);
+      const allEntries = Object.values(registry.tasks);
+      captureTrajectory(forgeDir, { type: 'phase_complete', domain: state.data.spec, tasks_completed: allEntries.filter(t => t.status === 'complete').length, tasks_failed: allEntries.filter(t => t.status === 'blocked').length });
+    } catch (e) { /* best-effort */ }
     const prefix = overrideMessage ? overrideMessage + '\n\n' : '';
     return `${prefix}All tasks complete. Before phase verification, run a holistic branch review to catch cross-task integration issues, blast radius problems, and convention drift. Commit your work first, then run the branch review.`;
   }
@@ -3109,6 +3250,7 @@ function advanceToNextTask(tasks, state, forgeDir, currentSpec, overrideMessage)
     state.data.task_status = 'pending';
     state.data.review_iterations = 0;
     writeState(forgeDir, state.data, state.content);
+    try { captureTrajectory(forgeDir, { type: 'task_started', task_id: unblockedTasks[0].id, depth: state.data.depth }); } catch (e) { /* best-effort */ }
     return ''; // Allow exit — user must /forge resume
   }
 
@@ -3122,6 +3264,7 @@ function advanceToNextTask(tasks, state, forgeDir, currentSpec, overrideMessage)
       state.data.review_iterations = 0;
       state.data.debug_attempts = 0;
       writeState(forgeDir, state.data, state.content);
+      try { captureTrajectory(forgeDir, { type: 'task_started', task_id: sameTier[0].id, depth: state.data.depth }); } catch (e) { /* best-effort */ }
 
       const taskList = sameTier.map(t =>
         `- ${t.id}: ${t.name}${t.repo ? ` (repo: ${t.repo})` : ''}`
@@ -3148,6 +3291,7 @@ Start ${sameTier[0].id} yourself and dispatch the rest as agents.`;
   state.data.review_iterations = 0;
   state.data.debug_attempts = 0;
   writeState(forgeDir, state.data, state.content);
+  try { captureTrajectory(forgeDir, { type: 'task_started', task_id: unblockedTasks[0].id, depth: state.data.depth }); } catch (e) { /* best-effort */ }
   const prefix = overrideMessage ? overrideMessage + '\n\n' : '';
   return prefix + buildTaskPrompt(unblockedTasks[0], forgeDir, state.data.depth || 'standard');
 }
@@ -5078,6 +5222,7 @@ module.exports = {
   acquireLock, releaseLock, heartbeat, detectStaleLock, readLock,
   updateTokenLedger, parseFrontier,
   detectFileConflicts, serializeConflictingTasks, logConflictEvent, planTierExecution, detectParallelConflicts,
+  writeParallelConstraints, readParallelConstraints, isBlockedByParallelConstraint,
   readLedger, writeLedgerAtomic, resolveTaskBudget,
   registerTask, recordTaskTokens, checkTaskBudget,
   getTaskBudgetRemaining, budgetStatusReport,
