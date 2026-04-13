@@ -57,10 +57,13 @@ const DEFAULT_CONFIG = {
   // Per-task token ceilings keyed by depth. Used by the loop to short-circuit
   // a task that blows past its budget instead of letting it consume the whole
   // session budget. (R001)
+  // v0.2.0 recalibration: lowered toward v0.1.0 baselines (quick=5k, std=15k,
+  // thorough=40k) now that compression features (context compression, caveman
+  // prompts, checkpoint bundles) reduce per-task overhead.
   per_task_budget: {
-    quick: 8000,
-    standard: 20000,
-    thorough: 45000
+    quick: 6000,
+    standard: 16000,
+    thorough: 42000
   },
   // When true, internal prompts dispatched to subagents are run through the
   // caveman/terse-prompt skill to reduce token cost. Default on since R005;
@@ -4301,6 +4304,43 @@ if (require.main === module) {
       process.stdout.write(lines.join('\n') + '\n');
     }
   }
+
+  // R005: token report CLI command
+  if (command === 'token-report') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const json = args.includes('--json');
+    const report = tokenReport(forgeDir);
+    if (json) {
+      process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+    } else {
+      const lines = [];
+      lines.push('=== Token Report: Actual vs Budget ===');
+      lines.push('');
+      if (!report.has_data) {
+        lines.push(report.message);
+      } else {
+        lines.push('Total trajectory events: ' + report.total_events);
+        lines.push('');
+        const header = padRight('Depth', 12) + padRight('v0.1.0', 10) + padRight('Budget', 10) + padRight('Actual', 10) + padRight('Delta(base)', 14) + 'Delta(budget)';
+        lines.push(header);
+        lines.push('-'.repeat(header.length));
+        for (const depth of ['quick', 'standard', 'thorough']) {
+          const d = report.depths[depth];
+          const actual = d.actual_avg != null ? String(d.actual_avg) : 'n/a';
+          const dBase = d.delta_vs_baseline != null ? (d.delta_vs_baseline >= 0 ? '+' : '') + d.delta_vs_baseline : 'n/a';
+          const dBudget = d.delta_vs_budget != null ? (d.delta_vs_budget >= 0 ? '+' : '') + d.delta_vs_budget : 'n/a';
+          lines.push(padRight(depth, 12) + padRight(String(d.v010_baseline), 10) + padRight(String(d.current_budget), 10) + padRight(actual, 10) + padRight(dBase, 14) + dBudget);
+        }
+      }
+      process.stdout.write(lines.join('\n') + '\n');
+    }
+  }
+}
+
+function padRight(str, len) {
+  str = String(str);
+  while (str.length < len) str += ' ';
+  return str;
 }
 
 // ============================================================
@@ -4441,6 +4481,57 @@ function trajectoryStats(forgeDir) {
     avg_review_cycles: avgReviewCycles,
     common_error_categories: commonErrors,
     avg_tasks_per_spec: avgTasksPerSpec
+  };
+}
+
+/**
+ * Generate a token report comparing actual usage against v0.1.0 baselines
+ * and current budget settings. Reads trajectory data only -- zero token cost.
+ *
+ * @param {string} forgeDir - Path to the .forge directory
+ * @returns {object} Report with per-depth comparisons
+ */
+function tokenReport(forgeDir) {
+  const V010_BASELINES = { quick: 5000, standard: 15000, thorough: 40000 };
+  const stats = trajectoryStats(forgeDir);
+
+  if (stats.total_events === 0) {
+    return {
+      has_data: false,
+      message: 'No trajectory data yet. Run tasks to collect data.',
+      depths: {}
+    };
+  }
+
+  const projectDir = path.dirname(path.resolve(forgeDir));
+  let cfg;
+  try {
+    cfg = loadConfig(projectDir);
+  } catch (e) {
+    cfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+  }
+
+  const depths = {};
+  for (const depth of ['quick', 'standard', 'thorough']) {
+    const baseline = V010_BASELINES[depth];
+    const budget = getConfig(cfg, 'per_task_budget.' + depth, DEFAULT_CONFIG.per_task_budget[depth]);
+    const actual = stats.avg_tokens_by_depth[depth] != null
+      ? Math.round(stats.avg_tokens_by_depth[depth])
+      : null;
+    depths[depth] = {
+      v010_baseline: baseline,
+      current_budget: budget,
+      actual_avg: actual,
+      delta_vs_baseline: actual != null ? actual - baseline : null,
+      delta_vs_budget: actual != null ? actual - budget : null
+    };
+  }
+
+  return {
+    has_data: true,
+    message: null,
+    total_events: stats.total_events,
+    depths: depths
   };
 }
 
@@ -5247,6 +5338,6 @@ module.exports = {
   truncateGraphOutput,
   graphifyAvailable, graphifyBuild, graphifySummary, graphifyQuery, graphifyDependents,
   ERROR_TAXONOMY, classifyError, getRecoveryAction, logError,
-  captureTrajectory, trajectoryStats, promoteToGlobalLearning,
+  captureTrajectory, trajectoryStats, tokenReport, promoteToGlobalLearning,
   compressContext, shouldCompress, getCompressionThreshold
 };
