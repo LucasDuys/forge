@@ -38,7 +38,7 @@ check_tool "firebase"    "firebase --version"       "npm i -g firebase-tools"   
 check_tool "docker"      "docker --version"         "winget install Docker.DockerDesktop"              "Container management"
 check_tool "wrangler"    "wrangler --version"       "npm i -g wrangler"                                "Cloudflare Workers, KV"
 check_tool "graphify"     "graphify -h"              "pip install graphifyy"                             "Codebase knowledge graphs for architecture-aware planning"
-check_tool "cli-anything" "cli-anything --version"  "pip install cli-anything"                         "Agent-native CLIs for desktop software"
+check_tool "cli-anything" "ls ~/.claude/plugins/cli-anything* 2>/dev/null || compgen -c cli-anything- | head -1" "In Claude Code: /plugin marketplace add HKUDS/CLI-Anything && /plugin install cli-anything" "Agent-native CLIs for desktop software"
 
 echo -e "$tools_status"
 ```
