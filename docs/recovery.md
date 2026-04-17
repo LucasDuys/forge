@@ -28,4 +28,10 @@ Recovery never auto-deletes user work. Orphan worktrees are flagged with warning
 
 Budget exhaustion has a dedicated recovery path: the handoff doc at `.forge/resume.md` explains why execution halted and what config change unblocks continuation.
 
+## In-session context reset
+
+When the transcript approaches `context_reset_threshold` (default 60% of the configured `context_window_tokens`), forge asks the model to write a handoff snapshot to `.forge/state.md`, then injects the resume prompt inline on the next stop-hook pass. The same session continues without you typing `/forge resume` — Claude Code's native auto-compact handles the context squeeze. `.forge/.forge-resume.md` is still written for `forge-runner.sh` and `/forge watch` flows, and `/forge resume` remains available as a manual fallback and for recovery after crashes or machine reboots.
+
+If you are running on a 1M-context model (e.g. `claude-opus-4-7[1m]`), set `context_window_tokens: 1000000` in `.forge/config.json` (or export `FORGE_CONTEXT_WINDOW=1000000`) so the estimator doesn't trigger resets at ~12% of real usage.
+
 See also: [checkpoint-schema.md](../references/checkpoint-schema.md).

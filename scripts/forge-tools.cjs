@@ -76,6 +76,11 @@ const DEFAULT_CONFIG = {
   // disables headless notifications.
   headless_notify_url: null,
   context_reset_threshold: 60,
+  // Approximate total context window in tokens, used by the context-reset
+  // estimator. Default assumes 200k. 1M-context models (e.g. claude-opus-4-7
+  // [1m]) should set this to 1000000 in .forge/config.json, or override at
+  // runtime with the FORGE_CONTEXT_WINDOW env var.
+  context_window_tokens: 200000,
   repos: {},
   cross_repo_rules: { commit_in_source: true, api_first: true, shared_specs: true },
   loop: {
@@ -2184,6 +2189,19 @@ After reading the state files, continue working. When you complete
 a task, commit it and update .forge/state.md before moving to the next task.`;
 }
 
+// Handles the "handoff written, now resume" branch of the context-reset path.
+// Writes .forge-resume.md (kept for forge-runner.sh / /forge watch / external
+// runners), clears handoff_requested so the loop doesn't re-fire, and returns
+// the resume-prompt string so the stop hook blocks exit and the SAME session
+// continues. Claude Code's native auto-compact handles the context squeeze.
+function handleContextReset(state, forgeDir) {
+  const prompt = generateResumePrompt(state.data, path.dirname(forgeDir));
+  fs.writeFileSync(path.join(forgeDir, '.forge-resume.md'), prompt);
+  state.data.handoff_requested = false;
+  writeState(forgeDir, state.data, state.content);
+  return prompt;
+}
+
 // === Execution Summary Generation ===
 // Fix #9: Wire up the summary.md template. Previously the template existed
 // but was never called. Now generateSummary() runs at completion, between
@@ -2758,15 +2776,18 @@ function routeDecision(forgeDir, iteration, transcriptPath) {
   }
 
   // --- Context window check ---
+  // Window size is configurable (context_window_tokens) with env override
+  // FORGE_CONTEXT_WINDOW, so 1M-context models don't trigger at ~12% real usage.
+  const contextWindow = Number(process.env.FORGE_CONTEXT_WINDOW)
+    || config.context_window_tokens
+    || 200000;
   if (transcriptPath) {
     try {
       const stats = fs.statSync(transcriptPath);
-      const estimatedContextPercent = (stats.size / 4 / 200000) * 100;
+      const estimatedContextPercent = (stats.size / 4 / contextWindow) * 100;
       if (estimatedContextPercent >= (config.context_reset_threshold || 60)) {
         if (state.data.handoff_requested) {
-          const prompt = generateResumePrompt(state.data, path.dirname(forgeDir));
-          fs.writeFileSync(path.join(forgeDir, '.forge-resume.md'), prompt);
-          return ''; // Allow exit for context reset
+          return handleContextReset(state, forgeDir);
         } else {
           state.data.handoff_requested = true;
           writeState(forgeDir, state.data, state.content);
@@ -2778,9 +2799,7 @@ function routeDecision(forgeDir, iteration, transcriptPath) {
 
   // Handoff was requested and completed
   if (state.data.handoff_requested) {
-    const prompt = generateResumePrompt(state.data, path.dirname(forgeDir));
-    fs.writeFileSync(path.join(forgeDir, '.forge-resume.md'), prompt);
-    return ''; // Allow exit for context reset
+    return handleContextReset(state, forgeDir);
   }
 
   // --- Fix #2: No-progress circuit breaker ---
@@ -5319,7 +5338,7 @@ module.exports = {
   readLedger, writeLedgerAtomic, resolveTaskBudget,
   registerTask, recordTaskTokens, checkTaskBudget,
   getTaskBudgetRemaining, budgetStatusReport,
-  discoverCapabilities, generateResumePrompt, generateSummary, inferMcpUse,
+  discoverCapabilities, generateResumePrompt, handleContextReset, generateSummary, inferMcpUse,
   routeDecision, checkSessionBudget, writeBudgetExhaustedHandoff,
   findNextUnblockedTask, findAllUnblockedTasks,
   getReadyTasks, hasFileOverlap, shouldReplan,

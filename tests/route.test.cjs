@@ -118,4 +118,136 @@ suite('routeDecision short-circuits', () => {
   });
 });
 
+suite('context-reset self-resume', () => {
+  // Builds a transcript file of a target byte size so the estimator
+  // (size / 4 / window * 100) hits the desired percent. Keep windows small
+  // so we don't need to write huge files.
+
+  function writeFakeTranscript(projectDir, bytes) {
+    const p = path.join(projectDir, 'transcript.jsonl');
+    fs.writeFileSync(p, 'x'.repeat(bytes));
+    return p;
+  }
+
+  test('configurable window: 1M context does not trigger reset at 480KB', () => {
+    // 480KB transcript → /4 → 120k tokens → /1M → 12% → below 60% threshold
+    const { forgeDir, projectDir } = makeTempForgeDir({
+      config: {
+        context_window_tokens: 1000000,
+        session_budget_tokens: 10000000,
+        token_budget: 10000000,
+        max_iterations: 100
+      }
+    });
+    writeState(forgeDir, { phase: 'executing', iteration: 1, handoff_requested: false });
+    const tp = writeFakeTranscript(projectDir, 480000);
+    const r = routeDecision(forgeDir, 1, tp);
+    // We expect to NOT hit the context-reset branch (which would return the
+    // save-handoff prompt). Any non-reset return is fine.
+    assert.ok(typeof r !== 'string' || !/Context approaching limit/.test(r),
+      'must not trigger reset on 1M window with 480KB transcript');
+  });
+
+  test('200k window does trigger reset at 480KB (baseline)', () => {
+    const { forgeDir, projectDir } = makeTempForgeDir({
+      config: {
+        context_window_tokens: 200000,
+        session_budget_tokens: 10000000,
+        token_budget: 10000000,
+        max_iterations: 100
+      }
+    });
+    writeState(forgeDir, { phase: 'executing', iteration: 1, handoff_requested: false });
+    const tp = writeFakeTranscript(projectDir, 480000);
+    const r = routeDecision(forgeDir, 1, tp);
+    assert.strictEqual(typeof r, 'string');
+    assert.match(r, /Context approaching limit/);
+  });
+
+  test('FORGE_CONTEXT_WINDOW env var overrides config', () => {
+    const { forgeDir, projectDir } = makeTempForgeDir({
+      config: {
+        context_window_tokens: 200000,
+        session_budget_tokens: 10000000,
+        token_budget: 10000000,
+        max_iterations: 100
+      }
+    });
+    writeState(forgeDir, { phase: 'executing', iteration: 1, handoff_requested: false });
+    const tp = writeFakeTranscript(projectDir, 480000);
+    const prev = process.env.FORGE_CONTEXT_WINDOW;
+    process.env.FORGE_CONTEXT_WINDOW = '1000000';
+    try {
+      const r = routeDecision(forgeDir, 1, tp);
+      assert.ok(typeof r !== 'string' || !/Context approaching limit/.test(r),
+        'env var must override config to prevent reset');
+    } finally {
+      if (prev === undefined) delete process.env.FORGE_CONTEXT_WINDOW;
+      else process.env.FORGE_CONTEXT_WINDOW = prev;
+    }
+  });
+
+  test('second reset trigger returns resume prompt, clears flag, writes file', () => {
+    const { forgeDir, projectDir } = makeTempForgeDir({
+      config: {
+        context_window_tokens: 200000,
+        session_budget_tokens: 10000000,
+        token_budget: 10000000,
+        max_iterations: 100
+      }
+    });
+    // Pre-state: handoff already requested (i.e. we're on the 2nd pass)
+    writeState(forgeDir, {
+      phase: 'executing',
+      iteration: 2,
+      handoff_requested: true,
+      spec: 'ctx',
+      current_task: 'T001'
+    });
+    const tp = writeFakeTranscript(projectDir, 480000);
+    const r = routeDecision(forgeDir, 2, tp);
+
+    // Returns a non-empty string containing the resume-prompt signature
+    assert.strictEqual(typeof r, 'string');
+    assert.ok(r.length > 0, 'return must be non-empty');
+    assert.match(r, /resuming a Forge execution session/);
+
+    // .forge-resume.md written with same content
+    const resumePath = path.join(forgeDir, '.forge-resume.md');
+    assert.ok(fs.existsSync(resumePath));
+    const fileContent = fs.readFileSync(resumePath, 'utf8');
+    assert.match(fileContent, /resuming a Forge execution session/);
+
+    // handoff_requested flag cleared so the loop doesn't re-fire
+    const state2 = tools.readState(forgeDir);
+    assert.strictEqual(state2.data.handoff_requested, false);
+  });
+
+  test('handoff_requested branch outside threshold also self-resumes', () => {
+    // Small transcript, below threshold, but handoff_requested already true
+    // → the standalone "Handoff was requested and completed" branch fires.
+    const { forgeDir, projectDir } = makeTempForgeDir({
+      config: {
+        context_window_tokens: 1000000,
+        session_budget_tokens: 10000000,
+        token_budget: 10000000,
+        max_iterations: 100
+      }
+    });
+    writeState(forgeDir, {
+      phase: 'executing',
+      iteration: 3,
+      handoff_requested: true,
+      spec: 'ctx',
+      current_task: 'T002'
+    });
+    const tp = writeFakeTranscript(projectDir, 1000); // tiny, under any threshold
+    const r = routeDecision(forgeDir, 3, tp);
+    assert.strictEqual(typeof r, 'string');
+    assert.match(r, /resuming a Forge execution session/);
+    const state2 = tools.readState(forgeDir);
+    assert.strictEqual(state2.data.handoff_requested, false);
+  });
+});
+
 runTests();
