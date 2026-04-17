@@ -26,6 +26,7 @@ trailing commas). Boolean fields are `true` or `false`, never `"true"`.
 | `use_worktrees` | boolean | `true` | When true, each task is implemented inside its own git worktree to isolate changes and allow safe parallel execution (R004). |
 | `headless_notify_url` | string or null | `null` | Optional URL that receives POST status updates when Forge runs headless. `null` disables headless notifications. |
 | `context_reset_threshold` | number | `60` | Percent of context window usage that triggers a context reset and handoff snapshot. |
+| `context_window_tokens` | number | `200000` | Approximate total context window in tokens, used by the context-reset estimator. Set to `1000000` for 1M-context models (e.g. `claude-opus-4-7[1m]`). Override at runtime with the `FORGE_CONTEXT_WINDOW` env var. |
 | `repos` | object | `{}` | Multi-repo definitions. Keys are repo tags, values describe path and base branch. See `references/multi-repo.md`. |
 | `cross_repo_rules` | object | see below | Rules governing how cross-repo work is ordered and committed. |
 | `loop` | object | see below | Inner-loop circuit-breaker thresholds. |
