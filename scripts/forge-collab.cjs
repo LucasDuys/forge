@@ -1156,6 +1156,126 @@ function createRecordingGitRunner(behavior) {
 }
 
 // ======================================================================
+// T009 -- research-type task execution + streaming results to git (R014)
+//
+// When an agent claims a task whose `type === "research"` (from
+// categorizeInputs in T007), it runs the research workflow and writes the
+// result to .forge/collab/research/<task-id>.md. The file is committed
+// and pushed by the executing machine so peers see it after `git pull`.
+//
+// Coding-type tasks continue through the existing execute pipeline
+// unchanged; this primitive is only exercised for research-type tasks.
+// ======================================================================
+
+function _researchPath(collabDir, taskId) {
+  if (!collabDir) throw new Error('research path requires collabDir');
+  if (!taskId) throw new Error('research path requires taskId');
+  return path.join(collabDir, 'research', String(taskId) + '.md');
+}
+
+/**
+ * Render a research result document with standard frontmatter so peers
+ * can parse `researcher`, `task_id`, and `completed_at` deterministically.
+ */
+function renderResearchResult({ taskId, researcher, body, completedAt }) {
+  const ts = completedAt || new Date().toISOString();
+  const fm = [
+    '---',
+    'task_id: ' + String(taskId),
+    'researcher: ' + _safeHandle(researcher),
+    'completed_at: ' + ts,
+    '---',
+    ''
+  ].join('\n');
+  return fm + String(body || '').trim() + '\n';
+}
+
+/**
+ * Persist a research result and (optionally) stage+commit+push it so
+ * teammates see the research as soon as it lands on origin.
+ *
+ * opts:
+ *   collabDir  path to .forge/collab/
+ *   taskId     research task id (e.g. "C003")
+ *   researcher handle of the executing agent
+ *   body       markdown research body
+ *   cwd        repo working directory (for git ops)
+ *   runner     injectable git runner (tests pass createRecordingGitRunner)
+ *   push       whether to git add/commit/push (default true). When false,
+ *              caller just gets the on-disk write (e.g. for T012 prompt
+ *              path when auto-push is disabled).
+ */
+function persistResearchResult(opts) {
+  opts = opts || {};
+  const { collabDir, taskId, researcher, body, cwd } = opts;
+  const doPush = opts.push !== false;
+  const runner = typeof opts.runner === 'function' ? opts.runner : _defaultGitRunner();
+  const target = _researchPath(collabDir, taskId);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const doc = renderResearchResult({
+    taskId, researcher, body, completedAt: opts.completedAt
+  });
+  fs.writeFileSync(target, doc);
+  if (!doPush) return { path: target, committed: false, pushed: false };
+  const rel = path.relative(cwd || process.cwd(), target);
+  const msg = 'forge(collab): research result ' + String(taskId) +
+    ' by ' + _safeHandle(researcher);
+  try {
+    runner(['add', rel], { cwd });
+    runner(['commit', '-m', msg], { cwd });
+  } catch (e) {
+    // If nothing new to commit, git errors non-zero. Surface clearly.
+    return { path: target, committed: false, pushed: false, error: e.message };
+  }
+  try {
+    runner(['push', opts.remote || 'origin', 'HEAD'], { cwd });
+  } catch (e) {
+    return { path: target, committed: true, pushed: false, error: e.message };
+  }
+  return { path: target, committed: true, pushed: true };
+}
+
+/**
+ * Stream a section of research output as the agent produces it. Each call
+ * appends a new `## <heading>` block to the research file and commits and
+ * pushes it so peers see incremental progress on their `git pull`.
+ *
+ * No lease/write-contention needed because each task has a single
+ * executing machine (enforced by the claim queue in T003).
+ */
+function appendResearchSection(opts) {
+  opts = opts || {};
+  const { collabDir, taskId, researcher, heading, body, cwd } = opts;
+  const doPush = opts.push !== false;
+  const runner = typeof opts.runner === 'function' ? opts.runner : _defaultGitRunner();
+  const target = _researchPath(collabDir, taskId);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const exists = fs.existsSync(target);
+  if (!exists) {
+    fs.writeFileSync(target, renderResearchResult({
+      taskId, researcher, body: '', completedAt: opts.completedAt
+    }));
+  }
+  const section = '\n## ' + String(heading || 'section') + '\n\n' + String(body || '').trim() + '\n';
+  fs.appendFileSync(target, section);
+  if (!doPush) return { path: target, appended: true, pushed: false };
+  const rel = path.relative(cwd || process.cwd(), target);
+  const msg = 'forge(collab): research progress ' + String(taskId) + ' -- ' + (heading || 'section');
+  try {
+    runner(['add', rel], { cwd });
+    runner(['commit', '-m', msg], { cwd });
+    runner(['push', opts.remote || 'origin', 'HEAD'], { cwd });
+    return { path: target, appended: true, pushed: true };
+  } catch (e) {
+    return { path: target, appended: true, pushed: false, error: e.message };
+  }
+}
+
+function isResearchTask(task) {
+  return !!(task && task.type === 'research');
+}
+
+// ======================================================================
 // Task-claim wrappers -- thin names on top of the generic lease primitive.
 // ======================================================================
 
@@ -1227,6 +1347,10 @@ module.exports = {
   updateTaskBranch,
   deleteTaskBranch,
   createRecordingGitRunner,
+  renderResearchResult,
+  persistResearchResult,
+  appendResearchSection,
+  isResearchTask,
   // Exposed for tests and future-task extension points:
   _internal: {
     readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,

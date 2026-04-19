@@ -21,7 +21,8 @@ const {
   brainstormDump, readAllInputs, consolidateInputs, categorizeInputs,
   writeConsolidatedUnderLease, routeClarifyingQuestion,
   TASK_BRANCH_PREFIX, taskBranchName, startTaskBranch, updateTaskBranch,
-  deleteTaskBranch, createRecordingGitRunner
+  deleteTaskBranch, createRecordingGitRunner,
+  renderResearchResult, persistResearchResult, appendResearchSection, isResearchTask
 } = collab;
 
 function mkTempRepo(originUrl) {
@@ -1136,6 +1137,136 @@ suite('start + update + delete -- R007 lifecycle', () => {
     assert.strictEqual(runner.calls.length, 4);
     const ops = runner.calls.map(c => c.args[0] + ' ' + (c.args.includes('--delete') ? 'delete' : c.args.includes('--force-with-lease') ? 'force-push' : 'push'));
     assert.deepStrictEqual(ops, ['push push', 'push force-push', 'push force-push', 'push delete']);
+  });
+});
+
+// =====================================================================
+// T009 -- research-type task execution (R014)
+// =====================================================================
+
+suite('isResearchTask (R014)', () => {
+  test('true only for type=research tasks', () => {
+    assert.strictEqual(isResearchTask({ type: 'research' }), true);
+    assert.strictEqual(isResearchTask({ type: 'coding' }), false);
+    assert.strictEqual(isResearchTask({}), false);
+    assert.strictEqual(isResearchTask(null), false);
+  });
+});
+
+suite('renderResearchResult (R014)', () => {
+  test('renders frontmatter with task_id, researcher, completed_at', () => {
+    const doc = renderResearchResult({
+      taskId: 'C003', researcher: 'daniel',
+      body: 'findings:\n- redis supports pub/sub natively',
+      completedAt: '2026-04-19T01:00:00Z'
+    });
+    assert.match(doc, /task_id: C003/);
+    assert.match(doc, /researcher: daniel/);
+    assert.match(doc, /completed_at: 2026-04-19T01:00:00Z/);
+    assert.match(doc, /redis supports pub\/sub/);
+  });
+
+  test('sanitizes researcher handle into frontmatter', () => {
+    const doc = renderResearchResult({ taskId: 'C1', researcher: 'evil/../name', body: '' });
+    assert.match(doc, /researcher: evil___\.\._name|researcher: evil_____name|researcher: evil_.._name/);
+  });
+});
+
+suite('persistResearchResult (R014)', () => {
+  test('writes file, stages, commits, pushes (happy path)', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const runner = createRecordingGitRunner();
+    const r = persistResearchResult({
+      collabDir, taskId: 'C003', researcher: 'daniel',
+      body: 'findings...', cwd: projectDir, runner
+    });
+    assert.strictEqual(r.committed, true);
+    assert.strictEqual(r.pushed, true);
+    assert.ok(fs.existsSync(r.path));
+    // Expect git add, commit, push in order
+    const ops = runner.calls.map(c => c.args[0]);
+    assert.deepStrictEqual(ops, ['add', 'commit', 'push']);
+  });
+
+  test('push=false writes file without any git invocations', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const runner = createRecordingGitRunner();
+    const r = persistResearchResult({
+      collabDir, taskId: 'C003', researcher: 'daniel',
+      body: 'findings...', cwd: projectDir, runner, push: false
+    });
+    assert.strictEqual(r.committed, false);
+    assert.strictEqual(r.pushed, false);
+    assert.ok(fs.existsSync(r.path));
+    assert.strictEqual(runner.calls.length, 0);
+  });
+
+  test('commit failure -> returns committed:false with error', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const runner = createRecordingGitRunner({ throwOn: (args) => args[0] === 'commit' });
+    const r = persistResearchResult({
+      collabDir, taskId: 'C003', researcher: 'daniel',
+      body: 'findings...', cwd: projectDir, runner
+    });
+    assert.strictEqual(r.committed, false);
+    assert.ok(r.error);
+  });
+
+  test('push failure after commit -> committed:true, pushed:false', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const runner = createRecordingGitRunner({ throwOn: (args) => args[0] === 'push' });
+    const r = persistResearchResult({
+      collabDir, taskId: 'C003', researcher: 'daniel',
+      body: 'findings...', cwd: projectDir, runner
+    });
+    assert.strictEqual(r.committed, true);
+    assert.strictEqual(r.pushed, false);
+    assert.ok(r.error);
+  });
+});
+
+suite('appendResearchSection (R014 streaming)', () => {
+  test('creates file on first append + commits and pushes each section', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const runner = createRecordingGitRunner();
+    const r1 = appendResearchSection({
+      collabDir, taskId: 'C003', researcher: 'daniel',
+      heading: 'Overview', body: 'redis supports pub/sub',
+      cwd: projectDir, runner
+    });
+    assert.strictEqual(r1.appended, true);
+    assert.strictEqual(r1.pushed, true);
+    const r2 = appendResearchSection({
+      collabDir, taskId: 'C003', researcher: 'daniel',
+      heading: 'Benchmarks', body: 'read throughput: 100k/s',
+      cwd: projectDir, runner
+    });
+    assert.strictEqual(r2.appended, true);
+    assert.strictEqual(r2.pushed, true);
+    const raw = fs.readFileSync(r1.path, 'utf8');
+    assert.match(raw, /## Overview/);
+    assert.match(raw, /## Benchmarks/);
+    // Two full add+commit+push cycles
+    const ops = runner.calls.map(c => c.args[0]);
+    assert.deepStrictEqual(ops, ['add', 'commit', 'push', 'add', 'commit', 'push']);
+  });
+});
+
+suite('mixed coding + research in a categorization', () => {
+  test('only research tasks hit the research pipeline; coding stays unchanged', () => {
+    const tasks = [
+      { id: 'C001', type: 'coding',   title: 'implement something' },
+      { id: 'C002', type: 'research', title: 'investigate library options' },
+      { id: 'C003', type: 'coding',   title: 'wire up route' }
+    ];
+    const researchTasks = tasks.filter(isResearchTask);
+    assert.strictEqual(researchTasks.length, 1);
+    assert.strictEqual(researchTasks[0].id, 'C002');
   });
 });
 
