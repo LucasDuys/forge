@@ -23,7 +23,8 @@ const {
   TASK_BRANCH_PREFIX, taskBranchName, startTaskBranch, updateTaskBranch,
   deleteTaskBranch, createRecordingGitRunner,
   renderResearchResult, persistResearchResult, appendResearchSection, isResearchTask,
-  FLAG_STATUS, writeForwardMotionFlag, listFlags, readFlag, overrideFlag
+  FLAG_STATUS, writeForwardMotionFlag, listFlags, readFlag, overrideFlag,
+  DEFAULT_MERGE_RETRIES, DEFAULT_MERGE_BACKOFF_MS, squashMergeAndPush
 } = collab;
 
 function mkTempRepo(originUrl) {
@@ -1473,6 +1474,135 @@ suite('overrideFlag (R009)', () => {
     const r2 = overrideFlag(collabDir, r.id, 'postgres', { author: 'sarah' });
     assert.strictEqual(r2.overridden, false);
     assert.strictEqual(r2.reason, 'already_overridden');
+  });
+});
+
+// =====================================================================
+// T011 -- per-agent squash-merge with race-retry (R010, TDD)
+// =====================================================================
+
+function _mergeRunnerHelper(opts) {
+  opts = opts || {};
+  let pushesAttempted = 0;
+  const failPushTimes = opts.failPushTimes || 0;
+  const runner = (args) => {
+    runner.calls.push(args.slice());
+    if (args[0] === 'push') {
+      pushesAttempted++;
+      if (pushesAttempted <= failPushTimes) {
+        const e = new Error('push rejected (simulated)');
+        e.stderr = 'non-fast-forward: Updates were rejected because the remote contains work that you do not have locally';
+        throw e;
+      }
+    }
+    return '';
+  };
+  runner.calls = [];
+  return runner;
+}
+
+suite('squashMergeAndPush -- happy path (R010)', () => {
+  test('checks out main, squashes branch, commits, pushes', async () => {
+    const runner = _mergeRunnerHelper();
+    const r = await squashMergeAndPush({ taskId: 'T004', runner, sleep: async () => {} });
+    assert.strictEqual(r.merged, true);
+    assert.strictEqual(r.pushed, true);
+    assert.strictEqual(r.attempts, 1);
+    const ops = runner.calls.map(c => c[0] + (c[1] === '--squash' ? ' --squash' : ''));
+    assert.ok(ops.includes('checkout'));
+    assert.ok(ops.includes('merge --squash'));
+    assert.ok(ops.includes('commit'));
+    assert.ok(ops.includes('push'));
+  });
+
+  test('custom mainBranch + remote + commitMessage threaded through', async () => {
+    const runner = _mergeRunnerHelper();
+    await squashMergeAndPush({
+      taskId: 'T004', runner, sleep: async () => {},
+      mainBranch: 'trunk', remote: 'upstream', commitMessage: 'custom msg'
+    });
+    const commitCall = runner.calls.find(c => c[0] === 'commit');
+    assert.deepStrictEqual(commitCall, ['commit', '-m', 'custom msg']);
+    const pushCall = runner.calls.find(c => c[0] === 'push');
+    assert.deepStrictEqual(pushCall, ['push', 'upstream', 'trunk']);
+    const checkoutCall = runner.calls.find(c => c[0] === 'checkout');
+    assert.deepStrictEqual(checkoutCall, ['checkout', 'trunk']);
+  });
+});
+
+suite('squashMergeAndPush -- race retry (R010)', () => {
+  test('one push rejection -> pull --rebase + retry -> success', async () => {
+    const runner = _mergeRunnerHelper({ failPushTimes: 1 });
+    let sleepCount = 0;
+    const sleep = async (ms) => { sleepCount++; };
+    const r = await squashMergeAndPush({ taskId: 'T004', runner, sleep });
+    assert.strictEqual(r.merged, true);
+    assert.strictEqual(r.pushed, true);
+    assert.strictEqual(r.attempts, 2);
+    const pulls = runner.calls.filter(c => c[0] === 'pull');
+    assert.strictEqual(pulls.length, 1);
+    assert.deepStrictEqual(pulls[0], ['pull', '--rebase', 'origin', 'main']);
+    assert.strictEqual(sleepCount, 1, 'linear backoff should sleep once between retries');
+  });
+
+  test('two push rejections -> two pulls -> third push succeeds', async () => {
+    const runner = _mergeRunnerHelper({ failPushTimes: 2 });
+    const r = await squashMergeAndPush({ taskId: 'T004', runner, sleep: async () => {} });
+    assert.strictEqual(r.pushed, true);
+    assert.strictEqual(r.attempts, 3);
+    const pulls = runner.calls.filter(c => c[0] === 'pull');
+    assert.strictEqual(pulls.length, 2);
+  });
+
+  test('three rejections exhaust retries -> merged:true, pushed:false', async () => {
+    const runner = _mergeRunnerHelper({ failPushTimes: 99 });
+    const r = await squashMergeAndPush({ taskId: 'T004', runner, sleep: async () => {} });
+    assert.strictEqual(r.merged, true);
+    assert.strictEqual(r.pushed, false);
+    assert.strictEqual(r.attempts, DEFAULT_MERGE_RETRIES);
+    assert.match(r.error, /push rejected after/);
+  });
+
+  test('non-race failure (other push error) bubbles up', async () => {
+    let calls = [];
+    const runner = (args) => {
+      calls.push(args);
+      if (args[0] === 'push') {
+        const e = new Error('permission denied');
+        e.stderr = 'remote: permission to repo denied';
+        throw e;
+      }
+      return '';
+    };
+    runner.calls = calls;
+    let threw = null;
+    try {
+      await squashMergeAndPush({ taskId: 'T004', runner, sleep: async () => {} });
+    } catch (e) { threw = e; }
+    assert.ok(threw, 'non-race push errors should throw, not retry');
+    assert.match(threw.message, /permission denied/);
+    assert.strictEqual(calls.filter(c => c[0] === 'pull').length, 0);
+  });
+
+  test('two agents near-simultaneous -- both land cleanly (R010 AC)', async () => {
+    // Agent A: no rejection (wins first). Agent B: one rejection then success.
+    const runnerA = _mergeRunnerHelper({ failPushTimes: 0 });
+    const runnerB = _mergeRunnerHelper({ failPushTimes: 1 });
+    const rA = await squashMergeAndPush({ taskId: 'T004', runner: runnerA, sleep: async () => {} });
+    const rB = await squashMergeAndPush({ taskId: 'T005', runner: runnerB, sleep: async () => {} });
+    assert.strictEqual(rA.pushed, true);
+    assert.strictEqual(rB.pushed, true);
+    assert.strictEqual(rA.attempts, 1);
+    assert.strictEqual(rB.attempts, 2);
+  });
+});
+
+suite('squashMergeAndPush -- defaults', () => {
+  test('DEFAULT_MERGE_RETRIES is 3 per R010 AC', () => {
+    assert.strictEqual(DEFAULT_MERGE_RETRIES, 3);
+  });
+  test('DEFAULT_MERGE_BACKOFF_MS is positive (linear)', () => {
+    assert.ok(DEFAULT_MERGE_BACKOFF_MS > 0);
   });
 });
 

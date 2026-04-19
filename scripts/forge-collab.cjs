@@ -1507,6 +1507,108 @@ function overrideFlag(collabDir, flagId, newDecision, opts) {
 }
 
 // ======================================================================
+// T011 -- per-agent squash-merge with race-retry (R010)
+//
+// On task verify-pass the executing agent squash-merges its worktree
+// branch to main and pushes origin/main. If another agent merged first
+// the push is rejected; we `git pull --rebase origin main` and retry
+// up to 3 times with linear backoff. Two agents merging near-
+// simultaneously both land cleanly.
+//
+// This is the only primitive that writes to main. There is no global
+// "merge-tier" command -- each agent owns its own completed task.
+// ======================================================================
+
+const DEFAULT_MERGE_RETRIES = 3;
+const DEFAULT_MERGE_BACKOFF_MS = 250;
+
+function _looksLikeNonFastForward(err) {
+  const msg = String((err && err.message) || '');
+  const stderr = String((err && err.stderr) || '');
+  const text = msg + ' ' + stderr;
+  return /non-fast-forward|Updates were rejected|rejected|failed to push some refs/i.test(text);
+}
+
+/**
+ * Squash-merge the branch `forge/task/<taskId>` into the local main
+ * branch, then push origin/main. Retries on push-rejection via
+ * pull --rebase so concurrent merges from other agents converge without
+ * conflicts (they're guaranteed disjoint by the planner's
+ * parallel-constraint logic).
+ *
+ * opts:
+ *   taskId          required; source branch = forge/task/<taskId>.
+ *   cwd             repo working dir.
+ *   runner          injectable git runner for tests.
+ *   mainBranch      default "main".
+ *   remote          default "origin".
+ *   commitMessage   commit subject for the squash merge.
+ *   retries         default 3.
+ *   backoffMs       linear backoff step; actual wait = attempt * backoffMs.
+ *   sleep           injectable sleep for deterministic tests; (ms)=>void.
+ *
+ * Returns { merged: true, attempts, pushed: true, ref } on success.
+ * Returns { merged: true, pushed: false, error } if all retries exhaust.
+ */
+async function squashMergeAndPush(opts) {
+  opts = opts || {};
+  if (!opts.taskId) throw new Error('squashMergeAndPush requires taskId');
+  const runner = typeof opts.runner === 'function' ? opts.runner : _defaultGitRunner();
+  const sleep = typeof opts.sleep === 'function'
+    ? opts.sleep
+    : (ms) => new Promise(r => setTimeout(r, ms));
+  const retries = typeof opts.retries === 'number' ? opts.retries : DEFAULT_MERGE_RETRIES;
+  const backoffMs = typeof opts.backoffMs === 'number' ? opts.backoffMs : DEFAULT_MERGE_BACKOFF_MS;
+  const main = opts.mainBranch || 'main';
+  const remote = opts.remote || 'origin';
+  const branch = taskBranchName(opts.taskId);
+  const msg = opts.commitMessage || ('forge(collab): squash ' + opts.taskId);
+
+  // Checkout main, squash-merge source branch, commit.
+  runner(['checkout', main], { cwd: opts.cwd });
+  // --squash stages the changes without committing; we need a follow-up commit.
+  runner(['merge', '--squash', branch], { cwd: opts.cwd });
+  try {
+    runner(['commit', '-m', msg], { cwd: opts.cwd });
+  } catch (e) {
+    // Empty squash (no changes) -- treat as already-merged and continue.
+    if (!/nothing to commit/i.test(String((e && e.stderr) || e.message || ''))) throw e;
+  }
+
+  // Push + rebase-retry loop.
+  let attempts = 0;
+  let lastErr = null;
+  while (attempts < retries) {
+    attempts++;
+    try {
+      runner(['push', remote, main], { cwd: opts.cwd });
+      return { merged: true, pushed: true, attempts, ref: main };
+    } catch (e) {
+      lastErr = e;
+      if (!_looksLikeNonFastForward(e)) {
+        // Not a race rejection -- bubble up immediately.
+        throw e;
+      }
+      // Race: fetch peer's commits, rebase our squash on top, retry.
+      try {
+        runner(['pull', '--rebase', remote, main], { cwd: opts.cwd });
+      } catch (pullErr) {
+        return {
+          merged: true, pushed: false, attempts,
+          error: 'pull-rebase failed: ' + (pullErr.message || pullErr)
+        };
+      }
+      if (attempts < retries) await sleep(attempts * backoffMs);
+    }
+  }
+  return {
+    merged: true, pushed: false, attempts,
+    error: 'push rejected after ' + retries + ' attempts: ' +
+      ((lastErr && lastErr.message) || 'unknown')
+  };
+}
+
+// ======================================================================
 // Task-claim wrappers -- thin names on top of the generic lease primitive.
 // ======================================================================
 
@@ -1587,6 +1689,9 @@ module.exports = {
   listFlags,
   readFlag,
   overrideFlag,
+  DEFAULT_MERGE_RETRIES,
+  DEFAULT_MERGE_BACKOFF_MS,
+  squashMergeAndPush,
   // Exposed for tests and future-task extension points:
   _internal: {
     readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,
