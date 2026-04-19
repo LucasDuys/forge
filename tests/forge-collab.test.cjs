@@ -17,7 +17,9 @@ const {
   DEFAULT_CLAIM_TTL_SECONDS, DEFAULT_HEARTBEAT_SECONDS, DEFAULT_CONSOLIDATION_TTL_SECONDS,
   generateFlagId, flagPath, userScopedLogPath, appendToUserScopedLog,
   selectTransportMode, renderSetupGuide, createTransport, createPollingTransport,
-  POLLING_BRANCH_DEFAULT, POLLING_INTERVAL_MS_DEFAULT
+  POLLING_BRANCH_DEFAULT, POLLING_INTERVAL_MS_DEFAULT,
+  brainstormDump, readAllInputs, consolidateInputs, categorizeInputs,
+  writeConsolidatedUnderLease, routeClarifyingQuestion
 } = collab;
 
 function mkTempRepo(originUrl) {
@@ -836,6 +838,207 @@ suite('package.json peer-dependency declaration (R013)', () => {
       }
     }
     assert.deepStrictEqual(offenders, [], 'ably must only be imported from scripts/forge-collab.cjs');
+  });
+});
+
+// =====================================================================
+// T007 -- brainstorm pipeline (R002, R003, R004, R014, R015, R016)
+// =====================================================================
+
+suite('brainstormDump (R002)', () => {
+  test('writes inputs-<handle>.md with frontmatter and body', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const p = brainstormDump(collabDir, 'daniel', 'we need redis for caching\n\npayments use stripe', { timestamp: '2026-04-19T00:00:00Z' });
+    assert.ok(p.endsWith(path.join('brainstorm', 'inputs-daniel.md')));
+    const raw = fs.readFileSync(p, 'utf8');
+    assert.match(raw, /^---\nauthor: daniel\ntimestamp: 2026-04-19T00:00:00Z\n---/);
+    assert.match(raw, /redis/);
+    assert.match(raw, /stripe/);
+  });
+
+  test('sanitizes unsafe handle characters', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const p = brainstormDump(collabDir, 'evil/../name', 'hi', { timestamp: 'T' });
+    assert.ok(!p.includes('/../'));
+  });
+});
+
+suite('readAllInputs (R003)', () => {
+  test('returns empty array when no brainstorm dir', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    assert.deepStrictEqual(readAllInputs(collabDir), []);
+  });
+
+  test('reads every inputs-*.md with handle + body', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    brainstormDump(collabDir, 'daniel', 'redis caching sessions');
+    brainstormDump(collabDir, 'lucas',  'use nats for pub sub');
+    brainstormDump(collabDir, 'sarah',  'stripe payments');
+    const r = readAllInputs(collabDir);
+    assert.strictEqual(r.length, 3);
+    const handles = r.map(x => x.handle).sort();
+    assert.deepStrictEqual(handles, ['daniel', 'lucas', 'sarah']);
+  });
+});
+
+suite('consolidateInputs (R003)', () => {
+  test('overlapping ideas merge into multi-contributor topic', () => {
+    const inputs = [
+      { handle: 'daniel', body: 'redis cache invalidation is tricky' },
+      { handle: 'lucas',  body: 'cache invalidation strategy matters' },
+      { handle: 'sarah',  body: 'stripe payments need retries' }
+    ];
+    const md = consolidateInputs(inputs);
+    assert.match(md, /contributors:.*(daniel.*lucas|lucas.*daniel)/);
+    assert.match(md, /contributors:.*sarah/);
+  });
+
+  test('empty inputs -> empty string', () => {
+    assert.strictEqual(consolidateInputs([]), '');
+  });
+
+  test('injected consolidator overrides default', () => {
+    assert.strictEqual(
+      consolidateInputs([{ handle: 'd', body: 'x' }], { consolidator: () => 'custom' }),
+      'custom'
+    );
+  });
+});
+
+suite('categorizeInputs (R004, R014, R016)', () => {
+  test('three topics produce at least three categories', () => {
+    const inputs = [
+      { handle: 'daniel', body: 'redis cache' },
+      { handle: 'lucas',  body: 'stripe payments' },
+      { handle: 'sarah',  body: 'react ui polish' }
+    ];
+    const md = consolidateInputs(inputs);
+    const cats = categorizeInputs(md, inputs);
+    assert.ok(cats.length >= 3, 'expected >=3 categories, got ' + cats.length);
+  });
+
+  test('each category has required fields including type in {coding, research}', () => {
+    const inputs = [{ handle: 'daniel', body: 'explore the mongo query planner' }];
+    const md = consolidateInputs(inputs);
+    const cats = categorizeInputs(md, inputs);
+    for (const c of cats) {
+      assert.ok(c.id);
+      assert.ok(c.title);
+      assert.ok(Array.isArray(c.source_contributors));
+      assert.strictEqual(typeof c.is_decision, 'boolean');
+      assert.ok(c.type === 'coding' || c.type === 'research');
+    }
+  });
+
+  test('classifier picks research for explore/investigate topics (R014)', () => {
+    const inputs = [{ handle: 'd', body: 'we should research cache eviction policies' }];
+    const md = consolidateInputs(inputs);
+    const cats = categorizeInputs(md, inputs);
+    assert.ok(cats.some(c => c.type === 'research'));
+  });
+
+  test('contradictions surface as is_decision: true (R005/R016)', () => {
+    const inputs = [
+      { handle: 'daniel', body: 'use redis for pub sub' },
+      { handle: 'lucas',  body: 'use nats for pub sub' }
+    ];
+    const md = consolidateInputs(inputs);
+    const cats = categorizeInputs(md, inputs);
+    const decisions = cats.filter(c => c.is_decision);
+    assert.ok(decisions.length >= 1);
+    assert.ok(decisions[0].source_contributors.includes('daniel'));
+    assert.ok(decisions[0].source_contributors.includes('lucas'));
+  });
+
+  test('injected classifier + detector override defaults', () => {
+    const inputs = [{ handle: 'd', body: 'hi' }];
+    const md = consolidateInputs(inputs);
+    const cats = categorizeInputs(md, inputs, {
+      classifier: () => 'research',
+      contradictionDetector: () => [{ summary: 'forced', positions: [{ option: 'x', contributors: ['d'] }] }]
+    });
+    assert.ok(cats.some(c => c.type === 'research'));
+    assert.ok(cats.some(c => c.is_decision === true && c.title === 'forced'));
+  });
+});
+
+suite('writeConsolidatedUnderLease (R016)', () => {
+  test('single writer -> writes consolidated.md and categories.json', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const inputs = [
+      { handle: 'daniel', body: 'redis cache' },
+      { handle: 'lucas',  body: 'stripe payments' }
+    ];
+    const t = createMemoryTransport();
+    const r = await writeConsolidatedUnderLease(t, collabDir, 'daniel', inputs, { ttlSeconds: 30, now: 1000 });
+    assert.strictEqual(r.held, true);
+    assert.ok(r.result.taskCount >= 2);
+    assert.ok(fs.existsSync(r.result.consolidatedPath));
+    assert.ok(fs.existsSync(r.result.categoriesPath));
+    const cats = JSON.parse(fs.readFileSync(r.result.categoriesPath, 'utf8'));
+    assert.ok(Array.isArray(cats.categories));
+  });
+
+  test('concurrent consolidation -> second defers without writing', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const t = createMemoryTransport();
+    tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1000 });
+    const r = await writeConsolidatedUnderLease(t, collabDir, 'daniel', [{ handle: 'd', body: 'x' }], { ttlSeconds: 30, now: 1001 });
+    assert.strictEqual(r.held, false);
+    assert.match(r.reason, /held_by_lucas/);
+    assert.strictEqual(fs.existsSync(path.join(collabDir, 'brainstorm', 'consolidated.md')), false);
+  });
+});
+
+suite('routeClarifyingQuestion (R015)', () => {
+  test('writes question file + sends targeted transport message', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const sent = [];
+    const transport = {
+      async sendTargeted(handle, event, data) { sent.push({ handle, event, data }); },
+      async publish(event, data) { sent.push({ broadcast: true, event, data }); }
+    };
+    const participants = [
+      { handle: 'daniel', contributions: 'redis cache invalidation', active_tasks: 0 },
+      { handle: 'lucas',  contributions: 'stripe payments',          active_tasks: 0 }
+    ];
+    const r = await routeClarifyingQuestion(transport, collabDir, participants, {
+      text: 'which cache eviction policy should we use?',
+      topic: 'cache',
+      source_section: 'Topic 1'
+    });
+    assert.ok(fs.existsSync(r.path));
+    assert.strictEqual(r.routed_to, 'daniel');
+    const raw = fs.readFileSync(r.path, 'utf8');
+    assert.match(raw, /routed_to: daniel/);
+    assert.match(raw, /status: open/);
+    assert.strictEqual(sent.length, 1);
+    assert.strictEqual(sent[0].handle, 'daniel');
+  });
+
+  test('broadcast on tie -> publish, not sendTargeted', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const sent = [];
+    const transport = {
+      async sendTargeted(h, e, d) { sent.push({ handle: h, event: e, data: d }); },
+      async publish(e, d) { sent.push({ broadcast: true, event: e, data: d }); }
+    };
+    const participants = [
+      { handle: 'a', contributions: 'identical', active_tasks: 0 },
+      { handle: 'b', contributions: 'identical', active_tasks: 0 }
+    ];
+    const r = await routeClarifyingQuestion(transport, collabDir, participants, { text: 'q', topic: 't' }, { scorer: () => 0.5 });
+    assert.strictEqual(r.routed_to, 'broadcast');
+    assert.strictEqual(sent.length, 1);
+    assert.strictEqual(sent[0].broadcast, true);
   });
 });
 

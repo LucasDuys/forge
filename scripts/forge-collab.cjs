@@ -771,6 +771,273 @@ function appendToUserScopedLog(collabDir, kind, handle, entry) {
 }
 
 // ======================================================================
+// T007 -- brainstorm chat + consolidate + categorize + routed questions
+//         (R002, R003, R004, R014, R015, R016)
+// ======================================================================
+
+function _inputsPath(collabDir, handle) {
+  return path.join(collabDir, 'brainstorm', 'inputs-' + _safeHandle(handle) + '.md');
+}
+function _consolidatedPath(collabDir) {
+  return path.join(collabDir, 'brainstorm', 'consolidated.md');
+}
+function _categoriesPath(collabDir) {
+  return path.join(collabDir, 'categories.json');
+}
+function _questionsDir(collabDir, round) {
+  return path.join(collabDir, 'questions', 'round' + (Number(round) || 1));
+}
+
+function _parseFrontmatter(raw) {
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!m) return { frontmatter: {}, body: raw };
+  const fm = {};
+  for (const line of m[1].split('\n')) {
+    const kv = line.match(/^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/);
+    if (kv) fm[kv[1]] = kv[2].trim();
+  }
+  return { frontmatter: fm, body: m[2] };
+}
+
+/**
+ * Persist one participant's refined brainstorm output. The chat-mode
+ * interactive loop happens at the command layer (outside this module);
+ * this primitive only writes the accepted doc with standard frontmatter.
+ */
+function brainstormDump(collabDir, handle, body, opts) {
+  opts = opts || {};
+  const ts = opts.timestamp || new Date().toISOString();
+  const safe = _safeHandle(handle);
+  const p = _inputsPath(collabDir, handle);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const fm = ['---', 'author: ' + safe, 'timestamp: ' + ts, '---', ''].join('\n');
+  fs.writeFileSync(p, fm + String(body || '').trim() + '\n');
+  return p;
+}
+
+/** Load every inputs-*.md with { handle, timestamp, body, path }. */
+function readAllInputs(collabDir) {
+  const dir = path.join(collabDir, 'brainstorm');
+  if (!fs.existsSync(dir)) return [];
+  const files = fs.readdirSync(dir).filter(f => /^inputs-.+\.md$/.test(f));
+  const out = [];
+  for (const f of files) {
+    const full = path.join(dir, f);
+    const raw = fs.readFileSync(full, 'utf8');
+    const parsed = _parseFrontmatter(raw);
+    out.push({
+      handle: parsed.frontmatter.author || f.replace(/^inputs-/, '').replace(/\.md$/, ''),
+      timestamp: parsed.frontmatter.timestamp || null,
+      body: parsed.body,
+      path: full
+    });
+  }
+  return out;
+}
+
+/**
+ * Merge per-user inputs into a single markdown with contributor-tagged
+ * topic sections. Heuristic default; inject opts.consolidator for LLM
+ * fidelity.
+ */
+function consolidateInputs(inputs, opts) {
+  opts = opts || {};
+  if (typeof opts.consolidator === 'function') return opts.consolidator(inputs);
+  if (!Array.isArray(inputs) || inputs.length === 0) return '';
+  const groups = [];
+  for (const inp of inputs) {
+    const paragraphs = String(inp.body || '').split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+    for (const para of paragraphs) {
+      const tokens = _tokenSet(para);
+      let placed = false;
+      for (const g of groups) {
+        let overlap = 0;
+        for (const t of tokens) if (g.tokens.has(t)) overlap++;
+        if (overlap >= 2) {
+          g.paragraphs.push({ author: inp.handle, text: para });
+          g.contributors.add(inp.handle);
+          for (const t of tokens) g.tokens.add(t);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        groups.push({
+          tokens: new Set(tokens),
+          paragraphs: [{ author: inp.handle, text: para }],
+          contributors: new Set([inp.handle])
+        });
+      }
+    }
+  }
+  const lines = ['# Consolidated Brainstorm', ''];
+  groups.forEach((g, i) => {
+    const contribs = Array.from(g.contributors).sort().join(', ');
+    lines.push('## Topic ' + (i + 1) + ' (contributors: ' + contribs + ')');
+    for (const p of g.paragraphs) lines.push('- (' + p.author + ') ' + p.text.replace(/\s+/g, ' '));
+    lines.push('');
+  });
+  return lines.join('\n');
+}
+
+function _extractSections(consolidatedBody) {
+  const lines = String(consolidatedBody || '').split('\n');
+  const sections = [];
+  let current = null;
+  for (const line of lines) {
+    const h = line.match(/^##\s+(.*)$/);
+    if (h) {
+      if (current) sections.push(current);
+      const title = h[1].trim();
+      const cm = title.match(/\(contributors:\s*([^)]+)\)/);
+      const contributors = cm ? cm[1].split(',').map(s => s.trim()).filter(Boolean) : [];
+      current = { title, contributors, body: '' };
+    } else if (current) {
+      current.body += line + '\n';
+    }
+  }
+  if (current) sections.push(current);
+  return sections;
+}
+
+function _defaultClassifier(text /*, inputs */) {
+  const t = String(text || '').toLowerCase();
+  if (/\b(research|explore|investigate|evaluate|unknown|unclear)\b/.test(t)) return 'research';
+  return 'coding';
+}
+
+function _defaultContradictionDetector(inputs) {
+  const opinions = {};
+  for (const inp of inputs) {
+    const useMatch = String(inp.body || '').match(/\b(?:use|prefer|pick)\s+([A-Za-z][A-Za-z0-9_-]{1,30})/gi) || [];
+    for (const m of useMatch) {
+      const token = m.replace(/^(?:use|prefer|pick)\s+/i, '').toLowerCase();
+      if (!opinions[token]) opinions[token] = new Set();
+      opinions[token].add(inp.handle);
+    }
+  }
+  const entries = Object.entries(opinions);
+  if (entries.length < 2) return [];
+  const authorsPerOption = new Set(entries.map(([, a]) => Array.from(a).sort().join(',')));
+  if (authorsPerOption.size < 2) return [];
+  const champions = entries.map(([tok, authors]) => ({ option: tok, contributors: Array.from(authors) }));
+  return [{
+    summary: 'Competing technology choices detected: ' + champions.map(c => c.option).join(' vs '),
+    positions: champions
+  }];
+}
+
+/**
+ * Categorize a consolidated brainstorm into discrete tasks with per-task
+ * `type: "coding" | "research"` and `is_decision` flag (R004, R014, R016).
+ */
+function categorizeInputs(consolidatedBody, inputs, opts) {
+  opts = opts || {};
+  const classify = typeof opts.classifier === 'function' ? opts.classifier : _defaultClassifier;
+  const contradictionDetector = typeof opts.contradictionDetector === 'function'
+    ? opts.contradictionDetector : _defaultContradictionDetector;
+  const sections = _extractSections(consolidatedBody);
+  const tasks = [];
+  let idx = 1;
+  for (const s of sections) {
+    const type = classify(s.title + '\n' + s.body, inputs);
+    const cleanTitle = s.title.replace(/\s*\(contributors:.*\)\s*$/, '').trim();
+    tasks.push({
+      id: 'C' + String(idx).padStart(3, '0'),
+      title: cleanTitle,
+      category: cleanTitle,
+      source_contributors: s.contributors,
+      is_decision: false,
+      type: type === 'research' ? 'research' : 'coding'
+    });
+    idx++;
+  }
+  const contradictions = contradictionDetector(inputs);
+  for (const c of contradictions) {
+    const contribs = Array.from(new Set((c.positions || []).flatMap(p => p.contributors || [])));
+    tasks.push({
+      id: 'C' + String(idx).padStart(3, '0'),
+      title: c.summary,
+      category: 'decision',
+      source_contributors: contribs,
+      is_decision: true,
+      type: 'research',
+      positions: c.positions
+    });
+    idx++;
+  }
+  return tasks;
+}
+
+/**
+ * Write consolidated.md + categories.json under a short-lived consolidation
+ * lease per R016. Returns { held, result? / reason / holder }.
+ */
+async function writeConsolidatedUnderLease(transport, collabDir, claimant, inputs, opts) {
+  opts = opts || {};
+  const leaseName = opts.leaseName || 'consolidation';
+  const ttlSeconds = typeof opts.ttlSeconds === 'number' ? opts.ttlSeconds : DEFAULT_CONSOLIDATION_TTL_SECONDS;
+  const now = _nowMs(opts);
+  return withLease(transport, leaseName, claimant, { ttlSeconds, now }, async () => {
+    const body = consolidateInputs(inputs, opts);
+    const cPath = _consolidatedPath(collabDir);
+    fs.mkdirSync(path.dirname(cPath), { recursive: true });
+    fs.writeFileSync(cPath, body);
+    const tasks = categorizeInputs(body, inputs, opts);
+    const catPath = _categoriesPath(collabDir);
+    fs.mkdirSync(path.dirname(catPath), { recursive: true });
+    fs.writeFileSync(catPath, JSON.stringify({ categories: tasks }, null, 2) + '\n');
+    return { consolidatedPath: cPath, categoriesPath: catPath, taskCount: tasks.length };
+  });
+}
+
+/**
+ * Route a clarifying question to the closest contributor via similarity +
+ * transport ping. Persists a question file for late-joiners (R015).
+ */
+async function routeClarifyingQuestion(transport, collabDir, participants, question, opts) {
+  opts = opts || {};
+  const round = typeof opts.round === 'number' ? opts.round : 1;
+  const qDir = _questionsDir(collabDir, round);
+  fs.mkdirSync(qDir, { recursive: true });
+  const id = opts.id || generateFlagId();
+  const qPath = path.join(qDir, id + '.md');
+  const target = routeToParticipant(
+    String(question.text || '') + '\n' + String(question.source_section || ''),
+    participants,
+    opts
+  );
+  const fm = [
+    '---',
+    'id: ' + id,
+    'round: ' + round,
+    'routed_to: ' + target,
+    'topic: ' + (question.topic || ''),
+    'source_section: ' + (question.source_section || ''),
+    'status: open',
+    'created: ' + new Date().toISOString(),
+    '---',
+    ''
+  ].join('\n');
+  fs.writeFileSync(qPath, fm + String(question.text || '').trim() + '\n');
+  if (transport) {
+    const payload = {
+      id, round,
+      topic: question.topic || '',
+      source_section: question.source_section || '',
+      on_disk_path: qPath,
+      question: question.text
+    };
+    if (target !== 'broadcast' && typeof transport.sendTargeted === 'function') {
+      await transport.sendTargeted(target, 'clarifying-question', payload);
+    } else if (typeof transport.publish === 'function') {
+      await transport.publish('clarifying-question', payload);
+    }
+  }
+  return { id, path: qPath, routed_to: target };
+}
+
+// ======================================================================
 // Task-claim wrappers -- thin names on top of the generic lease primitive.
 // ======================================================================
 
@@ -830,6 +1097,17 @@ module.exports = {
   createPollingTransport,
   POLLING_BRANCH_DEFAULT,
   POLLING_INTERVAL_MS_DEFAULT,
+  brainstormDump,
+  readAllInputs,
+  consolidateInputs,
+  categorizeInputs,
+  writeConsolidatedUnderLease,
+  routeClarifyingQuestion,
   // Exposed for tests and future-task extension points:
-  _internal: { readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet, _isExpired, _claimName, _safeHandle, _safeKind }
+  _internal: {
+    readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,
+    _isExpired, _claimName, _safeHandle, _safeKind,
+    _parseFrontmatter, _extractSections, _defaultClassifier, _defaultContradictionDetector,
+    _inputsPath, _consolidatedPath, _categoriesPath, _questionsDir
+  }
 };
