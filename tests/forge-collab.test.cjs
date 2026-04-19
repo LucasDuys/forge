@@ -15,7 +15,9 @@ const {
   tryAcquireLease, refreshLease, releaseLease, readLease, withLease,
   claimTask, heartbeatTaskClaim, releaseTaskClaim, readTaskClaim, listActiveTaskClaims,
   DEFAULT_CLAIM_TTL_SECONDS, DEFAULT_HEARTBEAT_SECONDS, DEFAULT_CONSOLIDATION_TTL_SECONDS,
-  generateFlagId, flagPath, userScopedLogPath, appendToUserScopedLog
+  generateFlagId, flagPath, userScopedLogPath, appendToUserScopedLog,
+  selectTransportMode, renderSetupGuide, createTransport, createPollingTransport,
+  POLLING_BRANCH_DEFAULT, POLLING_INTERVAL_MS_DEFAULT
 } = collab;
 
 function mkTempRepo(originUrl) {
@@ -579,6 +581,138 @@ suite('defaults match spec-collab config contract', () => {
     assert.ok(DEFAULT_CONSOLIDATION_TTL_SECONDS <= 30);
   });
 });
+
+// =====================================================================
+// T004 -- transport layer (R013, R015): mode select + polling + targeted
+// =====================================================================
+
+suite('selectTransportMode (R013)', () => {
+  test('ABLY_KEY present -> ably', () => {
+    assert.strictEqual(selectTransportMode({ env: { ABLY_KEY: 'xxx' } }), 'ably');
+  });
+
+  test('no ABLY_KEY + polling opt-in -> polling', () => {
+    assert.strictEqual(selectTransportMode({ env: {}, polling: true }), 'polling');
+  });
+
+  test('no ABLY_KEY + no polling opt-in -> setup-required', () => {
+    assert.strictEqual(selectTransportMode({ env: {} }), 'setup-required');
+  });
+
+  test('explicit opts.mode overrides env detection', () => {
+    assert.strictEqual(selectTransportMode({ env: { ABLY_KEY: 'x' }, mode: 'polling' }), 'polling');
+    assert.strictEqual(selectTransportMode({ env: {}, mode: 'memory' }), 'memory');
+  });
+});
+
+suite('renderSetupGuide (R013)', () => {
+  test('includes Ably signup url and ABLY_KEY hint', () => {
+    const g = renderSetupGuide();
+    assert.match(g, /ably\.com/);
+    assert.match(g, /ABLY_KEY/);
+    assert.match(g, /--polling/);
+    assert.match(g, /npm install ably/);
+  });
+});
+
+suite('createTransport dispatcher (R013)', () => {
+  test('no ABLY_KEY without polling -> returns setup-required object with guide', () => {
+    const t = createTransport({ env: {} });
+    assert.strictEqual(t.mode, 'setup-required');
+    assert.match(t.guide, /ABLY_KEY/);
+  });
+
+  test('memory mode returns a working lease store', () => {
+    const t = createTransport({ mode: 'memory' });
+    assert.strictEqual(t.mode, 'memory');
+    assert.strictEqual(typeof t.read, 'function');
+    assert.strictEqual(typeof t.cas, 'function');
+  });
+
+  test('polling mode returns a polling transport', () => {
+    const t = createTransport({ mode: 'polling', ioAdapter: _stubIo() });
+    assert.strictEqual(t.mode, 'polling');
+  });
+});
+
+suite('polling transport (R013, R015)', () => {
+  test('publish + subscribe round-trip via shared io', async () => {
+    const io = _stubIo();
+    const tA = createPollingTransport({ ioAdapter: io, clientId: 'alice', intervalMs: 60_000 });
+    const tB = createPollingTransport({ ioAdapter: io, clientId: 'bob',   intervalMs: 60_000 });
+    await tA.connect();
+    await tB.connect();
+    const received = [];
+    tB.subscribe('lock-claim', (m) => received.push(m));
+    await tA.publish('lock-claim', { task: 'T004' });
+    await tB._internal._refresh();
+    assert.strictEqual(received.length, 1);
+    assert.strictEqual(received[0].data.task, 'T004');
+    assert.strictEqual(received[0].from, 'alice');
+    await tA.disconnect(); await tB.disconnect();
+  });
+
+  test('sendTargeted addresses a specific handle via target field (R015)', async () => {
+    const io = _stubIo();
+    const tA = createPollingTransport({ ioAdapter: io, clientId: 'alice', intervalMs: 60_000 });
+    const tDaniel = createPollingTransport({ ioAdapter: io, clientId: 'daniel', intervalMs: 60_000 });
+    const tLucas  = createPollingTransport({ ioAdapter: io, clientId: 'lucas',  intervalMs: 60_000 });
+    await tA.connect(); await tDaniel.connect(); await tLucas.connect();
+    const danMsgs = [];
+    const lucMsgs = [];
+    tDaniel.subscribe('flag-ping', m => { if (m.data.target === 'daniel') danMsgs.push(m); });
+    tLucas.subscribe('flag-ping',  m => { if (m.data.target === 'lucas')  lucMsgs.push(m); });
+    await tA.sendTargeted('daniel', 'flag-ping', { flag: 'F001' });
+    await tDaniel._internal._refresh();
+    await tLucas._internal._refresh();
+    assert.strictEqual(danMsgs.length, 1);
+    assert.strictEqual(lucMsgs.length, 0, 'non-target must receive zero messages per R015 AC');
+    await tA.disconnect(); await tDaniel.disconnect(); await tLucas.disconnect();
+  });
+
+  test('cas semantics -- single-node CAS accepts null-expected once, rejects thereafter', async () => {
+    // Unit-scope test: one polling transport's cas enforces CAS on its own
+    // local cache. Cross-node race resolution is a git-layer concern tested
+    // in the integration review (T013), not here.
+    const io = _stubIo();
+    const t = createPollingTransport({ ioAdapter: io, clientId: 'alice', intervalMs: 60_000 });
+    await t.connect();
+    const lease = { name: 'claim:T001', claimant: 'alice', acquiredAt: 'T', expiresAt: 'T' };
+    assert.strictEqual(t.cas('claim:T001', null, lease), true);
+    // Second attempt with null-expected must fail because the slot is now occupied.
+    assert.strictEqual(t.cas('claim:T001', null, Object.assign({}, lease, { claimant: 'bob' })), false);
+    // cas with the current value as expected succeeds (refresh/takeover pattern).
+    assert.strictEqual(t.cas('claim:T001', lease, Object.assign({}, lease, { expiresAt: 'T+1' })), true);
+    await t.disconnect();
+  });
+});
+
+suite('polling transport defaults', () => {
+  test('POLLING_BRANCH_DEFAULT is forge/collab-state', () => {
+    assert.strictEqual(POLLING_BRANCH_DEFAULT, 'forge/collab-state');
+  });
+  test('POLLING_INTERVAL_MS_DEFAULT is within 2-3 seconds per R013 AC', () => {
+    assert.ok(POLLING_INTERVAL_MS_DEFAULT >= 2000 && POLLING_INTERVAL_MS_DEFAULT <= 3000);
+  });
+});
+
+// Shared in-memory io adapter for polling transport tests.
+function _stubIo() {
+  const state = { leases: {}, messages: [] };
+  return {
+    async ensureBranch() { return true; },
+    async readBranch() { return JSON.parse(JSON.stringify(state)); },
+    async writeLease(branch, name, lease) {
+      if (lease === null) delete state.leases[name];
+      else state.leases[name] = lease;
+      return true;
+    },
+    async appendMessage(branch, msg) {
+      state.messages.push(msg);
+      return true;
+    }
+  };
+}
 
 // =====================================================================
 // T006 -- single-writer utilities (R016): flag IDs + user-scoped logs
