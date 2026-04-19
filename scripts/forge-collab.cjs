@@ -371,6 +371,76 @@ async function withLease(transport, name, claimant, opts, fn) {
 }
 
 // ======================================================================
+// T006 -- single-writer utilities: flag IDs + user-scoped append logs (R016)
+//
+// Two tiny building blocks that remove cross-writer contention without
+// requiring the transport-gated lease machinery above:
+//   * generateFlagId()     -- UUID-based IDs so concurrent flag writes land
+//                             at distinct filesystem paths by construction.
+//   * userScopedLogPath()  -- return per-user log paths so append-only
+//                             coordination logs never have cross-user races.
+//   * appendToUserScopedLog() -- small wrapper that creates the directory
+//                             and appends a JSONL entry.
+// ======================================================================
+
+function _safeHandle(handle) {
+  // Strip anything that could escape a filename; keep alnum + - + _
+  return String(handle || 'unknown').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || 'unknown';
+}
+
+function _safeKind(kind) {
+  return String(kind || 'log').replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64) || 'log';
+}
+
+/**
+ * Generate a new flag ID. Uses crypto.randomUUID() under the hood. Two
+ * concurrent invocations on the same machine (or across machines) produce
+ * distinct IDs with cryptographic probability, so simultaneous flag writes
+ * land at distinct filesystem paths per spec-collab R016 AC.
+ *
+ * Format: "F<12-hex-prefix-of-uuid>" -- short, greppable, filesystem-safe.
+ */
+function generateFlagId() {
+  const uuid = crypto.randomUUID();
+  const hex = uuid.replace(/-/g, '').slice(0, 12);
+  return 'F' + hex;
+}
+
+/**
+ * Build the filesystem path of the flag file for the given ID. Lives under
+ * `<collabDir>/flags/<id>.md`. Directory is created by callers that actually
+ * write.
+ */
+function flagPath(collabDir, flagId) {
+  if (!collabDir) throw new Error('flagPath requires collabDir');
+  if (!flagId) throw new Error('flagPath requires flagId');
+  return path.join(collabDir, 'flags', String(flagId) + '.md');
+}
+
+/**
+ * Return the per-user log path for a given kind. Append-only coordination
+ * logs (routing decisions, flag emits, etc.) are user-scoped by filename
+ * rather than funneled into a single shared file -- so two users appending
+ * simultaneously never contend on the same file.
+ */
+function userScopedLogPath(collabDir, kind, handle) {
+  if (!collabDir) throw new Error('userScopedLogPath requires collabDir');
+  return path.join(collabDir, _safeKind(kind) + '-log-' + _safeHandle(handle) + '.jsonl');
+}
+
+/**
+ * Append a JSON-serializable entry as a single JSONL line. Creates parent
+ * dirs as needed. Each entry gets an ISO timestamp if none provided.
+ */
+function appendToUserScopedLog(collabDir, kind, handle, entry) {
+  const p = userScopedLogPath(collabDir, kind, handle);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const withTs = Object.assign({ ts: new Date().toISOString() }, entry || {});
+  fs.appendFileSync(p, JSON.stringify(withTs) + '\n');
+  return p;
+}
+
+// ======================================================================
 // Task-claim wrappers -- thin names on top of the generic lease primitive.
 // ======================================================================
 
@@ -419,6 +489,10 @@ module.exports = {
   releaseTaskClaim,
   readTaskClaim,
   listActiveTaskClaims,
+  generateFlagId,
+  flagPath,
+  userScopedLogPath,
+  appendToUserScopedLog,
   // Exposed for tests and future-task extension points:
-  _internal: { readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet, _isExpired, _claimName }
+  _internal: { readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet, _isExpired, _claimName, _safeHandle, _safeKind }
 };

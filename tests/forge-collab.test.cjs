@@ -14,7 +14,8 @@ const {
   createMemoryTransport,
   tryAcquireLease, refreshLease, releaseLease, readLease, withLease,
   claimTask, heartbeatTaskClaim, releaseTaskClaim, readTaskClaim, listActiveTaskClaims,
-  DEFAULT_CLAIM_TTL_SECONDS, DEFAULT_HEARTBEAT_SECONDS, DEFAULT_CONSOLIDATION_TTL_SECONDS
+  DEFAULT_CLAIM_TTL_SECONDS, DEFAULT_HEARTBEAT_SECONDS, DEFAULT_CONSOLIDATION_TTL_SECONDS,
+  generateFlagId, flagPath, userScopedLogPath, appendToUserScopedLog
 } = collab;
 
 function mkTempRepo(originUrl) {
@@ -576,6 +577,84 @@ suite('defaults match spec-collab config contract', () => {
   });
   test('DEFAULT_CONSOLIDATION_TTL_SECONDS <= 30 (matches R016 AC)', () => {
     assert.ok(DEFAULT_CONSOLIDATION_TTL_SECONDS <= 30);
+  });
+});
+
+// =====================================================================
+// T006 -- single-writer utilities (R016): flag IDs + user-scoped logs
+// =====================================================================
+
+suite('generateFlagId', () => {
+  test('returns F-prefixed 13-char id', () => {
+    const id = generateFlagId();
+    assert.match(id, /^F[0-9a-f]{12}$/);
+  });
+
+  test('two concurrent generations produce distinct ids (filesystem-safe)', () => {
+    const n = 500;
+    const ids = new Set();
+    for (let i = 0; i < n; i++) ids.add(generateFlagId());
+    assert.strictEqual(ids.size, n, 'expected all generated flag ids to be unique');
+  });
+
+  test('flagPath composes collabDir + flags/<id>.md', () => {
+    const p = flagPath('/tmp/collab', 'F0123456789ab');
+    assert.ok(p.endsWith(path.join('flags', 'F0123456789ab.md')));
+    assert.throws(() => flagPath('', 'F1'));
+    assert.throws(() => flagPath('/tmp', ''));
+  });
+});
+
+suite('userScopedLogPath', () => {
+  test('includes kind and handle in filename', () => {
+    const p = userScopedLogPath('/c', 'routing', 'daniel');
+    assert.ok(p.endsWith('routing-log-daniel.jsonl'));
+  });
+
+  test('sanitizes unsafe handle characters', () => {
+    const p = userScopedLogPath('/c', 'flag-emit', 'evil/../name');
+    assert.ok(!p.includes('/../'));
+    assert.match(path.basename(p), /^flag-emit-log-[A-Za-z0-9_-]+\.jsonl$/);
+  });
+
+  test('defaults unknown kind/handle to safe placeholders', () => {
+    const p = userScopedLogPath('/c', '', null);
+    assert.match(path.basename(p), /^log-log-unknown\.jsonl$/);
+  });
+});
+
+suite('appendToUserScopedLog', () => {
+  test('appends a JSONL line with ts and creates parent dir', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const p1 = appendToUserScopedLog(collabDir, 'routing', 'daniel', { event: 'routed', target: 'lucas' });
+    const p2 = appendToUserScopedLog(collabDir, 'routing', 'daniel', { event: 'routed', target: 'sarah' });
+    assert.strictEqual(p1, p2);
+    const lines = fs.readFileSync(p1, 'utf8').trim().split('\n');
+    assert.strictEqual(lines.length, 2);
+    const first = JSON.parse(lines[0]);
+    const second = JSON.parse(lines[1]);
+    assert.ok(first.ts && second.ts, 'each entry gets ts');
+    assert.strictEqual(first.target, 'lucas');
+    assert.strictEqual(second.target, 'sarah');
+  });
+
+  test('two users appending simultaneously land in distinct files (no contention)', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const pA = appendToUserScopedLog(collabDir, 'routing', 'alice', { n: 1 });
+    const pB = appendToUserScopedLog(collabDir, 'routing', 'bob',   { n: 2 });
+    assert.notStrictEqual(pA, pB);
+    assert.ok(fs.existsSync(pA));
+    assert.ok(fs.existsSync(pB));
+  });
+
+  test('preserves caller-provided ts when supplied', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const p = appendToUserScopedLog(collabDir, 'flag-emit', 'daniel', { ts: 'custom-ts', flag: 'F1' });
+    const entry = JSON.parse(fs.readFileSync(p, 'utf8').trim());
+    assert.strictEqual(entry.ts, 'custom-ts');
   });
 });
 
