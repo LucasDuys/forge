@@ -1038,6 +1038,124 @@ async function routeClarifyingQuestion(transport, collabDir, participants, quest
 }
 
 // ======================================================================
+// T008 -- per-task branches pushed to origin with checkpoint updates (R007)
+//
+// Each active worktree is mirrored on origin as `forge/task/<task-id>` so
+// teammates can observe in-flight work via `git fetch && git checkout`.
+// The primitive is runner-injectable so tests verify the git invocations
+// without a real remote.
+//
+// Branch lifecycle:
+//   startTaskBranch(id, ref) -> push forge/task/<id> at `ref` to origin.
+//   updateTaskBranch(id)     -> push latest local commits (called after
+//                               each checkpoint write).
+//   deleteTaskBranch(id)     -> delete origin branch on successful
+//                               squash-merge. Failures are non-fatal
+//                               (the worktree code still converges).
+// ======================================================================
+
+const TASK_BRANCH_PREFIX = 'forge/task/';
+
+function taskBranchName(taskId) {
+  if (!taskId) throw new Error('taskBranchName requires a task id');
+  return TASK_BRANCH_PREFIX + String(taskId);
+}
+
+function _defaultGitRunner() {
+  return function gitRun(args, opts) {
+    opts = opts || {};
+    return execFileSync('git', args, {
+      cwd: opts.cwd || process.cwd(),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+  };
+}
+
+/**
+ * Push the current worktree's branch as forge/task/<id> to origin.
+ *
+ * opts:
+ *   cwd       worktree directory (defaults to process.cwd())
+ *   ref       local ref / commit to push (defaults to HEAD)
+ *   remote    remote name (defaults to "origin")
+ *   runner    injectable git-runner for tests; (args, opts) -> stdout string
+ *   force     whether to force-push. Default false. Set true for checkpoint
+ *             updates that rewrite history mid-task.
+ *
+ * Returns { pushed: true, branch, remote } on success. Throws on git error
+ * with a clear message so callers can decide whether to retry.
+ */
+function startTaskBranch(taskId, opts) {
+  opts = opts || {};
+  const branch = taskBranchName(taskId);
+  const remote = opts.remote || 'origin';
+  const ref = opts.ref || 'HEAD';
+  const runner = typeof opts.runner === 'function' ? opts.runner : _defaultGitRunner();
+  const args = ['push'];
+  if (opts.force) args.push('--force-with-lease');
+  args.push(remote, ref + ':refs/heads/' + branch);
+  runner(args, { cwd: opts.cwd });
+  return { pushed: true, branch, remote };
+}
+
+/**
+ * Push the latest local commits on the worktree's branch to origin.
+ * Called after each Forge checkpoint step so teammates see in-flight code.
+ * Always uses --force-with-lease because checkpoints can overwrite prior
+ * WIP commits.
+ */
+function updateTaskBranch(taskId, opts) {
+  return startTaskBranch(taskId, Object.assign({}, opts, { force: true }));
+}
+
+/**
+ * Delete the origin-side task branch after successful squash-merge.
+ * Non-fatal: swallows errors so a momentarily-unreachable remote doesn't
+ * block task completion. Returns { deleted, branch, remote, error? }.
+ */
+function deleteTaskBranch(taskId, opts) {
+  opts = opts || {};
+  const branch = taskBranchName(taskId);
+  const remote = opts.remote || 'origin';
+  const runner = typeof opts.runner === 'function' ? opts.runner : _defaultGitRunner();
+  try {
+    runner(['push', remote, '--delete', branch], { cwd: opts.cwd });
+    return { deleted: true, branch, remote };
+  } catch (e) {
+    return {
+      deleted: false,
+      branch,
+      remote,
+      error: (e && e.message) || 'delete failed'
+    };
+  }
+}
+
+/**
+ * Capture a git runner that records every invocation, for tests and for
+ * debugging the push pipeline under failure.
+ */
+function createRecordingGitRunner(behavior) {
+  behavior = behavior || {};
+  const calls = [];
+  function runner(args, opts) {
+    calls.push({ args: args.slice(), cwd: (opts && opts.cwd) || null });
+    if (typeof behavior.stdout === 'function') {
+      return behavior.stdout(args, opts) || '';
+    }
+    if (typeof behavior.throwOn === 'function' && behavior.throwOn(args)) {
+      const err = new Error('simulated git failure: ' + args.join(' '));
+      err.stderr = Buffer.from('simulated');
+      throw err;
+    }
+    return '';
+  }
+  runner.calls = calls;
+  return runner;
+}
+
+// ======================================================================
 // Task-claim wrappers -- thin names on top of the generic lease primitive.
 // ======================================================================
 
@@ -1103,6 +1221,12 @@ module.exports = {
   categorizeInputs,
   writeConsolidatedUnderLease,
   routeClarifyingQuestion,
+  TASK_BRANCH_PREFIX,
+  taskBranchName,
+  startTaskBranch,
+  updateTaskBranch,
+  deleteTaskBranch,
+  createRecordingGitRunner,
   // Exposed for tests and future-task extension points:
   _internal: {
     readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,

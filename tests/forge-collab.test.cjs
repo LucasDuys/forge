@@ -19,7 +19,9 @@ const {
   selectTransportMode, renderSetupGuide, createTransport, createPollingTransport,
   POLLING_BRANCH_DEFAULT, POLLING_INTERVAL_MS_DEFAULT,
   brainstormDump, readAllInputs, consolidateInputs, categorizeInputs,
-  writeConsolidatedUnderLease, routeClarifyingQuestion
+  writeConsolidatedUnderLease, routeClarifyingQuestion,
+  TASK_BRANCH_PREFIX, taskBranchName, startTaskBranch, updateTaskBranch,
+  deleteTaskBranch, createRecordingGitRunner
 } = collab;
 
 function mkTempRepo(originUrl) {
@@ -1039,6 +1041,101 @@ suite('routeClarifyingQuestion (R015)', () => {
     assert.strictEqual(r.routed_to, 'broadcast');
     assert.strictEqual(sent.length, 1);
     assert.strictEqual(sent[0].broadcast, true);
+  });
+});
+
+// =====================================================================
+// T008 -- per-task branches pushed to origin (R007)
+// =====================================================================
+
+suite('taskBranchName (R007)', () => {
+  test('prefixes task id with forge/task/', () => {
+    assert.strictEqual(taskBranchName('T004'), 'forge/task/T004');
+    assert.strictEqual(TASK_BRANCH_PREFIX, 'forge/task/');
+  });
+
+  test('rejects empty task id', () => {
+    assert.throws(() => taskBranchName(''));
+    assert.throws(() => taskBranchName(null));
+  });
+});
+
+suite('startTaskBranch (R007)', () => {
+  test('pushes HEAD to origin refs/heads/forge/task/<id> by default', () => {
+    const runner = createRecordingGitRunner();
+    const r = startTaskBranch('T004', { runner, cwd: '/tmp/worktree' });
+    assert.strictEqual(r.pushed, true);
+    assert.strictEqual(r.branch, 'forge/task/T004');
+    assert.strictEqual(r.remote, 'origin');
+    assert.strictEqual(runner.calls.length, 1);
+    assert.deepStrictEqual(runner.calls[0].args, [
+      'push', 'origin', 'HEAD:refs/heads/forge/task/T004'
+    ]);
+    assert.strictEqual(runner.calls[0].cwd, '/tmp/worktree');
+  });
+
+  test('honors opts.ref for arbitrary source ref', () => {
+    const runner = createRecordingGitRunner();
+    startTaskBranch('T005', { runner, ref: 'abc1234' });
+    assert.deepStrictEqual(runner.calls[0].args, [
+      'push', 'origin', 'abc1234:refs/heads/forge/task/T005'
+    ]);
+  });
+
+  test('honors opts.remote override', () => {
+    const runner = createRecordingGitRunner();
+    startTaskBranch('T005', { runner, remote: 'upstream' });
+    assert.match(runner.calls[0].args.join(' '), /upstream/);
+  });
+
+  test('opts.force adds --force-with-lease', () => {
+    const runner = createRecordingGitRunner();
+    startTaskBranch('T005', { runner, force: true });
+    assert.ok(runner.calls[0].args.includes('--force-with-lease'));
+  });
+
+  test('surfaces git errors', () => {
+    const runner = createRecordingGitRunner({ throwOn: () => true });
+    assert.throws(() => startTaskBranch('T005', { runner }));
+  });
+});
+
+suite('updateTaskBranch (R007, checkpoint refresh)', () => {
+  test('always uses --force-with-lease', () => {
+    const runner = createRecordingGitRunner();
+    updateTaskBranch('T004', { runner });
+    assert.ok(runner.calls[0].args.includes('--force-with-lease'));
+  });
+});
+
+suite('deleteTaskBranch (R007, post-completion cleanup)', () => {
+  test('push --delete with branch name', () => {
+    const runner = createRecordingGitRunner();
+    const r = deleteTaskBranch('T004', { runner });
+    assert.strictEqual(r.deleted, true);
+    assert.deepStrictEqual(runner.calls[0].args, [
+      'push', 'origin', '--delete', 'forge/task/T004'
+    ]);
+  });
+
+  test('non-fatal on git error -- returns deleted:false with reason', () => {
+    const runner = createRecordingGitRunner({ throwOn: () => true });
+    const r = deleteTaskBranch('T004', { runner });
+    assert.strictEqual(r.deleted, false);
+    assert.ok(r.error);
+  });
+});
+
+suite('start + update + delete -- R007 lifecycle', () => {
+  test('sequence mirrors Forge task lifecycle', () => {
+    const runner = createRecordingGitRunner();
+    startTaskBranch('T010', { runner });
+    updateTaskBranch('T010', { runner });        // checkpoint 1
+    updateTaskBranch('T010', { runner });        // checkpoint 2
+    deleteTaskBranch('T010', { runner });        // post squash-merge
+    assert.strictEqual(runner.calls.length, 4);
+    const ops = runner.calls.map(c => c.args[0] + ' ' + (c.args.includes('--delete') ? 'delete' : c.args.includes('--force-with-lease') ? 'force-push' : 'push'));
+    assert.deepStrictEqual(ops, ['push push', 'push force-push', 'push force-push', 'push delete']);
   });
 });
 
