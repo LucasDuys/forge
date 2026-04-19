@@ -24,6 +24,10 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
 const DEFAULT_EPSILON = 0.05;
+const DEFAULT_CLAIM_TTL_SECONDS = 120;
+const DEFAULT_HEARTBEAT_SECONDS = 30;
+const DEFAULT_CONSOLIDATION_TTL_SECONDS = 30;
+const CLAIM_PREFIX = 'claim:';
 
 /**
  * Return the origin remote URL for the repo at `cwd`, or throw if none exists.
@@ -194,11 +198,227 @@ function routeToParticipant(targetText, participants, opts) {
   return top.handle;
 }
 
+// ======================================================================
+// T003 -- distributed claim queue + consolidation-lease primitive (R006, R016)
+//
+// One generic lease primitive, two use cases:
+//   * Task claims are leases namespaced `claim:<taskId>` with TTL ~120s.
+//   * Single-writer coordination (R016) uses a short-lived lease named
+//     e.g. "consolidation" with TTL <= 30s.
+//
+// The transport backend is injectable so T004 can swap in Ably / polling
+// branch implementations without touching this primitive. An in-memory
+// transport ships here for tests and as the shape reference.
+// ======================================================================
+
+function _nowMs(opts) {
+  return (opts && typeof opts.now === 'number') ? opts.now : Date.now();
+}
+
+/**
+ * In-memory lease transport -- the reference shape for T004 backends.
+ *
+ * Contract (all methods synchronous in this shape; real backends may be async):
+ *   read(name) -> lease | null
+ *   cas(name, expected, next) -> boolean   atomic compare-and-set; null expected
+ *                                           means "only succeed if no current entry"
+ *   del(name, expected) -> boolean         atomic delete-if-match
+ *   list() -> lease[]
+ *
+ * A lease object is shaped { name, claimant, acquiredAt, expiresAt }.
+ */
+function createMemoryTransport() {
+  const store = new Map();
+  function read(name) {
+    return store.has(name) ? Object.assign({}, store.get(name)) : null;
+  }
+  function _same(a, b) {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return a.claimant === b.claimant && a.acquiredAt === b.acquiredAt;
+  }
+  function cas(name, expected, next) {
+    const current = store.has(name) ? store.get(name) : null;
+    if (expected === null) {
+      if (current !== null) return false;
+    } else if (!_same(current, expected)) {
+      return false;
+    }
+    if (next === null) {
+      store.delete(name);
+    } else {
+      store.set(name, Object.assign({}, next));
+    }
+    return true;
+  }
+  function del(name, expected) {
+    return cas(name, expected, null);
+  }
+  function list() {
+    return Array.from(store.values()).map(v => Object.assign({}, v));
+  }
+  return { read, cas, del, list };
+}
+
+function _isExpired(lease, now) {
+  if (!lease || !lease.expiresAt) return true;
+  return Date.parse(lease.expiresAt) <= now;
+}
+
+/**
+ * Try to acquire the lease `name` for `claimant`. Returns:
+ *   { acquired: true, lease } on success (including stale-takeover)
+ *   { acquired: false, reason, holder } when another live claimant holds it
+ *
+ * opts:
+ *   ttlSeconds  lease lifetime (default 120s for claims; callers override
+ *               to 30s for consolidation or other short-lived leases)
+ *   now         optional override for deterministic tests (ms since epoch)
+ */
+function tryAcquireLease(transport, name, claimant, opts) {
+  opts = opts || {};
+  if (!transport || typeof transport.read !== 'function') {
+    throw new Error('tryAcquireLease requires a transport object');
+  }
+  if (!name) throw new Error('tryAcquireLease requires a lease name');
+  if (!claimant) throw new Error('tryAcquireLease requires a claimant handle');
+  const ttl = typeof opts.ttlSeconds === 'number' ? opts.ttlSeconds : DEFAULT_CLAIM_TTL_SECONDS;
+  const now = _nowMs(opts);
+  const current = transport.read(name);
+  const expiresAt = new Date(now + ttl * 1000).toISOString();
+  const acquiredAt = new Date(now).toISOString();
+  const next = { name, claimant, acquiredAt, expiresAt };
+
+  if (current && !_isExpired(current, now) && current.claimant !== claimant) {
+    return {
+      acquired: false,
+      reason: 'held_by_' + current.claimant,
+      holder: current
+    };
+  }
+
+  // Either fresh, stale, or already ours -> take/refresh.
+  const ok = transport.cas(name, current, next);
+  if (!ok) {
+    const nowHolder = transport.read(name);
+    return {
+      acquired: false,
+      reason: 'lost_race',
+      holder: nowHolder
+    };
+  }
+  return { acquired: true, lease: next, tookOverStale: !!(current && _isExpired(current, now)) };
+}
+
+/**
+ * Refresh the lease `name`. Succeeds only if `claimant` currently holds it.
+ */
+function refreshLease(transport, name, claimant, opts) {
+  opts = opts || {};
+  const ttl = typeof opts.ttlSeconds === 'number' ? opts.ttlSeconds : DEFAULT_CLAIM_TTL_SECONDS;
+  const now = _nowMs(opts);
+  const current = transport.read(name);
+  if (!current) return { refreshed: false, reason: 'not_held' };
+  if (current.claimant !== claimant) {
+    return { refreshed: false, reason: 'held_by_other', holder: current };
+  }
+  const next = Object.assign({}, current, {
+    expiresAt: new Date(now + ttl * 1000).toISOString()
+  });
+  const ok = transport.cas(name, current, next);
+  if (!ok) return { refreshed: false, reason: 'lost_race' };
+  return { refreshed: true, lease: next };
+}
+
+/**
+ * Release the lease `name` held by `claimant`. Idempotent: calling release
+ * on a lease you do not hold returns { released: true, noop: true } rather
+ * than throwing -- this matches the existing Forge lock semantics.
+ */
+function releaseLease(transport, name, claimant) {
+  const current = transport.read(name);
+  if (!current) return { released: true, noop: true };
+  if (current.claimant !== claimant) {
+    return { released: false, reason: 'held_by_other', holder: current };
+  }
+  const ok = transport.del(name, current);
+  if (!ok) return { released: false, reason: 'lost_race' };
+  return { released: true };
+}
+
+function readLease(transport, name, opts) {
+  const now = _nowMs(opts);
+  const current = transport.read(name);
+  if (!current) return null;
+  return Object.assign({}, current, { stale: _isExpired(current, now) });
+}
+
+/**
+ * Scoped helper: run `fn` while holding the lease, release afterward.
+ * On contention returns { held: false, ... } without running fn -- callers
+ * see "defer or abort cleanly" semantics per spec-collab R016 AC.
+ */
+async function withLease(transport, name, claimant, opts, fn) {
+  if (typeof fn !== 'function') throw new Error('withLease requires a function as last arg');
+  const acq = tryAcquireLease(transport, name, claimant, opts);
+  if (!acq.acquired) return { held: false, reason: acq.reason, holder: acq.holder };
+  try {
+    const result = await fn(acq.lease);
+    return { held: true, result, lease: acq.lease };
+  } finally {
+    releaseLease(transport, name, claimant);
+  }
+}
+
+// ======================================================================
+// Task-claim wrappers -- thin names on top of the generic lease primitive.
+// ======================================================================
+
+function _claimName(taskId) { return CLAIM_PREFIX + String(taskId); }
+
+function claimTask(transport, taskId, claimant, opts) {
+  return tryAcquireLease(transport, _claimName(taskId), claimant, opts);
+}
+
+function heartbeatTaskClaim(transport, taskId, claimant, opts) {
+  return refreshLease(transport, _claimName(taskId), claimant, opts);
+}
+
+function releaseTaskClaim(transport, taskId, claimant) {
+  return releaseLease(transport, _claimName(taskId), claimant);
+}
+
+function readTaskClaim(transport, taskId, opts) {
+  return readLease(transport, _claimName(taskId), opts);
+}
+
+function listActiveTaskClaims(transport, opts) {
+  const now = _nowMs(opts);
+  return (transport.list() || [])
+    .filter(l => l && typeof l.name === 'string' && l.name.startsWith(CLAIM_PREFIX))
+    .filter(l => !_isExpired(l, now))
+    .map(l => Object.assign({}, l, { task_id: l.name.slice(CLAIM_PREFIX.length) }));
+}
+
 module.exports = {
   sessionIdFromOrigin,
   scoreParticipant,
   routeToParticipant,
   DEFAULT_EPSILON,
+  DEFAULT_CLAIM_TTL_SECONDS,
+  DEFAULT_HEARTBEAT_SECONDS,
+  DEFAULT_CONSOLIDATION_TTL_SECONDS,
+  createMemoryTransport,
+  tryAcquireLease,
+  refreshLease,
+  releaseLease,
+  readLease,
+  withLease,
+  claimTask,
+  heartbeatTaskClaim,
+  releaseTaskClaim,
+  readTaskClaim,
+  listActiveTaskClaims,
   // Exposed for tests and future-task extension points:
-  _internal: { readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet }
+  _internal: { readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet, _isExpired, _claimName }
 };

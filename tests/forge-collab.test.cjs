@@ -8,7 +8,14 @@ const { execFileSync } = require('node:child_process');
 const { suite, test, assert, gitAvailable, makeTempForgeDir, runTests } = require('./_helper.cjs');
 const collab = require('../scripts/forge-collab.cjs');
 
-const { sessionIdFromOrigin, scoreParticipant, routeToParticipant, DEFAULT_EPSILON } = collab;
+const {
+  sessionIdFromOrigin,
+  scoreParticipant, routeToParticipant, DEFAULT_EPSILON,
+  createMemoryTransport,
+  tryAcquireLease, refreshLease, releaseLease, readLease, withLease,
+  claimTask, heartbeatTaskClaim, releaseTaskClaim, readTaskClaim, listActiveTaskClaims,
+  DEFAULT_CLAIM_TTL_SECONDS, DEFAULT_HEARTBEAT_SECONDS, DEFAULT_CONSOLIDATION_TTL_SECONDS
+} = collab;
 
 function mkTempRepo(originUrl) {
   if (!gitAvailable()) return null;
@@ -324,6 +331,251 @@ suite('routeToParticipant -- deterministic tiebreak on handle', () => {
     // Reordering must not change result.
     assert.strictEqual(routeToParticipant('x', inputA, { scorer }), 'broadcast');
     assert.strictEqual(routeToParticipant('x', inputB, { scorer }), 'broadcast');
+  });
+});
+
+// =====================================================================
+// T003 -- claim queue + consolidation-lease primitive (R006, R016)
+// =====================================================================
+
+suite('memory transport', () => {
+  test('read returns null for missing key', () => {
+    const t = createMemoryTransport();
+    assert.strictEqual(t.read('x'), null);
+  });
+
+  test('cas with null expected fails if entry exists', () => {
+    const t = createMemoryTransport();
+    t.cas('x', null, { name: 'x', claimant: 'a', acquiredAt: 'T', expiresAt: 'T' });
+    const ok = t.cas('x', null, { name: 'x', claimant: 'b', acquiredAt: 'T', expiresAt: 'T' });
+    assert.strictEqual(ok, false);
+  });
+
+  test('list returns copy of values', () => {
+    const t = createMemoryTransport();
+    t.cas('x', null, { name: 'x', claimant: 'a', acquiredAt: 'T', expiresAt: 'T' });
+    t.cas('y', null, { name: 'y', claimant: 'b', acquiredAt: 'T', expiresAt: 'T' });
+    assert.strictEqual(t.list().length, 2);
+  });
+});
+
+suite('tryAcquireLease -- basic', () => {
+  test('fresh lease -- acquired', () => {
+    const t = createMemoryTransport();
+    const r = tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
+    assert.strictEqual(r.acquired, true);
+    assert.strictEqual(r.lease.claimant, 'daniel');
+    assert.strictEqual(r.lease.name, 'consolidation');
+    assert.ok(Date.parse(r.lease.expiresAt) > Date.parse(r.lease.acquiredAt));
+  });
+
+  test('second distinct claimant while live -- rejected with holder', () => {
+    const t = createMemoryTransport();
+    tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
+    const r = tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1001 });
+    assert.strictEqual(r.acquired, false);
+    assert.match(r.reason, /held_by_daniel/);
+    assert.strictEqual(r.holder.claimant, 'daniel');
+  });
+
+  test('same claimant re-acquires (treated as refresh)', () => {
+    const t = createMemoryTransport();
+    const a = tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
+    const b = tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 2000 });
+    assert.strictEqual(a.acquired, true);
+    assert.strictEqual(b.acquired, true);
+    assert.ok(Date.parse(b.lease.expiresAt) > Date.parse(a.lease.expiresAt));
+  });
+
+  test('takes over a stale lease after TTL elapsed', () => {
+    const t = createMemoryTransport();
+    tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
+    // Jump forward > 30s
+    const r = tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1000 + 60_000 });
+    assert.strictEqual(r.acquired, true);
+    assert.strictEqual(r.tookOverStale, true);
+    assert.strictEqual(r.lease.claimant, 'lucas');
+  });
+
+  test('two-agent race -- exactly one wins on fresh lease', () => {
+    // Shared transport, both call simultaneously. The CAS backend resolves
+    // the race: the second caller sees the first's write and fails with
+    // lost_race or held_by_other.
+    const t = createMemoryTransport();
+    const r1 = tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
+    const r2 = tryAcquireLease(t, 'consolidation', 'lucas',  { ttlSeconds: 30, now: 1000 });
+    const wins = [r1.acquired, r2.acquired].filter(Boolean).length;
+    assert.strictEqual(wins, 1, 'expected exactly one winner in claim race');
+  });
+
+  test('argument validation', () => {
+    const t = createMemoryTransport();
+    assert.throws(() => tryAcquireLease(null, 'n', 'd'));
+    assert.throws(() => tryAcquireLease(t, '', 'd'));
+    assert.throws(() => tryAcquireLease(t, 'n', ''));
+  });
+});
+
+suite('refreshLease + releaseLease', () => {
+  test('refresh extends expiresAt for the holder', () => {
+    const t = createMemoryTransport();
+    const a = tryAcquireLease(t, 'L', 'd', { ttlSeconds: 10, now: 1000 });
+    const r = refreshLease(t, 'L', 'd', { ttlSeconds: 10, now: 2000 });
+    assert.strictEqual(r.refreshed, true);
+    assert.ok(Date.parse(r.lease.expiresAt) > Date.parse(a.lease.expiresAt));
+  });
+
+  test('refresh by non-holder fails with holder info', () => {
+    const t = createMemoryTransport();
+    tryAcquireLease(t, 'L', 'd', { ttlSeconds: 10, now: 1000 });
+    const r = refreshLease(t, 'L', 'lucas', { ttlSeconds: 10, now: 2000 });
+    assert.strictEqual(r.refreshed, false);
+    assert.match(r.reason, /held_by_other/);
+    assert.strictEqual(r.holder.claimant, 'd');
+  });
+
+  test('release by holder succeeds; re-acquire by other works', () => {
+    const t = createMemoryTransport();
+    tryAcquireLease(t, 'L', 'd', { ttlSeconds: 30, now: 1000 });
+    const rel = releaseLease(t, 'L', 'd');
+    assert.strictEqual(rel.released, true);
+    const r2 = tryAcquireLease(t, 'L', 'lucas', { ttlSeconds: 30, now: 1001 });
+    assert.strictEqual(r2.acquired, true);
+  });
+
+  test('release on already-empty is idempotent noop', () => {
+    const t = createMemoryTransport();
+    const r = releaseLease(t, 'L', 'd');
+    assert.strictEqual(r.released, true);
+    assert.strictEqual(r.noop, true);
+  });
+
+  test('release by non-holder fails', () => {
+    const t = createMemoryTransport();
+    tryAcquireLease(t, 'L', 'd', { ttlSeconds: 30, now: 1000 });
+    const r = releaseLease(t, 'L', 'lucas');
+    assert.strictEqual(r.released, false);
+  });
+});
+
+suite('readLease', () => {
+  test('reports stale=true when past expiry', () => {
+    const t = createMemoryTransport();
+    tryAcquireLease(t, 'L', 'd', { ttlSeconds: 5, now: 1000 });
+    const live = readLease(t, 'L', { now: 1001 });
+    const stale = readLease(t, 'L', { now: 1000 + 60_000 });
+    assert.strictEqual(live.stale, false);
+    assert.strictEqual(stale.stale, true);
+  });
+
+  test('returns null for unknown lease', () => {
+    const t = createMemoryTransport();
+    assert.strictEqual(readLease(t, 'missing', { now: 1 }), null);
+  });
+});
+
+suite('withLease', () => {
+  test('runs fn while holding, releases afterward', async () => {
+    const t = createMemoryTransport();
+    let seen = null;
+    const r = await withLease(t, 'consolidation', 'd', { ttlSeconds: 30, now: 1000 }, async (lease) => {
+      seen = lease.claimant;
+      return 'result-value';
+    });
+    assert.strictEqual(r.held, true);
+    assert.strictEqual(r.result, 'result-value');
+    assert.strictEqual(seen, 'd');
+    // Lease released after fn
+    assert.strictEqual(readLease(t, 'consolidation', { now: 1001 }), null);
+  });
+
+  test('defers cleanly when another holder exists -- does not run fn', async () => {
+    const t = createMemoryTransport();
+    tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1000 });
+    let ran = false;
+    const r = await withLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1001 }, async () => {
+      ran = true;
+      return 'should-not-run';
+    });
+    assert.strictEqual(r.held, false);
+    assert.strictEqual(ran, false);
+    assert.match(r.reason, /held_by_lucas/);
+  });
+
+  test('releases even when fn throws', async () => {
+    const t = createMemoryTransport();
+    let threw = null;
+    try {
+      await withLease(t, 'consolidation', 'd', { ttlSeconds: 30, now: 1000 }, async () => {
+        throw new Error('fn failed');
+      });
+    } catch (e) { threw = e; }
+    assert.ok(threw);
+    // Lease should still be released despite exception.
+    assert.strictEqual(readLease(t, 'consolidation', { now: 1001 }), null);
+  });
+});
+
+suite('task-claim wrappers', () => {
+  test('claimTask / heartbeatTaskClaim / releaseTaskClaim round-trip', () => {
+    const t = createMemoryTransport();
+    const c = claimTask(t, 'T004', 'daniel', { ttlSeconds: DEFAULT_CLAIM_TTL_SECONDS, now: 1000 });
+    assert.strictEqual(c.acquired, true);
+    const hb = heartbeatTaskClaim(t, 'T004', 'daniel', { ttlSeconds: DEFAULT_CLAIM_TTL_SECONDS, now: 2000 });
+    assert.strictEqual(hb.refreshed, true);
+    const rel = releaseTaskClaim(t, 'T004', 'daniel');
+    assert.strictEqual(rel.released, true);
+  });
+
+  test('two agents race for same task -- exactly one wins', () => {
+    const t = createMemoryTransport();
+    const r1 = claimTask(t, 'T004', 'daniel', { now: 1000 });
+    const r2 = claimTask(t, 'T004', 'lucas',  { now: 1000 });
+    const winners = [r1.acquired, r2.acquired].filter(Boolean).length;
+    assert.strictEqual(winners, 1);
+  });
+
+  test('stale claim is reclaimable after TTL', () => {
+    const t = createMemoryTransport();
+    claimTask(t, 'T004', 'daniel', { ttlSeconds: 60, now: 1000 });
+    const r = claimTask(t, 'T004', 'lucas', { ttlSeconds: 60, now: 1000 + 120_000 });
+    assert.strictEqual(r.acquired, true);
+    assert.strictEqual(r.tookOverStale, true);
+  });
+
+  test('readTaskClaim reports stale flag', () => {
+    const t = createMemoryTransport();
+    claimTask(t, 'T004', 'daniel', { ttlSeconds: 10, now: 1000 });
+    const fresh = readTaskClaim(t, 'T004', { now: 1001 });
+    const stale = readTaskClaim(t, 'T004', { now: 1000 + 60_000 });
+    assert.strictEqual(fresh.stale, false);
+    assert.strictEqual(stale.stale, true);
+  });
+
+  test('listActiveTaskClaims filters out expired and non-claim leases', () => {
+    const t = createMemoryTransport();
+    const T = 1_000_000; // use large numbers so ttl math is unambiguous in ms
+    // Active task claim: expires at T + 60s
+    claimTask(t, 'T004', 'daniel', { ttlSeconds: 60, now: T });
+    // Expired task claim: claimed at T - 200s with only 10s ttl -> long expired
+    claimTask(t, 'T005', 'lucas',  { ttlSeconds: 10, now: T - 200_000 });
+    // Non-claim lease (consolidation) -- must not appear in active task claims
+    tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: T });
+    const active = listActiveTaskClaims(t, { now: T + 1000 });
+    const ids = active.map(a => a.task_id).sort();
+    assert.deepStrictEqual(ids, ['T004']);
+  });
+});
+
+suite('defaults match spec-collab config contract', () => {
+  test('DEFAULT_CLAIM_TTL_SECONDS = 120 (matches R006 AC)', () => {
+    assert.strictEqual(DEFAULT_CLAIM_TTL_SECONDS, 120);
+  });
+  test('DEFAULT_HEARTBEAT_SECONDS = 30 (matches R006 AC)', () => {
+    assert.strictEqual(DEFAULT_HEARTBEAT_SECONDS, 30);
+  });
+  test('DEFAULT_CONSOLIDATION_TTL_SECONDS <= 30 (matches R016 AC)', () => {
+    assert.ok(DEFAULT_CONSOLIDATION_TTL_SECONDS <= 30);
   });
 });
 
