@@ -1609,6 +1609,128 @@ async function squashMergeAndPush(opts) {
 }
 
 // ======================================================================
+// T012 -- push-config inheritance + late-join mid-session (R011, R012)
+//
+// Push-config inheritance (R011): Forge's existing config key
+// `auto_push` (default true) gates whether git pushes happen silently or
+// ask the user first. Collab mode reads the same key so per-task branch
+// pushes, research-result pushes, and squash-merges match single-user
+// Forge's behavior. Disabling auto_push gates ONLY git push steps -- not
+// lease heartbeats, flag writes, or targeted transport sends.
+//
+// Late-join (R012): /forge:collaborate on an already-running session
+// pulls git, subscribes to the transport channel, reads the current
+// claims snapshot, and claims only tasks not already held by other
+// participants.
+// ======================================================================
+
+/**
+ * Read the auto-push config from .forge/config.json. Defaults to true so
+ * existing single-user behaviour is preserved when no config exists.
+ */
+function readAutoPushConfig(forgeDir) {
+  try {
+    if (!forgeDir) return true;
+    const p = path.join(forgeDir, 'config.json');
+    if (!fs.existsSync(p)) return true;
+    const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (typeof cfg.auto_push === 'boolean') return cfg.auto_push;
+    if (cfg.collab && typeof cfg.collab.auto_push === 'boolean') return cfg.collab.auto_push;
+    return true;
+  } catch (_) {
+    return true;
+  }
+}
+
+/**
+ * Gate a git push through the configured auto-push behavior.
+ *
+ * opts.autoPush (boolean) -- explicit override; if absent, reads from
+ *   .forge/config.json via opts.forgeDir.
+ * opts.runner   -- injectable git runner.
+ * opts.prompter -- async fn({args, cwd}) -> boolean. Called when
+ *                  auto_push is false; must return true to proceed.
+ * Returns { pushed: true } or { pushed: false, reason }.
+ *
+ * This primitive is consumed by persistResearchResult (T009), by the
+ * per-task branch push in T008, and by the squash-merge in T011. In
+ * collab mode those paths pass opts.forgeDir so the shared config gate
+ * governs every push.
+ */
+async function gatedPush(args, opts) {
+  opts = opts || {};
+  const runner = typeof opts.runner === 'function' ? opts.runner : _defaultGitRunner();
+  let autoPush = opts.autoPush;
+  if (typeof autoPush !== 'boolean') autoPush = readAutoPushConfig(opts.forgeDir);
+
+  if (!autoPush) {
+    if (typeof opts.prompter !== 'function') {
+      return { pushed: false, reason: 'auto_push_disabled_no_prompter' };
+    }
+    const ok = await opts.prompter({ args, cwd: opts.cwd });
+    if (!ok) return { pushed: false, reason: 'user_declined' };
+  }
+  runner(args, { cwd: opts.cwd });
+  return { pushed: true };
+}
+
+/**
+ * Compute which task IDs a late-joining agent can claim, given the
+ * current claims snapshot and the frontier.
+ *
+ * opts:
+ *   transport         collab transport (or memory/ably/polling backend).
+ *   unblockedTaskIds  array of task IDs that the planner reports as
+ *                     currently eligible (dependencies satisfied).
+ *   now               optional clock override for deterministic tests.
+ *
+ * Returns array of IDs that are NOT held by a live claim.
+ */
+function filterClaimableForLateJoin(transport, unblockedTaskIds, opts) {
+  const held = new Set(
+    listActiveTaskClaims(transport, opts).map(c => c.task_id)
+  );
+  return (unblockedTaskIds || []).filter(id => !held.has(id));
+}
+
+/**
+ * Bootstrap sequence for a late-joining participant. Runs `git pull`,
+ * connects the transport if needed, and returns the list of claimable
+ * task IDs. Caller decides which one to claim next.
+ *
+ * opts:
+ *   transport         injected transport (already constructed).
+ *   unblockedTaskIds  planner-provided eligibility list.
+ *   cwd               repo dir for git pull.
+ *   runner            injectable git runner (tests).
+ *   remote            default "origin".
+ *   branch            default "main".
+ *   skipGitPull       when true, skip the pull step (for tests).
+ */
+async function lateJoinBootstrap(opts) {
+  opts = opts || {};
+  const runner = typeof opts.runner === 'function' ? opts.runner : _defaultGitRunner();
+  if (!opts.skipGitPull) {
+    try {
+      runner(['pull', opts.remote || 'origin', opts.branch || 'main'], { cwd: opts.cwd });
+    } catch (e) {
+      return { joined: false, reason: 'git_pull_failed', error: (e && e.message) || String(e) };
+    }
+  }
+  if (opts.transport && typeof opts.transport.connect === 'function') {
+    try { await opts.transport.connect(); } catch (e) {
+      return { joined: false, reason: 'transport_connect_failed', error: e.message };
+    }
+  }
+  const claimable = filterClaimableForLateJoin(
+    opts.transport,
+    opts.unblockedTaskIds || [],
+    { now: opts.now }
+  );
+  return { joined: true, claimable };
+}
+
+// ======================================================================
 // Task-claim wrappers -- thin names on top of the generic lease primitive.
 // ======================================================================
 
@@ -1692,6 +1814,10 @@ module.exports = {
   DEFAULT_MERGE_RETRIES,
   DEFAULT_MERGE_BACKOFF_MS,
   squashMergeAndPush,
+  readAutoPushConfig,
+  gatedPush,
+  filterClaimableForLateJoin,
+  lateJoinBootstrap,
   // Exposed for tests and future-task extension points:
   _internal: {
     readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,

@@ -24,7 +24,8 @@ const {
   deleteTaskBranch, createRecordingGitRunner,
   renderResearchResult, persistResearchResult, appendResearchSection, isResearchTask,
   FLAG_STATUS, writeForwardMotionFlag, listFlags, readFlag, overrideFlag,
-  DEFAULT_MERGE_RETRIES, DEFAULT_MERGE_BACKOFF_MS, squashMergeAndPush
+  DEFAULT_MERGE_RETRIES, DEFAULT_MERGE_BACKOFF_MS, squashMergeAndPush,
+  readAutoPushConfig, gatedPush, filterClaimableForLateJoin, lateJoinBootstrap
 } = collab;
 
 function mkTempRepo(originUrl) {
@@ -1603,6 +1604,160 @@ suite('squashMergeAndPush -- defaults', () => {
   });
   test('DEFAULT_MERGE_BACKOFF_MS is positive (linear)', () => {
     assert.ok(DEFAULT_MERGE_BACKOFF_MS > 0);
+  });
+});
+
+// =====================================================================
+// T012 -- push-config inheritance + late-join (R011, R012)
+// =====================================================================
+
+suite('readAutoPushConfig (R011)', () => {
+  test('defaults to true when config missing', () => {
+    const { forgeDir } = makeTempForgeDir();
+    fs.rmSync(path.join(forgeDir, 'config.json'), { force: true });
+    assert.strictEqual(readAutoPushConfig(forgeDir), true);
+  });
+
+  test('returns explicit true / false from top-level auto_push', () => {
+    const a = makeTempForgeDir({ config: { auto_push: false } });
+    assert.strictEqual(readAutoPushConfig(a.forgeDir), false);
+    const b = makeTempForgeDir({ config: { auto_push: true } });
+    assert.strictEqual(readAutoPushConfig(b.forgeDir), true);
+  });
+
+  test('supports collab.auto_push namespace', () => {
+    const { forgeDir } = makeTempForgeDir({ config: { collab: { auto_push: false } } });
+    assert.strictEqual(readAutoPushConfig(forgeDir), false);
+  });
+
+  test('malformed config defaults to true (safe)', () => {
+    const { forgeDir } = makeTempForgeDir();
+    fs.writeFileSync(path.join(forgeDir, 'config.json'), '{not json');
+    assert.strictEqual(readAutoPushConfig(forgeDir), true);
+  });
+});
+
+suite('gatedPush (R011)', () => {
+  test('auto_push enabled -> silent push, no prompter call', async () => {
+    const runner = createRecordingGitRunner();
+    let prompted = 0;
+    const r = await gatedPush(['push', 'origin', 'main'], {
+      autoPush: true, runner, prompter: async () => { prompted++; return true; }
+    });
+    assert.strictEqual(r.pushed, true);
+    assert.strictEqual(runner.calls.length, 1);
+    assert.strictEqual(prompted, 0);
+  });
+
+  test('auto_push disabled -> prompter called; true proceeds', async () => {
+    const runner = createRecordingGitRunner();
+    let seenArgs = null;
+    const r = await gatedPush(['push', 'origin', 'main'], {
+      autoPush: false, runner,
+      prompter: async (info) => { seenArgs = info.args; return true; }
+    });
+    assert.strictEqual(r.pushed, true);
+    assert.deepStrictEqual(seenArgs, ['push', 'origin', 'main']);
+  });
+
+  test('auto_push disabled + prompter returns false -> user_declined', async () => {
+    const runner = createRecordingGitRunner();
+    const r = await gatedPush(['push', 'origin', 'main'], {
+      autoPush: false, runner, prompter: async () => false
+    });
+    assert.strictEqual(r.pushed, false);
+    assert.strictEqual(r.reason, 'user_declined');
+    assert.strictEqual(runner.calls.length, 0);
+  });
+
+  test('auto_push disabled + no prompter -> auto_push_disabled_no_prompter', async () => {
+    const runner = createRecordingGitRunner();
+    const r = await gatedPush(['push', 'origin', 'main'], { autoPush: false, runner });
+    assert.strictEqual(r.pushed, false);
+    assert.strictEqual(r.reason, 'auto_push_disabled_no_prompter');
+  });
+
+  test('opts.forgeDir reads config when autoPush not given', async () => {
+    const runner = createRecordingGitRunner();
+    const { forgeDir } = makeTempForgeDir({ config: { auto_push: false } });
+    const r = await gatedPush(['push', 'origin', 'main'], {
+      forgeDir, runner, prompter: async () => true
+    });
+    assert.strictEqual(r.pushed, true); // prompter returned true
+  });
+});
+
+suite('filterClaimableForLateJoin (R012)', () => {
+  test('skips already-claimed tasks', () => {
+    const t = createMemoryTransport();
+    claimTask(t, 'T004', 'daniel', { ttlSeconds: 120, now: 1_000_000 });
+    claimTask(t, 'T005', 'lucas',  { ttlSeconds: 120, now: 1_000_000 });
+    const claimable = filterClaimableForLateJoin(t, ['T004', 'T005', 'T006', 'T007'], { now: 1_000_000 + 1000 });
+    assert.deepStrictEqual(claimable.sort(), ['T006', 'T007']);
+  });
+
+  test('stale claims DO become claimable', () => {
+    const t = createMemoryTransport();
+    claimTask(t, 'T004', 'daniel', { ttlSeconds: 10, now: 1_000_000 });
+    const claimable = filterClaimableForLateJoin(t, ['T004'], { now: 1_000_000 + 60_000 });
+    assert.deepStrictEqual(claimable, ['T004']);
+  });
+
+  test('empty unblocked list -> empty claimable', () => {
+    const t = createMemoryTransport();
+    claimTask(t, 'T004', 'daniel', { ttlSeconds: 120, now: 1_000_000 });
+    assert.deepStrictEqual(filterClaimableForLateJoin(t, [], { now: 1_000_000 + 1000 }), []);
+  });
+});
+
+suite('lateJoinBootstrap (R012)', () => {
+  test('runs git pull, connects transport, returns claimable', async () => {
+    const runner = createRecordingGitRunner();
+    const t = createMemoryTransport();
+    // connect() is absent on memory transport; should not fail.
+    claimTask(t, 'T004', 'daniel', { ttlSeconds: 120, now: 1_000_000 });
+    const r = await lateJoinBootstrap({
+      transport: t,
+      unblockedTaskIds: ['T004', 'T005', 'T006'],
+      runner,
+      cwd: '/tmp/repo',
+      now: 1_000_000 + 1000
+    });
+    assert.strictEqual(r.joined, true);
+    assert.deepStrictEqual(r.claimable.sort(), ['T005', 'T006']);
+    const pullCall = runner.calls.find(c => c.args[0] === 'pull').args;
+    assert.deepStrictEqual(pullCall, ['pull', 'origin', 'main']);
+  });
+
+  test('git pull failure -> joined:false, reason: git_pull_failed', async () => {
+    const runner = createRecordingGitRunner({ throwOn: (args) => args[0] === 'pull' });
+    const t = createMemoryTransport();
+    const r = await lateJoinBootstrap({
+      transport: t, unblockedTaskIds: ['T001'], runner, cwd: '/tmp/repo'
+    });
+    assert.strictEqual(r.joined, false);
+    assert.strictEqual(r.reason, 'git_pull_failed');
+  });
+
+  test('custom remote/branch threaded through', async () => {
+    const runner = createRecordingGitRunner();
+    const t = createMemoryTransport();
+    await lateJoinBootstrap({
+      transport: t, unblockedTaskIds: ['T001'], runner,
+      remote: 'upstream', branch: 'trunk'
+    });
+    const pullCall = runner.calls.find(c => c.args[0] === 'pull').args;
+    assert.deepStrictEqual(pullCall, ['pull', 'upstream', 'trunk']);
+  });
+
+  test('skipGitPull bypasses pull for tests', async () => {
+    const runner = createRecordingGitRunner();
+    const t = createMemoryTransport();
+    const r = await lateJoinBootstrap({
+      transport: t, unblockedTaskIds: ['T001'], runner, skipGitPull: true
+    });
+    assert.strictEqual(r.joined, true);
+    assert.strictEqual(runner.calls.length, 0);
   });
 });
 
