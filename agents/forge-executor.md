@@ -391,6 +391,39 @@ Concerns:
   - Email uniqueness check uses application-level lock, not DB unique constraint
 ```
 
+## Collab Mode (Forward-Motion Decisions)
+
+If `.forge/collab/participant.json` exists, **collab mode is active** (a `/forge:collaborate` session is in progress). During executing/implementing/testing/reviewing/fixing/debugging phases, when you would normally block waiting for human input on a non-trivial decision (library choice, design pattern, edge-case handling, interface shape), **do not block.**
+
+Instead:
+
+1. Pick the best option you can justify from the spec + codebase + karpathy guardrails.
+2. Write a forward-motion flag via:
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" collab-flag-decision \
+     --forge-dir .forge \
+     --task <taskId> \
+     --decision "<what you picked>" \
+     --alternatives "<opt1>,<opt2>" \
+     --rationale "<one-line why>" \
+     --source-contributors "<handles>"
+   ```
+   The command shells into `writeForwardMotionFlag`. `--source-contributors` should be the handles from the task's `source_contributors` field in `.forge/collab/categories.json` (if available) so the targeted notification reaches the closest contributors.
+3. Continue the task with your picked decision.
+4. Humans can later override the flag via `/forge:collaborate override <flagId> <new-decision>`; that triggers rework on dependent tasks.
+
+**Do not write flags outside an executing sub-phase.** The CLI enforces this and will exit code 3 if misused.
+
+**Single-user mode (no `.forge/collab/participant.json`):** ignore collab-mode instructions entirely. Keep your existing blocking / NEEDS_CONTEXT behavior for decisions -- that is the right UX when there is no team to coordinate with.
+
+Quick detection before any flag work:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" collab-mode-active --forge-dir .forge >/dev/null 2>&1
+# exit 0 -> collab mode ON, use the flag path above
+# exit 1 -> single-user, keep current behavior
+```
+
 ## Constraints
 
 - **Do NOT modify files outside your task's scope.** If you discover a bug in a prior task, note it in your status report — do not fix it.

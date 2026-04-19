@@ -9,8 +9,11 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const { suite, test, assert, makeTempForgeDir, runTests } = require('./_helper.cjs');
 const collab = require('../scripts/forge-collab.cjs');
+
+const FORGE_TOOLS = path.join(__dirname, '..', 'scripts', 'forge-tools.cjs');
 
 // ---------------------------------------------------------------------
 // Scenario A: full happy-path multiplayer session, 2 participants.
@@ -243,6 +246,87 @@ suite('T013 integration -- R015 scoped routing never leaks to non-targets', () =
     assert.strictEqual(received.lucas, 0);
     assert.strictEqual(received.sarah, 0);
     assert.strictEqual(received.broadcast, 0);
+  });
+});
+
+// ---------------------------------------------------------------------
+// Scenario D: CLI bridges exposed through forge-tools.cjs.
+// Lets the executor agent invoke collab primitives from bash/hook.
+// ---------------------------------------------------------------------
+
+suite('T013 integration -- forge-tools CLI bridges', () => {
+  test('collab-mode-active returns true+exit 0 when participant.json exists', () => {
+    const { projectDir, forgeDir } = makeTempForgeDir();
+    fs.mkdirSync(path.join(forgeDir, 'collab'), { recursive: true });
+    fs.writeFileSync(
+      path.join(forgeDir, 'collab', 'participant.json'),
+      JSON.stringify({ handle: 'daniel', session_id: 'abc', started: 'T' })
+    );
+    const r = spawnSync(process.execPath, [FORGE_TOOLS, 'collab-mode-active', '--forge-dir', forgeDir], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0);
+    assert.match(r.stdout, /true/);
+  });
+
+  test('collab-mode-active returns false+exit 1 when participant.json absent', () => {
+    const { forgeDir } = makeTempForgeDir();
+    const r = spawnSync(process.execPath, [FORGE_TOOLS, 'collab-mode-active', '--forge-dir', forgeDir], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stdout, /false/);
+  });
+
+  test('collab-flag-decision writes a flag file and returns JSON', () => {
+    const { projectDir, forgeDir } = makeTempForgeDir();
+    fs.mkdirSync(path.join(forgeDir, 'collab'), { recursive: true });
+    fs.writeFileSync(
+      path.join(forgeDir, 'collab', 'participant.json'),
+      JSON.stringify({ handle: 'daniel', session_id: 'abc', started: 'T' })
+    );
+    const r = spawnSync(process.execPath, [
+      FORGE_TOOLS, 'collab-flag-decision',
+      '--forge-dir', forgeDir,
+      '--task', 'T005',
+      '--decision', 'use redis pubsub',
+      '--rationale', 'already in stack',
+      '--alternatives', 'nats,postgres-listen',
+      '--source-contributors', 'daniel,lucas',
+      '--phase', 'executing'
+    ], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0);
+    const out = JSON.parse(r.stdout.trim());
+    assert.strictEqual(out.written, true);
+    assert.ok(fs.existsSync(out.path));
+    const flagRaw = fs.readFileSync(out.path, 'utf8');
+    assert.match(flagRaw, /decision: "use redis pubsub"/);
+    assert.match(flagRaw, /alternatives: \["nats","postgres-listen"\]/);
+    assert.match(flagRaw, /source_contributors: \["daniel","lucas"\]/);
+  });
+
+  test('collab-flag-decision rejects wrong phase with exit 3', () => {
+    const { forgeDir } = makeTempForgeDir();
+    fs.mkdirSync(path.join(forgeDir, 'collab'), { recursive: true });
+    fs.writeFileSync(
+      path.join(forgeDir, 'collab', 'participant.json'),
+      JSON.stringify({ handle: 'x', session_id: 'y', started: 'T' })
+    );
+    const r = spawnSync(process.execPath, [
+      FORGE_TOOLS, 'collab-flag-decision',
+      '--forge-dir', forgeDir,
+      '--task', 'T001',
+      '--decision', 'x',
+      '--phase', 'brainstorming'
+    ], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 3);
+    const out = JSON.parse(r.stdout.trim());
+    assert.strictEqual(out.written, false);
+    assert.strictEqual(out.reason, 'wrong_phase');
+  });
+
+  test('collab-flag-decision without required args exits 2', () => {
+    const { forgeDir } = makeTempForgeDir();
+    const r = spawnSync(process.execPath, [
+      FORGE_TOOLS, 'collab-flag-decision', '--forge-dir', forgeDir
+    ], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 2);
   });
 });
 

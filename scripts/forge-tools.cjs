@@ -4354,6 +4354,65 @@ if (require.main === module) {
       process.stdout.write(lines.join('\n') + '\n');
     }
   }
+
+  // === Collab CLI bridges (T013 integration follow-up) =====================
+  // Executor agent shells out to these subcommands when `.forge/collab/
+  // participant.json` is present. They wrap primitives in scripts/forge-collab.cjs
+  // so the agent never has to JSON-encode payloads by hand.
+
+  if (command === 'collab-mode-active') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const flag = fs.existsSync(path.join(forgeDir, 'collab', 'participant.json'));
+    process.stdout.write(flag ? 'true\n' : 'false\n');
+    process.exit(flag ? 0 : 1);
+  }
+
+  if (command === 'collab-flag-decision') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const task = args.find((a, i) => args[i - 1] === '--task') || '';
+    const decision = args.find((a, i) => args[i - 1] === '--decision') || '';
+    const rationale = args.find((a, i) => args[i - 1] === '--rationale') || '';
+    const authorArg = args.find((a, i) => args[i - 1] === '--author');
+    const alternativesArg = args.find((a, i) => args[i - 1] === '--alternatives') || '';
+    const sourceArg = args.find((a, i) => args[i - 1] === '--source-contributors') || '';
+    const phase = args.find((a, i) => args[i - 1] === '--phase') || 'executing';
+
+    if (!task || !decision) {
+      process.stderr.write('collab-flag-decision requires --task and --decision\n');
+      process.exit(2);
+    }
+
+    const collabDir = path.join(forgeDir, 'collab');
+    let participantHandle = authorArg;
+    if (!participantHandle) {
+      try {
+        const p = JSON.parse(fs.readFileSync(path.join(collabDir, 'participant.json'), 'utf8'));
+        participantHandle = p.handle;
+      } catch (_) { /* fall through */ }
+    }
+    if (!participantHandle) participantHandle = process.env.FORGE_USER || process.env.USER || 'agent';
+
+    const collab = require('./forge-collab.cjs');
+    const alternatives = alternativesArg ? alternativesArg.split(',').map(s => s.trim()).filter(Boolean) : [];
+    const sourceContributors = sourceArg ? sourceArg.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+    // Fire-and-forget async -- no transport in the CLI path; the flag file
+    // is the durable record; peers see it on next git pull.
+    (async () => {
+      try {
+        const r = await collab.writeForwardMotionFlag({
+          phase, collabDir, task_id: task, author: participantHandle,
+          decision, alternatives, rationale,
+          source_contributors: sourceContributors
+        });
+        process.stdout.write(JSON.stringify(r) + '\n');
+        process.exit(r.written ? 0 : 3);
+      } catch (e) {
+        process.stderr.write('collab-flag-decision failed: ' + e.message + '\n');
+        process.exit(1);
+      }
+    })();
+  }
 }
 
 function padRight(str, len) {
