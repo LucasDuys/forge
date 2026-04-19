@@ -579,4 +579,51 @@ suite('defaults match spec-collab config contract', () => {
   });
 });
 
+// =====================================================================
+// T005 -- ably peerDependency declaration (R013)
+// =====================================================================
+
+suite('package.json peer-dependency declaration (R013)', () => {
+  const pkgPath = path.join(__dirname, '..', 'package.json');
+
+  test('package.json exists at repo root', () => {
+    assert.ok(fs.existsSync(pkgPath), 'package.json must exist at repo root');
+  });
+
+  test('ably is declared under peerDependencies, not dependencies', () => {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const peer = pkg.peerDependencies || {};
+    const hard = pkg.dependencies || {};
+    assert.ok(peer.ably, 'expected peerDependencies.ably to be declared');
+    assert.ok(!hard.ably, 'ably must not be a hard dependency');
+  });
+
+  test('peerDependenciesMeta marks ably as optional', () => {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const meta = (pkg.peerDependenciesMeta && pkg.peerDependenciesMeta.ably) || {};
+    assert.strictEqual(meta.optional, true, 'peerDependenciesMeta.ably.optional must be true');
+  });
+
+  test('no hard dependencies declared (zero-install philosophy preserved)', () => {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const hard = pkg.dependencies || {};
+    assert.strictEqual(Object.keys(hard).length, 0, 'expected zero hard dependencies');
+  });
+
+  test('ably is only imported from scripts/forge-collab.cjs (R013 AC: lazy-loaded)', () => {
+    const scriptsDir = path.join(__dirname, '..', 'scripts');
+    const files = fs.readdirSync(scriptsDir).filter(f => f.endsWith('.cjs'));
+    const offenders = [];
+    for (const f of files) {
+      if (f === 'forge-collab.cjs') continue;
+      const content = fs.readFileSync(path.join(scriptsDir, f), 'utf8');
+      // Match require('ably') or require("ably") or from 'ably'
+      if (/require\s*\(\s*['"]ably['"]\s*\)/.test(content) || /from\s+['"]ably['"]/.test(content)) {
+        offenders.push(f);
+      }
+    }
+    assert.deepStrictEqual(offenders, [], 'ably must only be imported from scripts/forge-collab.cjs');
+  });
+});
+
 runTests();
