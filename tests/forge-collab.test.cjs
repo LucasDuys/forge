@@ -22,7 +22,8 @@ const {
   writeConsolidatedUnderLease, routeClarifyingQuestion,
   TASK_BRANCH_PREFIX, taskBranchName, startTaskBranch, updateTaskBranch,
   deleteTaskBranch, createRecordingGitRunner,
-  renderResearchResult, persistResearchResult, appendResearchSection, isResearchTask
+  renderResearchResult, persistResearchResult, appendResearchSection, isResearchTask,
+  FLAG_STATUS, writeForwardMotionFlag, listFlags, readFlag, overrideFlag
 } = collab;
 
 function mkTempRepo(originUrl) {
@@ -1267,6 +1268,211 @@ suite('mixed coding + research in a categorization', () => {
     const researchTasks = tasks.filter(isResearchTask);
     assert.strictEqual(researchTasks.length, 1);
     assert.strictEqual(researchTasks[0].id, 'C002');
+  });
+});
+
+// =====================================================================
+// T010 -- forward-motion flags + override UX + targeted notifications
+//         (R008, R009, R015, R016)
+// =====================================================================
+
+suite('writeForwardMotionFlag -- phase guard (R008)', () => {
+  test('rejected when not in executing phase', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    for (const phase of ['brainstorming', 'planning', 'reviewing_branch', 'verifying', 'idle']) {
+      const r = await writeForwardMotionFlag({
+        phase, collabDir, task_id: 'T001', author: 'd', decision: 'x'
+      });
+      assert.strictEqual(r.written, false, 'phase ' + phase + ' should reject');
+      assert.strictEqual(r.reason, 'wrong_phase');
+    }
+  });
+
+  test('accepted for executing and its sub-phases', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    for (const phase of ['executing', 'implementing', 'testing', 'reviewing', 'fixing', 'debugging']) {
+      const r = await writeForwardMotionFlag({
+        phase, collabDir, task_id: 'T001', author: 'd',
+        decision: 'use-redis', alternatives: ['nats'], rationale: 'already in stack'
+      });
+      assert.strictEqual(r.written, true, 'phase ' + phase + ' should accept');
+      assert.ok(fs.existsSync(r.path));
+    }
+  });
+});
+
+suite('writeForwardMotionFlag -- file + log (R008, R016)', () => {
+  test('writes a flag file with full frontmatter', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const r = await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T005', author: 'daniel',
+      decision: 'redis', alternatives: ['nats', 'postgres-listen-notify'],
+      rationale: 'already in stack, team familiarity',
+      source_contributors: ['daniel', 'lucas'],
+      body: 'Redis chosen because ...'
+    });
+    assert.strictEqual(r.written, true);
+    const raw = fs.readFileSync(r.path, 'utf8');
+    assert.match(raw, /decision: "redis"/);
+    assert.match(raw, /alternatives: \["nats","postgres-listen-notify"\]/);
+    assert.match(raw, /rationale: "already in stack, team familiarity"/);
+    assert.match(raw, /source_contributors: \["daniel","lucas"\]/);
+    assert.match(raw, /status: open/);
+    assert.match(raw, /Redis chosen because/);
+  });
+
+  test('appends to user-scoped flag-emit log (R016)', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T005', author: 'daniel',
+      decision: 'x', alternatives: [], rationale: 'r', source_contributors: []
+    });
+    const logPath = path.join(collabDir, 'flag-emit-log-daniel.jsonl');
+    assert.ok(fs.existsSync(logPath));
+    const line = fs.readFileSync(logPath, 'utf8').trim();
+    const entry = JSON.parse(line);
+    assert.strictEqual(entry.task_id, 'T005');
+    assert.strictEqual(entry.decision, 'x');
+  });
+
+  test('two flags produced simultaneously land at distinct paths (R016)', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const r1 = await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T1', author: 'a', decision: 'd1'
+    });
+    const r2 = await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T2', author: 'b', decision: 'd2'
+    });
+    assert.strictEqual(r1.written, true);
+    assert.strictEqual(r2.written, true);
+    assert.notStrictEqual(r1.path, r2.path);
+  });
+});
+
+suite('writeForwardMotionFlag -- targeted notification (R015)', () => {
+  test('pings only the closest source_contributor, not other participants', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const sent = [];
+    const transport = {
+      async sendTargeted(handle, event, data) { sent.push({ handle, event, data }); },
+      async publish(event, data) { sent.push({ broadcast: true, event, data }); }
+    };
+    const participants = [
+      { handle: 'daniel', contributions: 'redis cache', active_tasks: 0 },
+      { handle: 'lucas',  contributions: 'stripe payments', active_tasks: 0 },
+      { handle: 'sarah',  contributions: 'react ui polish', active_tasks: 0 }
+    ];
+    const r = await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T5', author: 'agent-bot',
+      decision: 'use redis pubsub',
+      alternatives: ['nats'],
+      rationale: 'cache invalidation strategy',
+      source_contributors: ['daniel'],
+      participants,
+      transport
+    });
+    assert.strictEqual(r.written, true);
+    assert.strictEqual(r.notified.mode, 'targeted');
+    assert.strictEqual(r.notified.target, 'daniel');
+    assert.strictEqual(sent.length, 1);
+    assert.strictEqual(sent[0].handle, 'daniel');
+  });
+
+  test('broadcast fallback when no source contributors provided', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const sent = [];
+    const transport = {
+      async sendTargeted(h, e, d) { sent.push({ handle: h, event: e, data: d }); },
+      async publish(e, d) { sent.push({ broadcast: true, event: e, data: d }); }
+    };
+    const participants = [
+      { handle: 'a', contributions: 'x', active_tasks: 0 },
+      { handle: 'b', contributions: 'x', active_tasks: 0 }
+    ];
+    const r = await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T5', author: 'bot',
+      decision: 'd', source_contributors: [],
+      participants, transport, scorer: () => 0.5
+    });
+    assert.strictEqual(r.written, true);
+    assert.strictEqual(r.notified.mode, 'broadcast');
+    assert.strictEqual(sent.length, 1);
+    assert.strictEqual(sent[0].broadcast, true);
+  });
+});
+
+suite('listFlags + readFlag (R009)', () => {
+  test('lists all flags; filters by status', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T1', author: 'a', decision: 'x'
+    });
+    await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T2', author: 'a', decision: 'y'
+    });
+    const all = listFlags(collabDir);
+    assert.strictEqual(all.length, 2);
+    const open = listFlags(collabDir, { status: FLAG_STATUS.OPEN });
+    assert.strictEqual(open.length, 2);
+    const overridden = listFlags(collabDir, { status: FLAG_STATUS.OVERRIDDEN });
+    assert.strictEqual(overridden.length, 0);
+  });
+
+  test('readFlag returns the flag or null', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const r = await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T1', author: 'a', decision: 'x'
+    });
+    const loaded = readFlag(collabDir, r.id);
+    assert.ok(loaded);
+    assert.strictEqual(loaded.task_id, 'T1');
+    assert.strictEqual(readFlag(collabDir, 'Fmissing1234'), null);
+  });
+});
+
+suite('overrideFlag (R009)', () => {
+  test('overriding an open flag updates decision and status', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const r = await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T1', author: 'a', decision: 'redis'
+    });
+    const ov = overrideFlag(collabDir, r.id, 'nats', { author: 'lucas' });
+    assert.strictEqual(ov.overridden, true);
+    assert.strictEqual(ov.previousDecision, 'redis');
+    const loaded = readFlag(collabDir, r.id);
+    assert.strictEqual(loaded.status, FLAG_STATUS.OVERRIDDEN);
+    assert.strictEqual(loaded.decision, 'nats');
+    assert.match(fs.readFileSync(loaded.path, 'utf8'), /Previous decision: "redis"/);
+  });
+
+  test('missing flag returns overridden:false with reason', () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const r = overrideFlag(collabDir, 'Fmissing', 'x');
+    assert.strictEqual(r.overridden, false);
+    assert.strictEqual(r.reason, 'not_found');
+  });
+
+  test('already-overridden flag returns overridden:false', async () => {
+    const { projectDir } = makeTempForgeDir();
+    const collabDir = path.join(projectDir, '.forge', 'collab');
+    const r = await writeForwardMotionFlag({
+      phase: 'executing', collabDir, task_id: 'T1', author: 'a', decision: 'redis'
+    });
+    overrideFlag(collabDir, r.id, 'nats', { author: 'lucas' });
+    const r2 = overrideFlag(collabDir, r.id, 'postgres', { author: 'sarah' });
+    assert.strictEqual(r2.overridden, false);
+    assert.strictEqual(r2.reason, 'already_overridden');
   });
 });
 

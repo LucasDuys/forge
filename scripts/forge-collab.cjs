@@ -1276,6 +1276,237 @@ function isResearchTask(task) {
 }
 
 // ======================================================================
+// T010 -- forward-motion decision flags + review/override UX
+//         + targeted flag notifications (R008, R009, R015, R016)
+//
+// During the `executing` phase only, agents never block on human input:
+// they pick a decision, write a flag file, and keep moving. The flag is
+// a durable record of what was chosen and why; humans can review and
+// override it asynchronously.
+//
+// Phase guard (R008): flag writes are rejected outside the executing
+// phase. The existing blocking behaviour stays in brainstorm / plan /
+// reviewing_branch / verifying phases.
+//
+// Flag file format (.forge/collab/flags/<id>.md):
+//   ---
+//   id: <id>
+//   task_id: <task>
+//   author: <agent handle>
+//   created: <iso>
+//   status: open | acknowledged | overridden
+//   decision: <chosen option>
+//   alternatives: [opt1, opt2, ...]
+//   rationale: <one-line>
+//   source_contributors: [a, b, ...]
+//   ---
+//   <expanded body: pros/cons, references>
+// ======================================================================
+
+const EXECUTING_PHASES = new Set(['executing', 'implementing', 'testing', 'reviewing', 'fixing', 'debugging']);
+const FLAG_STATUS = Object.freeze({ OPEN: 'open', ACKED: 'acknowledged', OVERRIDDEN: 'overridden' });
+
+function _isExecutingPhase(phase) {
+  return EXECUTING_PHASES.has(String(phase || '').trim());
+}
+
+function _flagDir(collabDir) {
+  return path.join(collabDir, 'flags');
+}
+
+function _renderFlagDoc(flag, extraBody) {
+  const fm = [
+    '---',
+    'id: ' + flag.id,
+    'task_id: ' + (flag.task_id || ''),
+    'author: ' + _safeHandle(flag.author),
+    'created: ' + (flag.created || new Date().toISOString()),
+    'status: ' + (flag.status || FLAG_STATUS.OPEN),
+    'decision: ' + JSON.stringify(flag.decision || ''),
+    'alternatives: ' + JSON.stringify(flag.alternatives || []),
+    'rationale: ' + JSON.stringify(flag.rationale || ''),
+    'source_contributors: ' + JSON.stringify(flag.source_contributors || []),
+    '---',
+    ''
+  ].join('\n');
+  return fm + String(extraBody || '').trim() + '\n';
+}
+
+function _parseFlagDoc(raw) {
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!m) return null;
+  const fm = {};
+  for (const line of m[1].split('\n')) {
+    const kv = line.match(/^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/);
+    if (!kv) continue;
+    const key = kv[1];
+    const val = kv[2];
+    try {
+      if (key === 'decision' || key === 'rationale' ||
+          key === 'alternatives' || key === 'source_contributors') {
+        fm[key] = JSON.parse(val);
+      } else {
+        fm[key] = val;
+      }
+    } catch (_) {
+      fm[key] = val;
+    }
+  }
+  return { frontmatter: fm, body: m[2] };
+}
+
+/**
+ * Write a forward-motion decision flag during the executing phase. Never
+ * blocks. Caller provides the already-chosen decision; this function
+ * persists it and notifies targeted contributors via the transport.
+ *
+ * opts:
+ *   phase            current Forge state-machine phase; flag writes are
+ *                    rejected when not in an executing sub-phase.
+ *   transport        transport object used to sendTargeted the notification.
+ *   collabDir        .forge/collab/
+ *   task_id          the task that triggered the decision.
+ *   author           the agent handle writing the flag.
+ *   decision         chosen option string.
+ *   alternatives     array of alternative options considered.
+ *   rationale        one-line reason for the choice.
+ *   source_contributors  who contributed to this task in the brainstorm;
+ *                    notification routes to the closest of them.
+ *   participants     full participant list for similarity routing (closest
+ *                    of `source_contributors` wins).
+ *   body             optional extended markdown body (pros/cons, refs).
+ */
+async function writeForwardMotionFlag(opts) {
+  opts = opts || {};
+  if (!_isExecutingPhase(opts.phase)) {
+    return {
+      written: false,
+      reason: 'wrong_phase',
+      phase: opts.phase,
+      guidance: 'forward-motion flags only allowed in the executing phase; current phase is ' + opts.phase
+    };
+  }
+  if (!opts.collabDir) throw new Error('writeForwardMotionFlag requires collabDir');
+  if (!opts.task_id) throw new Error('writeForwardMotionFlag requires task_id');
+  if (!opts.author) throw new Error('writeForwardMotionFlag requires author');
+  if (!opts.decision) throw new Error('writeForwardMotionFlag requires decision');
+
+  const id = opts.id || generateFlagId();
+  const flag = {
+    id, task_id: opts.task_id, author: opts.author,
+    created: opts.created || new Date().toISOString(),
+    status: FLAG_STATUS.OPEN,
+    decision: opts.decision,
+    alternatives: opts.alternatives || [],
+    rationale: opts.rationale || '',
+    source_contributors: opts.source_contributors || []
+  };
+  const fpath = flagPath(opts.collabDir, id);
+  fs.mkdirSync(path.dirname(fpath), { recursive: true });
+  fs.writeFileSync(fpath, _renderFlagDoc(flag, opts.body));
+
+  // Append to a user-scoped flag-emit log so cross-writer append races
+  // can't occur (R016: user-scoped log filenames).
+  appendToUserScopedLog(opts.collabDir, 'flag-emit', opts.author, {
+    flag_id: id, task_id: flag.task_id, decision: flag.decision
+  });
+
+  // Targeted notification via transport (R015). Target is the closest
+  // source_contributor; fall back to broadcast only if contributors list
+  // is empty or routing ties.
+  let notified = null;
+  if (opts.transport && Array.isArray(opts.participants) && opts.participants.length > 0) {
+    const candidates = opts.participants.filter(p =>
+      !opts.source_contributors || (opts.source_contributors || []).includes(p.handle)
+    );
+    const pool = candidates.length > 0 ? candidates : opts.participants;
+    const target = routeToParticipant(
+      String(flag.decision) + '\n' + String(flag.rationale || ''),
+      pool,
+      opts
+    );
+    const payload = {
+      flag_id: id,
+      task_id: flag.task_id,
+      decision: flag.decision,
+      alternatives: flag.alternatives,
+      rationale: flag.rationale,
+      on_disk_path: fpath
+    };
+    if (target !== 'broadcast' && typeof opts.transport.sendTargeted === 'function') {
+      await opts.transport.sendTargeted(target, 'flag-ping', payload);
+      notified = { mode: 'targeted', target };
+    } else if (typeof opts.transport.publish === 'function') {
+      await opts.transport.publish('flag-ping', payload);
+      notified = { mode: 'broadcast' };
+    }
+  }
+
+  return { written: true, id, path: fpath, flag, notified };
+}
+
+/**
+ * List all flags with their current status. Returns an array of flag
+ * objects (frontmatter + body). Unreadable/corrupt flag files are
+ * skipped rather than throwing, so a broken flag can't stall the review
+ * UX for the others.
+ */
+function listFlags(collabDir, opts) {
+  const dir = _flagDir(collabDir);
+  if (!fs.existsSync(dir)) return [];
+  const files = fs.readdirSync(dir).filter(f => /^F[0-9a-f]+\.md$/.test(f));
+  const out = [];
+  for (const f of files) {
+    const raw = fs.readFileSync(path.join(dir, f), 'utf8');
+    const parsed = _parseFlagDoc(raw);
+    if (!parsed) continue;
+    if (opts && opts.status && parsed.frontmatter.status !== opts.status) continue;
+    out.push(Object.assign({ path: path.join(dir, f) }, parsed.frontmatter, { body: parsed.body }));
+  }
+  return out;
+}
+
+function readFlag(collabDir, flagId) {
+  const fpath = flagPath(collabDir, flagId);
+  if (!fs.existsSync(fpath)) return null;
+  const parsed = _parseFlagDoc(fs.readFileSync(fpath, 'utf8'));
+  if (!parsed) return null;
+  return Object.assign({ path: fpath }, parsed.frontmatter, { body: parsed.body });
+}
+
+/**
+ * Override an open flag's decision. Marks it `overridden` and records the
+ * new decision so dependent tasks can be re-triggered for rework.
+ *
+ * Returns { overridden: true, flag, previousDecision } or
+ * { overridden: false, reason } when the flag is missing or closed.
+ */
+function overrideFlag(collabDir, flagId, newDecision, opts) {
+  opts = opts || {};
+  const fpath = flagPath(collabDir, flagId);
+  if (!fs.existsSync(fpath)) return { overridden: false, reason: 'not_found', flagId };
+  const parsed = _parseFlagDoc(fs.readFileSync(fpath, 'utf8'));
+  if (!parsed) return { overridden: false, reason: 'malformed' };
+  const fm = parsed.frontmatter;
+  if (fm.status === FLAG_STATUS.OVERRIDDEN) {
+    return { overridden: false, reason: 'already_overridden', previousDecision: fm.decision };
+  }
+  const previousDecision = fm.decision;
+  const newFlag = Object.assign({}, fm, {
+    status: FLAG_STATUS.OVERRIDDEN,
+    decision: newDecision,
+    overridden_by: _safeHandle(opts.author || 'unknown'),
+    overridden_at: opts.overriddenAt || new Date().toISOString()
+  });
+  // Re-render preserving body
+  const newDoc = _renderFlagDoc(newFlag, parsed.body) +
+    'Overridden by: ' + newFlag.overridden_by + ' at ' + newFlag.overridden_at + '\n' +
+    'Previous decision: ' + JSON.stringify(previousDecision) + '\n';
+  fs.writeFileSync(fpath, newDoc);
+  return { overridden: true, flag: newFlag, previousDecision, path: fpath };
+}
+
+// ======================================================================
 // Task-claim wrappers -- thin names on top of the generic lease primitive.
 // ======================================================================
 
@@ -1351,6 +1582,11 @@ module.exports = {
   persistResearchResult,
   appendResearchSection,
   isResearchTask,
+  FLAG_STATUS,
+  writeForwardMotionFlag,
+  listFlags,
+  readFlag,
+  overrideFlag,
   // Exposed for tests and future-task extension points:
   _internal: {
     readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,
