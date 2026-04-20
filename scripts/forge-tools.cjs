@@ -4454,6 +4454,162 @@ function _formatRecoveryReport(report) {
   return lines.join('\n');
 }
 
+// === T008 / R014: execute-run transcripts =================================
+//
+// Every agent invocation inside `/forge:execute` appends a single JSON line
+// to `.forge/history/cycles/<cycleId>/transcript.jsonl`. `/forge:review-branch`
+// later cross-checks these lines against the commits on the branch.
+//
+// Design invariants (R014 acceptance criteria):
+//   - Per-entry lines contain NO timestamp so a deterministic mock run produces
+//     byte-identical output across repeats.
+//   - Exactly one `{ "phase": "boundary", "at": "<iso>" }` line is emitted
+//     per phase transition (detected by comparing `entry.phase` to the last
+//     non-boundary entry in the file). Boundary lines are the only place `at`
+//     appears; the rest of the file diffs cleanly across runs.
+//   - Keys are serialized in a fixed order so `JSON.stringify`'s key-insertion
+//     semantics do not produce noisy diffs.
+//   - The cycle directory is created on demand.
+//
+// Callers:
+//   - hooks/stop-hook.sh on every iteration (route-decision snapshot)
+//   - executor agents via `node scripts/forge-tools.cjs transcript-append ...`
+//   - any internal routing code that wants to record an agent hand-off
+
+const _TRANSCRIPT_ENTRY_KEY_ORDER = [
+  'phase', 'agent', 'task_id', 'tool_calls_count',
+  'duration_ms', 'status', 'summary'
+];
+const _TRANSCRIPT_BOUNDARY_KEY_ORDER = ['phase', 'at'];
+
+function _transcriptCycleDir(forgeDir, cycleId) {
+  if (!cycleId || typeof cycleId !== 'string') {
+    throw new Error('appendTranscript: cycleId is required');
+  }
+  // Defend against path traversal in the cycleId. The historical cycle
+  // naming scheme is timestamp-y (e.g. "20260420T1730") or a simple tag;
+  // anything with a path separator is rejected.
+  if (/[\\/]/.test(cycleId) || cycleId === '.' || cycleId === '..') {
+    throw new Error('appendTranscript: invalid cycleId');
+  }
+  return path.join(forgeDir, 'history', 'cycles', cycleId);
+}
+
+function _transcriptPath(forgeDir, cycleId) {
+  return path.join(_transcriptCycleDir(forgeDir, cycleId), 'transcript.jsonl');
+}
+
+// Serialize an object with a deterministic key order. Entry keys appear in
+// the same order every run so JSONL files diff cleanly.
+function _serializeTranscriptEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    throw new Error('appendTranscript: entry must be an object');
+  }
+  const isBoundary = entry.phase === 'boundary';
+  const order = isBoundary ? _TRANSCRIPT_BOUNDARY_KEY_ORDER : _TRANSCRIPT_ENTRY_KEY_ORDER;
+  const out = {};
+  for (const key of order) {
+    if (Object.prototype.hasOwnProperty.call(entry, key)) {
+      out[key] = entry[key];
+    }
+  }
+  // Any extra keys the caller supplied land after the canonical keys in
+  // sorted order so their appearance is also deterministic.
+  const extras = Object.keys(entry).filter((k) => !order.includes(k)).sort();
+  for (const key of extras) out[key] = entry[key];
+  return JSON.stringify(out);
+}
+
+// Read the last non-boundary entry's phase from an existing transcript. Used
+// to decide whether to emit a boundary line before the next entry. Returns
+// `null` for an empty/missing file.
+function _lastTranscriptPhase(filePath) {
+  let text;
+  try { text = fs.readFileSync(filePath, 'utf8'); }
+  catch (_) { return null; }
+  if (!text) return null;
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (obj && obj.phase && obj.phase !== 'boundary') return obj.phase;
+    } catch (_) { /* skip malformed line */ }
+  }
+  return null;
+}
+
+// Append a transcript entry. If the caller supplies `{ phase: "boundary", at }`
+// directly, it is written verbatim (caller owns timestamp). Otherwise, if the
+// entry's phase differs from the last entry's phase, a boundary line is
+// synthesised first using `opts.now` (defaults to `new Date().toISOString()`).
+// The cycle directory is created on demand.
+//
+// Returns an object describing what was written:
+//   { path, boundaryWritten: bool, entryWritten: bool }
+function appendTranscript(forgeDir, cycleId, entry, opts) {
+  opts = opts || {};
+  const cycleDir = _transcriptCycleDir(forgeDir, cycleId);
+  if (!fs.existsSync(cycleDir)) {
+    fs.mkdirSync(cycleDir, { recursive: true });
+  }
+  const filePath = path.join(cycleDir, 'transcript.jsonl');
+
+  const result = { path: filePath, boundaryWritten: false, entryWritten: false };
+
+  if (entry && entry.phase === 'boundary') {
+    // Caller-owned boundary line. Require `at`.
+    if (!entry.at || typeof entry.at !== 'string') {
+      throw new Error('appendTranscript: boundary entry must include "at"');
+    }
+    fs.appendFileSync(filePath, _serializeTranscriptEntry(entry) + '\n');
+    result.boundaryWritten = true;
+    return result;
+  }
+
+  // Regular entry. Reject explicit timestamps on per-entry lines so a
+  // misbehaving caller cannot poison deterministic diffs.
+  if (entry && typeof entry === 'object' && 'at' in entry) {
+    throw new Error('appendTranscript: non-boundary entries must not include "at"');
+  }
+  if (!entry || !entry.phase || typeof entry.phase !== 'string') {
+    throw new Error('appendTranscript: entry.phase is required');
+  }
+
+  const lastPhase = _lastTranscriptPhase(filePath);
+  if (lastPhase !== entry.phase) {
+    const boundary = {
+      phase: 'boundary',
+      at: opts.now || new Date().toISOString()
+    };
+    fs.appendFileSync(filePath, _serializeTranscriptEntry(boundary) + '\n');
+    result.boundaryWritten = true;
+  }
+
+  fs.appendFileSync(filePath, _serializeTranscriptEntry(entry) + '\n');
+  result.entryWritten = true;
+  return result;
+}
+
+// Read a transcript file and return { entries: [...], boundaries: [...] }.
+// Non-JSON lines are silently skipped.
+function readTranscript(forgeDir, cycleId) {
+  const filePath = _transcriptPath(forgeDir, cycleId);
+  const out = { path: filePath, entries: [], boundaries: [] };
+  let text;
+  try { text = fs.readFileSync(filePath, 'utf8'); }
+  catch (_) { return out; }
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    let obj;
+    try { obj = JSON.parse(line); } catch (_) { continue; }
+    if (obj && obj.phase === 'boundary') out.boundaries.push(obj);
+    else if (obj) out.entries.push(obj);
+  }
+  return out;
+}
+
 // === CLI Entry Point ===
 
 if (require.main === module) {
@@ -4927,6 +5083,50 @@ if (require.main === module) {
         process.exit(1);
       }
     })();
+  }
+
+  // T008/R014: append a line to the execute-run transcript. Shell callers
+  // (notably hooks/stop-hook.sh and the forge-executor agent) use this
+  // subcommand so they do not have to reimplement the boundary-line logic.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs transcript-append \
+  //     --forge-dir .forge \
+  //     --cycle <cycleId> \
+  //     --entry '<json>'
+  //
+  // The --entry payload is a JSON object with at minimum `phase`. A
+  // `{ "phase": "boundary", "at": "..." }` payload is written verbatim.
+  // Non-boundary entries must omit `at`; the command injects a boundary
+  // line on phase transitions automatically.
+  //
+  // Exit codes: 0 on success, 2 on invalid arguments, 1 on write error.
+  if (command === 'transcript-append') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const cycle = args.find((a, i) => args[i - 1] === '--cycle');
+    const entryRaw = args.find((a, i) => args[i - 1] === '--entry');
+    if (!cycle) {
+      process.stderr.write('transcript-append: --cycle is required\n');
+      process.exit(2);
+    }
+    if (!entryRaw) {
+      process.stderr.write('transcript-append: --entry is required\n');
+      process.exit(2);
+    }
+    let entry;
+    try { entry = JSON.parse(entryRaw); }
+    catch (e) {
+      process.stderr.write('transcript-append: --entry is not valid JSON: ' + e.message + '\n');
+      process.exit(2);
+    }
+    try {
+      const r = appendTranscript(forgeDir, cycle, entry);
+      process.stdout.write(JSON.stringify(r) + '\n');
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write('transcript-append failed: ' + e.message + '\n');
+      process.exit(1);
+    }
   }
 }
 
@@ -5936,5 +6136,6 @@ module.exports = {
   graphifyAvailable, graphifyBuild, graphifySummary, graphifyQuery, graphifyDependents,
   ERROR_TAXONOMY, classifyError, getRecoveryAction, logError,
   captureTrajectory, trajectoryStats, tokenReport, promoteToGlobalLearning,
-  compressContext, shouldCompress, getCompressionThreshold
+  compressContext, shouldCompress, getCompressionThreshold,
+  appendTranscript, readTranscript
 };

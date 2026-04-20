@@ -130,6 +130,41 @@ After parallel agents complete, run verification checks:
    python -m pytest --co -q  # collect affected tests
    ```
 
+### Step 4.5: Transcript Cross-Check (T008 / R014)
+
+If `.forge/history/cycles/<cycle-id>/transcript.jsonl` exists for any cycle that touched this branch, cross-check agent claims against reality. A transcript line is written by the stop-hook on every iteration and by the forge-executor on every task completion, so the file is the ground truth for what agents *said* they did.
+
+1. **Locate transcripts**. List every `transcript.jsonl` under `.forge/history/cycles/` whose newest line is more recent than `git log {base}...{head} --pretty=%ci | tail -1` minus a 5-minute buffer. These are the cycles that can have produced the commits under review.
+
+2. **Load the transcript**. Use the library (same file both entries and boundary lines get you):
+   ```bash
+   node -e "console.log(JSON.stringify(require('./scripts/forge-tools.cjs').readTranscript('.forge','<cycle-id>'), null, 2))"
+   ```
+
+3. **Cross-check A — every reviewed task has ≥ 1 transcript entry.**
+   For every task id that appears in the branch commits (`git log {base}...{head} --pretty=%s | grep -oE 'T[0-9]+'`), verify there is at least one transcript entry with `task_id` equal to that id. A task id in the commit log with zero transcript entries means either the loop was bypassed or the transcript was tampered with — flag as CRITICAL.
+
+4. **Cross-check B — every transcript-mentioned commit exists.**
+   For every transcript entry whose `summary` references a commit SHA (pattern `[0-9a-f]{7,40}`), verify the SHA is reachable from `{head}`: `git cat-file -e <sha>` exits 0. A transcript-claimed commit that is absent means the agent lied about finalising work — flag as CRITICAL.
+
+5. **Cross-check C — phase transitions are well-formed.**
+   The transcript schema requires exactly one `{ phase: "boundary", at: "<iso>" }` line per phase transition, and no `at` keys on per-entry lines. If either invariant is violated the transcript has been tampered with or the appender is buggy — flag as IMPORTANT. Detect by iterating `readTranscript(...).boundaries` and `readTranscript(...).entries` and asserting entries never carry `at`.
+
+Report results under a dedicated section:
+
+```
+TRANSCRIPT CROSS-CHECK:
+  Cycles examined:    {N}
+  Entries:            {E}
+  Boundaries:         {B}
+  Tasks in branch:    [T001, T003, T008]
+  Tasks without entry: {none|list}
+  Transcript commits missing from git: {none|list}
+  Schema violations:  {none|list}
+```
+
+Skip this step if no cycles touch the review window — explicitly note "no transcripts for this window" so reviewers know the check ran.
+
 ## Step 5: Produce Report
 
 Present results in this format:

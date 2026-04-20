@@ -365,6 +365,33 @@ The `artifacts` map keys should match the `provides:` names from the frontier. V
 
 If a context bundle file exists at `.forge/context-bundles/{task-id}.md`, read it first for curated context from your dependencies.
 
+### 5.6 Transcripts (T008/R014)
+
+Every agent invocation inside `/forge:execute` appends a single JSONL line to `.forge/history/cycles/<cycle-id>/transcript.jsonl` so `/forge:review-branch` can cross-check agent claims against commits. The stop-hook records a line for every iteration automatically; you should record one more when you finish your task so the transcript reflects the executor's own activity, not just the router's.
+
+Append your own entry via the CLI:
+
+```bash
+node scripts/forge-tools.cjs transcript-append \
+  --forge-dir .forge \
+  --cycle "$CYCLE_ID" \
+  --entry '{"phase":"executing","agent":"forge-executor","task_id":"T003","tool_calls_count":42,"duration_ms":180000,"status":"DONE","summary":"Registration endpoint + bcrypt hashing + JWT; 4/4 ACs met"}'
+```
+
+The cycle id is the `current_cycle` value from `.forge/state.md` frontmatter. If you cannot resolve it (fresh cycle, missing state), skip the transcript append — the stop-hook will still capture the route-level entry. Do NOT include an `at` timestamp on per-entry lines; the appender injects a phase-boundary line with a timestamp exactly once per phase transition so the rest of the file diffs cleanly across runs.
+
+Alternatively, call it in-process:
+
+```js
+require('./scripts/forge-tools.cjs').appendTranscript('.forge', cycleId, {
+  phase: 'executing', agent: 'forge-executor', task_id: 'T003',
+  tool_calls_count: 42, duration_ms: 180000,
+  status: 'DONE', summary: 'Registration endpoint + bcrypt hashing + JWT'
+});
+```
+
+Keep `summary` short (≤ 120 chars) and caveman-internal-friendly; it is agent-internal scratch, not user-facing prose.
+
 ### 6. Report Status
 
 Report your status using one of the four status codes (DONE, DONE_WITH_CONCERNS, NEEDS_CONTEXT, BLOCKED) along with a brief summary:

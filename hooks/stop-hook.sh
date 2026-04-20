@@ -317,6 +317,66 @@ echo "$LOOP_DATA" | node -e "
   console.log(JSON.stringify(d,null,2));
 " > "$LOOP_FILE" 2>/dev/null
 
+# === T008/R014: transcript capture ===
+# Every iteration records a single JSONL entry describing the route decision
+# and task snapshot. appendTranscript handles phase-boundary lines
+# automatically; we pass in phase/agent/task_id/status so /forge:review-branch
+# can later cross-check agent activity against commits. Errors go to the
+# debug log and never break the loop.
+node -e "
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const tools = require('${TOOLS_CJS}'.replace(/\\\\/g, '/'));
+    const forgeDir = '${FORGE_DIR}';
+
+    // Derive a cycle id. Priority:
+    //   1. state.md frontmatter key 'current_cycle' (caveman module already sets this)
+    //   2. loop started_at timestamp compacted (YYYYMMDDTHHMM)
+    //   3. today's date YYYY-MM-DD
+    let cycleId = '';
+    try {
+      const st = tools.readState(forgeDir);
+      if (st && st.data && st.data.current_cycle) cycleId = String(st.data.current_cycle);
+    } catch (_) {}
+    if (!cycleId) {
+      try {
+        const loop = JSON.parse(fs.readFileSync(path.join(forgeDir, '.forge-loop.json'), 'utf8'));
+        if (loop && loop.started_at) {
+          cycleId = String(loop.started_at).replace(/[:\-]/g, '').replace(/\.\d+Z?$/, '').slice(0, 13);
+        }
+      } catch (_) {}
+    }
+    if (!cycleId) cycleId = new Date().toISOString().slice(0, 10);
+
+    // Pull current phase + active task from state.md (already read above as
+    // CURRENT_PHASE, but we re-read in-process to keep this one node call
+    // self-contained).
+    let phase = 'unknown';
+    let taskId = '';
+    try {
+      const st = tools.readState(forgeDir);
+      if (st && st.data) {
+        if (st.data.phase) phase = String(st.data.phase);
+        if (st.data.current_task) taskId = String(st.data.current_task);
+      }
+    } catch (_) {}
+
+    tools.appendTranscript(forgeDir, cycleId, {
+      phase,
+      agent: 'stop-hook',
+      task_id: taskId,
+      tool_calls_count: 0,
+      duration_ms: 0,
+      status: 'iteration_${NEXT_ITERATION}',
+      summary: 'route decision recorded'
+    });
+  } catch (e) {
+    // Best-effort; log to debug and move on.
+    try { require('fs').appendFileSync('${DEBUG_LOG}', '[' + new Date().toISOString() + '] transcript append failed: ' + (e && e.message || e) + '\n'); } catch (_) {}
+  }
+" 2>>"$DEBUG_LOG" || true
+
 # === Status block injection (R-status, in-session dashboard) ===
 # Calls scripts/forge-status-block.cjs which reads .forge/ and emits a
 # compact ASCII dashboard. Prepended to every NEXT_PROMPT so the user sees
