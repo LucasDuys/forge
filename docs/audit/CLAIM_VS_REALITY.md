@@ -155,4 +155,34 @@ These came in from the user's follow-up and are not yet verified on my side — 
 
 ---
 
+### O019 — Parallel agents in one working directory collide on git state
+
+- **CLAIM** (`/forge:execute` docs): the autonomous loop dispatches executor agents per task; implicit expectation is that each runs cleanly.
+- **REALITY**: six T-agents launched in parallel against the same `C:\dev\forge-review\` working directory produced commit-label scrambling. Concretely, observed on this branch between commits `5598dc1..d0ebe03`:
+  - `b514f1b` labelled `fix(brainstorming): one-question-at-a-time cadence [T010]` — diff is 39 lines of CLAIM_VS_REALITY.md only. T010 agent committed its audit-log update first before other agents committed code, under its own label.
+  - `898c642` labelled `docs(audit): O016+O017 observations from T011 mock scaffold [T011]` — diff is `scripts/setup.sh` + `tests/setup.test.cjs`. This is actually T002's idempotency work committed under T011's label, because the T011 agent staged and committed while T002's edits were also in the working tree.
+  - `fc8c533` labelled `fix(brainstorming): one-question-at-a-time cadence [T010] (skill + test)` — diff is `README.md` + `docs/mechanics/*`. This is T005's README rewrite committed under T010's retry label.
+  - `d0ebe03` labelled `(retry)` — diff IS the brainstorming skill. T010 actually landed here after two retries.
+- **ROOT CAUSE**: all six agents share one git index + working tree. When agent A commits, it sweeps agent B's staged + unstaged changes along for the ride, and the commit message reflects whichever agent's workflow reached `git commit` first.
+- **SEVERITY**: blocker (for parallel dispatch correctness; every parallel run needs isolated worktrees).
+- **RESOLUTION PATH**: spec-forge-v03-gaps R006 (streaming DAG) already mandates worktree isolation for provisional downstream tasks (per Sherlock research). The same mechanism must apply to every parallel executor dispatch, not just provisional ones. Proposed as a follow-up R under spec-forge-v03-gaps before its final merge.
+- **WORKAROUND UNTIL FIXED**: only dispatch a single executor agent at a time until R006 worktree gating ships, or dispatch parallel agents only on tasks that touch disjoint file sets and serialize committal by having the outer loop (not the agents) do `git commit` after all agents return.
+
+### O020 — T001 setup.sh half is NOT committed; test suite reflects this honestly
+
+- **CLAIM** (F001 audit note from T002 execution): "T001 (collab-fix R001) landed a parallel edit on the same file, adding `mkdir -p .forge/collab` and the `.gitignore` carve-out block."
+- **REALITY**: the current `scripts/setup.sh` on HEAD does NOT contain any collab carve-out or `.forge/collab/` handling. Verified by `grep -n "collab\|carve" scripts/setup.sh`. The only `.gitignore` write in setup.sh is still the legacy `echo ".forge/" >> "$GITIGNORE"`. F001's claim was incorrect — T001's setup.sh half never landed.
+- **CONSEQUENCE**: 7 of 18 tests in `tests/forge-collab-gitignore.test.cjs` fail because they expect setup.sh to generate `.forge/collab/.gitignore` and the glob-form rules. These failures are accurate regression coverage for the remaining T001 work.
+- **SEVERITY**: partial (half of T001 shipped; the other half is a known gap the tests correctly guard).
+- **RESOLUTION PATH**: re-dispatch T001 with a narrowed scope after the rate limit reset ("only modify scripts/setup.sh to emit the glob-form .gitignore rules and create .forge/collab/.gitignore carve-out") — when it lands, the 7 failing tests flip to green without changes to the test file.
+
+### O021 — Rate-limit interruption mid-run produced partial commits + orphan test files
+
+- **CLAIM** (agent orchestration): long-running agent dispatch completes or reports NEEDS_CONTEXT.
+- **REALITY**: all six Tier-1 agents returned `You've hit your limit · resets 2pm (Europe/Amsterdam)` after 12–14 minutes and 57–71 tool uses each. Partial work was left in the working tree; my outer-loop cleanup split the uncommitted state into T001 and T007 commits under correct labels.
+- **SEVERITY**: ux (expected Anthropic API behaviour; Forge has no graceful-partial-commit protocol).
+- **FIX SKETCH**: executor agent could write a `PARTIAL` checkpoint at every significant milestone (file written, test passing) so a rate-limit-interrupted task can be resumed by a fresh agent reading `.forge/progress/<task>.json`. Forge's existing checkpoint schema already supports this; the executor just needs to write more frequently than "end of task".
+
+---
+
 ## Next entries to be added as brainstorming progresses.
