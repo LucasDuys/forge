@@ -553,7 +553,17 @@ function createPollingTransport(opts) {
   opts = opts || {};
   const branch = opts.branch || POLLING_BRANCH_DEFAULT;
   const intervalMs = Number(opts.intervalMs) || POLLING_INTERVAL_MS_DEFAULT;
-  const io = opts.ioAdapter || _defaultPollingIo();
+  const io = opts.ioAdapter || _defaultPollingIo({
+    cwd: opts.cwd,
+    forgeDir: opts.forgeDir,
+    autoPush: opts.autoPush,
+    runner: opts.runner,
+    prompter: opts.prompter,
+    ttlSeconds: opts.ttlSeconds,
+    retries: opts.retries,
+    backoffMs: opts.backoffMs,
+    now: opts.now
+  });
   let connected = false;
   let poller = null;
   const localLeases = new Map();
@@ -640,43 +650,316 @@ function createPollingTransport(opts) {
     connect, disconnect,
     publish, subscribe, sendTargeted,
     read, cas, del, list,
-    _internal: { _refresh, get pendingMessages() { return pendingMessages.slice(); } }
+    _internal: {
+      _refresh,
+      get pendingMessages() { return pendingMessages.slice(); },
+      get io() { return io; },
+      get branch() { return branch; }
+    }
   };
 }
 
-function _defaultPollingIo() {
-  // Default io adapter uses the real git CLI. Tests override with a stub.
-  function gitCmd(cwd, args) {
+/**
+ * Default polling-transport IO adapter. Uses real git plumbing so the
+ * `forge/collab-state` branch on origin always holds exactly one commit
+ * whose `state.json` blob is the authoritative `{ leases, messages }`
+ * document. Every mutation is:
+ *
+ *   1. fetch origin branch + read current state + read current sha (CAS
+ *      expected value for force-with-lease)
+ *   2. mutate state in memory
+ *   3. synthesize a new rootless commit via `git hash-object` +
+ *      `git mktree` + `git commit-tree` (no parent -> exactly one commit
+ *      on the ref after every push)
+ *   4. `git push --force-with-lease=refs/heads/<branch>:<sha-read>` via
+ *      gatedPush so the user's auto_push preference is honored.
+ *   5. on rejection, re-read and retry up to 3 times with 100ms linear
+ *      backoff; the 4th rejection returns `{ ok:false, reason:'cas_exhausted' }`.
+ *
+ * A `writeLease` call may also pass `{ expected }` so the caller gets
+ * `{ ok:false, reason:'cas_race_lost' }` when a peer claimed the slot
+ * first at the semantic level (lease already held by someone else).
+ *
+ * Tests inject a pure in-memory stub via `opts.ioAdapter`; this default
+ * is what runs when no stub is provided.
+ *
+ * opts:
+ *   cwd       repo dir (defaults to process.cwd())
+ *   forgeDir  path to .forge/ so readAutoPushConfig can gate pushes
+ *   autoPush  explicit boolean override; skips config lookup
+ *   runner    injectable (args, {cwd}) -> stdout runner for tests
+ *   ttlSeconds  message TTL for appendMessage compaction (default 300)
+ *   retries   push-retry count before cas_exhausted (default 3)
+ *   backoffMs linear backoff base in ms (default 100)
+ */
+function _defaultPollingIo(opts) {
+  opts = opts || {};
+  const cwd = opts.cwd || process.cwd();
+  const forgeDir = opts.forgeDir || path.join(cwd, '.forge');
+  const ttlSeconds = Number(opts.ttlSeconds) || 300;
+  const retries = Number.isFinite(opts.retries) ? Number(opts.retries) : 3;
+  const backoffMs = Number.isFinite(opts.backoffMs) ? Number(opts.backoffMs) : 100;
+  const runner = typeof opts.runner === 'function' ? opts.runner : null;
+
+  function run(args, runOpts) {
+    runOpts = runOpts || {};
+    if (runner) return runner(args, { cwd: runOpts.cwd || cwd, input: runOpts.input });
+    // When input is provided, stdin must be a pipe (not 'ignore') so the
+    // caller's payload actually reaches the git subprocess. Otherwise
+    // `git hash-object -w --stdin` hashes empty input, producing the tree
+    // with no state.json entry -- a silent wrong answer.
+    const spawnOpts = {
+      cwd: runOpts.cwd || cwd,
+      encoding: 'utf8',
+      stdio: runOpts.input != null ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe']
+    };
+    if (runOpts.input != null) spawnOpts.input = runOpts.input;
     try {
-      return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      return execFileSync('git', args, spawnOpts);
     } catch (e) {
-      const err = new Error('git ' + args.join(' ') + ' failed: ' + (e.stderr ? e.stderr.toString() : e.message));
+      const err = new Error('git ' + args.join(' ') + ' failed: ' +
+        (e.stderr ? e.stderr.toString() : e.message));
+      err.stderr = e.stderr ? e.stderr.toString() : '';
+      err.stdout = e.stdout ? e.stdout.toString() : '';
       err.cause = e;
       throw err;
     }
   }
+
+  function tryRun(args, runOpts) {
+    try { return { ok: true, out: run(args, runOpts) }; }
+    catch (e) { return { ok: false, err: e }; }
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function _fetchBranch(branch) {
+    // Force-update the local remote-tracking ref so re-reads after a
+    // rejected push see the winner's commit, even when our own earlier
+    // push advanced the local tracking ref past the current origin tip.
+    // The '+' prefix on the refspec permits non-fast-forward updates.
+    return tryRun(['fetch', 'origin', '+' + branch + ':refs/remotes/origin/' + branch]);
+  }
+
+  function _lsRemoteSha(branch) {
+    const res = tryRun(['ls-remote', 'origin', 'refs/heads/' + branch]);
+    if (!res.ok) return null;
+    const line = (res.out || '').split(/\r?\n/).find(l => l.trim());
+    if (!line) return null;
+    return line.split(/\s+/)[0] || null;
+  }
+
+  function _readStateAndSha(branch) {
+    // Returns { sha, state } with sha=null when origin has no such branch yet.
+    // We prefer the *remote* sha via ls-remote because a prior rejected push
+    // could have left our local tracking ref stale; ls-remote is the source
+    // of truth for the force-with-lease expected value.
+    const remoteSha = _lsRemoteSha(branch);
+    if (!remoteSha) return { sha: null, state: { leases: {}, messages: [] } };
+    // Ensure the object is local so `git show` can read it.
+    tryRun(['fetch', 'origin', '+' + remoteSha + ':refs/remotes/origin/' + branch]);
+    const show = tryRun(['show', remoteSha + ':state.json']);
+    if (!show.ok) return { sha: remoteSha, state: { leases: {}, messages: [] } };
+    let state;
+    try { state = JSON.parse(show.out); }
+    catch (_) { state = { leases: {}, messages: [] }; }
+    if (!state || typeof state !== 'object') state = { leases: {}, messages: [] };
+    if (!state.leases || typeof state.leases !== 'object') state.leases = {};
+    if (!Array.isArray(state.messages)) state.messages = [];
+    return { sha: remoteSha, state };
+  }
+
+  function _buildCommit(state) {
+    // Serialize state deterministically (keys sorted at the top level) so
+    // two clients producing the same logical state land on the same blob
+    // and the same tree SHA, making no-op writes a true no-op.
+    const canonical = JSON.stringify({
+      leases: state.leases || {},
+      messages: state.messages || []
+    }, null, 2) + '\n';
+    const blobOut = run(['hash-object', '-w', '--stdin'], { input: canonical });
+    const blobSha = blobOut.trim();
+    const treeInput = '100644 blob ' + blobSha + '\tstate.json\n';
+    const treeOut = run(['mktree'], { input: treeInput });
+    const treeSha = treeOut.trim();
+    // No parent -> every mutation replaces the ref with a single-commit history.
+    const commitOut = run(
+      ['commit-tree', treeSha, '-m', 'forge-collab: update state.json'],
+      {}
+    );
+    return commitOut.trim();
+  }
+
+  function _isNonFastForward(err) {
+    const s = ((err && err.stderr) || (err && err.message) || '') + '';
+    return /stale info|non-fast-forward|rejected|force-with-lease|cannot lock ref/i.test(s);
+  }
+
+  async function _pushWithLease(branch, commitSha, expectedSha) {
+    const lease = expectedSha
+      ? 'refs/heads/' + branch + ':' + expectedSha
+      : 'refs/heads/' + branch;
+    const args = [
+      'push',
+      '--force-with-lease=' + lease,
+      'origin',
+      commitSha + ':refs/heads/' + branch
+    ];
+    // Gate through the user's auto_push preference. T012 semantics:
+    // auto_push=false + no prompter -> returns pushed:false, reason:'auto_push_disabled_no_prompter'.
+    const result = await gatedPush(args, {
+      cwd,
+      forgeDir,
+      autoPush: typeof opts.autoPush === 'boolean' ? opts.autoPush : undefined,
+      runner: runner ? (a, o) => runner(a, o || {}) : undefined,
+      prompter: opts.prompter
+    });
+    return result;
+  }
+
+  async function _mutate(branch, mutator) {
+    // mutator: (state) -> { state, abort?: { ok:false, reason:string } }
+    // Returns { ok:true, sha } on success, or the abort object, or
+    // { ok:false, reason:'cas_exhausted' } after retries are exhausted.
+    let attempt = 0;
+    let lastErr = null;
+    while (attempt <= retries) {
+      _fetchBranch(branch);
+      const read = _readStateAndSha(branch);
+      let mutated;
+      try { mutated = mutator(JSON.parse(JSON.stringify(read.state))); }
+      catch (e) { return { ok: false, reason: 'mutator_threw', error: e.message }; }
+      if (mutated && mutated.abort) return mutated.abort;
+      const nextState = mutated && mutated.state ? mutated.state : read.state;
+      const commitSha = _buildCommit(nextState);
+      let pushResult;
+      try {
+        pushResult = await _pushWithLease(branch, commitSha, read.sha);
+      } catch (e) {
+        lastErr = e;
+        if (_isNonFastForward(e)) {
+          attempt += 1;
+          if (attempt > retries) break;
+          await sleep(attempt * backoffMs);
+          continue;
+        }
+        throw e;
+      }
+      if (pushResult && pushResult.pushed === false) {
+        // auto_push disabled and prompter refused (or absent).
+        return {
+          ok: false,
+          reason: pushResult.reason || 'push_gated',
+          pushResult
+        };
+      }
+      return { ok: true, sha: commitSha };
+    }
+    return {
+      ok: false,
+      reason: 'cas_exhausted',
+      error: lastErr ? (lastErr.message || String(lastErr)) : 'unknown'
+    };
+  }
+
+  function _pruneMessages(messages, now) {
+    const cutoff = (now || Date.now()) - ttlSeconds * 1000;
+    const seen = new Set();
+    const kept = [];
+    for (const m of messages) {
+      if (!m || typeof m !== 'object') continue;
+      const tsMs = m.ts ? Date.parse(m.ts) : NaN;
+      if (Number.isFinite(tsMs) && tsMs < cutoff) continue;
+      if (m.id && seen.has(m.id)) continue;
+      if (m.id) seen.add(m.id);
+      kept.push(m);
+    }
+    return kept;
+  }
+
+  function _leasesEqual(a, b) {
+    if (a === b) return true;
+    if (a == null && b == null) return true;
+    if (a == null || b == null) return false;
+    return a.claimant === b.claimant && a.acquiredAt === b.acquiredAt;
+  }
+
   return {
     async ensureBranch(branch) {
-      // Create local branch from origin if missing; harmless if it already exists.
-      try { gitCmd(process.cwd(), ['fetch', 'origin', branch]); } catch (_) {}
-      return true;
-    },
-    async readBranch(branch) {
-      try {
-        const raw = gitCmd(process.cwd(), ['show', 'origin/' + branch + ':state.json']);
-        return JSON.parse(raw);
-      } catch (_) {
-        return { leases: {}, messages: [] };
+      _fetchBranch(branch);
+      const read = _readStateAndSha(branch);
+      if (read.sha) return true;
+      // Branch missing on origin -> seed it with an empty state document so
+      // later reads/writes always have a ref to force-with-lease against.
+      const seed = { leases: {}, messages: [] };
+      const commitSha = _buildCommit(seed);
+      // Use an empty expected-sha to mean "ref must not exist yet"; if two
+      // clients race to create, whoever lands first wins and the loser's
+      // push is rejected -> we re-fetch and discover the ref.
+      const pushResult = await gatedPush(
+        [
+          'push',
+          '--force-with-lease=refs/heads/' + branch + ':',
+          'origin',
+          commitSha + ':refs/heads/' + branch
+        ],
+        {
+          cwd,
+          forgeDir,
+          autoPush: typeof opts.autoPush === 'boolean' ? opts.autoPush : undefined,
+          runner: runner ? (a, o) => runner(a, o || {}) : undefined,
+          prompter: opts.prompter
+        }
+      ).catch(() => ({ pushed: false, reason: 'seed_push_rejected' }));
+      if (pushResult && pushResult.pushed === false) {
+        // Either auto_push was gated off, or a peer beat us to the seed.
+        // Re-fetch so subsequent reads see their commit.
+        _fetchBranch(branch);
       }
-    },
-    async writeLease(/* branch, name, lease */) {
-      // Real implementation would commit + push; shipped as a stub here so
-      // the connect/publish/subscribe loop is testable. T012 push-config
-      // task will wire auto-push vs prompted-push here.
       return true;
     },
-    async appendMessage(/* branch, msg */) {
-      return true;
+
+    async readBranch(branch) {
+      _fetchBranch(branch);
+      return _readStateAndSha(branch).state;
+    },
+
+    async writeLease(branch, name, next, writeOpts) {
+      writeOpts = writeOpts || {};
+      const hasExpected = Object.prototype.hasOwnProperty.call(writeOpts, 'expected');
+      return _mutate(branch, (state) => {
+        if (hasExpected) {
+          const cur = state.leases[name] != null ? state.leases[name] : null;
+          if (!_leasesEqual(cur, writeOpts.expected)) {
+            return { abort: { ok: false, reason: 'cas_race_lost', current: cur } };
+          }
+        }
+        if (next === null || next === undefined) delete state.leases[name];
+        else state.leases[name] = next;
+        return { state };
+      });
+    },
+
+    async appendMessage(branch, msg) {
+      return _mutate(branch, (state) => {
+        state.messages = _pruneMessages(state.messages, opts.now);
+        const withTs = Object.assign({ ts: new Date().toISOString() }, msg || {});
+        // Dedupe by id when the caller already assigned one.
+        if (!withTs.id || !state.messages.find(m => m.id === withTs.id)) {
+          state.messages.push(withTs);
+        }
+        return { state };
+      });
+    },
+
+    // Exposed for the cross-process wire test + future introspection.
+    _internal: {
+      _readStateAndSha,
+      _buildCommit,
+      _pruneMessages,
+      get ttlSeconds() { return ttlSeconds; },
+      get retries() { return retries; },
+      get backoffMs() { return backoffMs; }
     }
   };
 }
@@ -1980,6 +2263,7 @@ module.exports = {
     readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,
     _isExpired, _claimName, _safeHandle, _safeKind,
     _parseFrontmatter, _extractSections, _defaultClassifier, _defaultContradictionDetector,
-    _inputsPath, _consolidatedPath, _categoriesPath, _questionsDir
+    _inputsPath, _consolidatedPath, _categoriesPath, _questionsDir,
+    _defaultPollingIo
   }
 };

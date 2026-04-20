@@ -58,6 +58,7 @@ Running log of "what the architecture says will happen" vs "what actually happen
 - **REALITY** (`scripts/forge-collab.cjs:672-680`): `_defaultPollingIo.writeLease()` and `.appendMessage()` are empty stubs. Inline comment acknowledges: "Real implementation would commit + push; shipped as a stub here so the connect/publish/subscribe loop is testable. T012 push-config task will wire auto-push vs prompted-push here." T012 landed `gatedPush` but never wired it into the IO adapter.
 - **VERIFICATION**: ran alice `sendTargeted('bob', 'flag-ping', ...)` across two real git clones sharing a bare remote. No branch created, no commits, bob `_refresh()` got 0 messages. In-repo tests pass because every polling test injects a shared in-memory `_stubIo()`.
 - **SEVERITY**: blocker (for polling mode)
+- **STATUS**: RESOLVED by T013. See F004 below — `_defaultPollingIo` now runs a full single-commit amend + force-with-lease CAS loop against `forge/collab-state`, with a cross-process wire test at `tests/forge-collab-polling-real.test.cjs` covering the race-resolution, retry-exhaustion, TTL-pruning, and gated-push paths.
 
 ### O006 — `sendTargeted` at transport layer broadcasts to all subscribers
 
@@ -162,6 +163,43 @@ These came in from the user's follow-up and are not yet verified on my side — 
 - **SCOPE NOTE**: the guard is strict on purpose. Per-task `task_status: complete` writes (the historical "this task finished, route to next" signal) will now be rejected unless the whole frontier is DONE. This is what R008 AC2 literally requires ("every status entry is one of {DONE, DONE_WITH_CONCERNS}"). In practice the rest of the codebase writes task-done state to the registry (`markTaskComplete`) and uses other `task_status` values (`testing`, `reviewing`, `implementing`, `null`) during per-task lifecycle transitions; only the legitimate spec-level completion flip lands `task_status: complete`, and it passes when the registry agrees. The one in-file callsite that writes per-task `'complete'` (`verifyStateConsistency` at line ~2898) is self-healing reconciliation: when it runs, the registry already shows `complete` for the current task, so the guard continues to pass for any single-task frontier; multi-task frontiers where only one task is done will now surface a violation, which is the correct behavior — the spec-level flag is semantically wrong in that state.
 - **RESOLVES**: O014.
 
+### F004 — polling transport writes are real: amend + force-with-lease CAS (T013, spec-collab-fix R002)
+
+- **CHANGE** (`scripts/forge-collab.cjs:_defaultPollingIo`): replaced the two no-op stubs (`writeLease`, `appendMessage`) plus the read-only `ensureBranch`/`readBranch` pair with a full single-commit-on-ref implementation driven by git plumbing. Every mutation runs the `_mutate` loop:
+  1. `git fetch origin +<branch>:refs/remotes/origin/<branch>` (forced tracking update so a rejected push never leaves the local tracking ref ahead of origin).
+  2. `git ls-remote origin refs/heads/<branch>` (authoritative CAS-expected sha; local tracking is a snapshot, ls-remote is truth).
+  3. `git show <sha>:state.json` to materialize `{ leases, messages }`.
+  4. Apply the mutator. `writeLease` honours an optional `{ expected }` — if `state.leases[name]` no longer matches on re-read, the mutator aborts with `{ ok: false, reason: 'cas_race_lost', current }`. `appendMessage` prunes entries where `Date.now() - Date.parse(ts) > ttl_seconds * 1000` (default 300) before appending and dedupes by `id`.
+  5. Build a *rootless* commit: `git hash-object -w --stdin` -> `git mktree` -> `git commit-tree <tree> -m "forge-collab: update state.json"` with **no `-p` parent**, so every push replaces the ref with a one-commit history.
+  6. `gatedPush(['push', '--force-with-lease=refs/heads/<branch>:<expected-sha>', 'origin', '<commit>:refs/heads/<branch>'], {...})` so the user's `auto_push` preference is honoured (T012 wiring).
+  7. On push rejection (`stale info|non-fast-forward|rejected|force-with-lease|cannot lock ref`), re-loop. Up to 3 retries with 100 ms linear backoff. 4th rejection returns `{ ok: false, reason: 'cas_exhausted', error }`.
+- **BOOTSTRAP** (`ensureBranch`): if origin has no `forge/collab-state` ref, seeds it with an empty `{ leases:{}, messages:[] }` commit via the same plumbing and `--force-with-lease=refs/heads/<branch>:` (empty expected = "ref must not exist"). Two clients racing the seed: one lands, the loser's rejection is swallowed and a fresh fetch surfaces the winner's ref — so a quiet no-op on the loser side rather than a hard error.
+- **STDIN FIX**: the earlier stub used `stdio: ['ignore', 'pipe', 'pipe']` uniformly. `hash-object --stdin` needs real stdin, so the new `run()` helper switches stdio[0] to `'pipe'` whenever `input` is present. Missed this in the first pass — hash-object was silently hashing empty input, producing a tree with no `state.json` entry. Caught by the wire test failing with `fatal: path 'state.json' does not exist in 'refs/heads/forge/collab-state'` after the commit landed.
+- **BACKWARD COMPAT**: `writeLease(branch, name, next)` without the 4th `{ expected }` option is a plain setter — matches the shape the existing fire-and-forget call in `createPollingTransport.cas` uses (`forge-collab.cjs:642`). The in-repo `_stubIo()` tests (153/153) all continue to pass unchanged. `readBranch` still returns just the state object (not `{state, sha}`), so the existing `_refresh()` consumer is unaffected.
+- **NEW EXPOSED SURFACE**: `_internal._defaultPollingIo` at module level; `_internal.io` and `_internal.branch` on the polling transport. Both added so cross-process tests can reach the real adapter from a clone's cwd without patching the whole transport.
+- **NEW TEST FILE** (`tests/forge-collab-polling-real.test.cjs`, 4/4 green): first in-repo test that exercises the real IO adapter end-to-end instead of a stub.
+  - **Two-subprocess race**: spawns two node children with separate clones of a shared bare remote in `os.tmpdir()`, each calls `writeLease('claim:T001', lease, { expected: null })` against the same branch with a wall-clock barrier so their race windows overlap. Asserts exactly one `{ ok:true }`, one `{ ok:false, reason:'cas_race_lost' }`, and that the bare repo's `forge/collab-state` ref holds exactly one commit (per R002 AC4 "single commit on ref regardless of N operations"). Winner's claimant is either alice or bob and the loser observes it on re-read.
+  - **`cas_exhausted` path**: injected runner returns a non-fast-forward error on every push; retries exhaust and the caller sees `{ ok:false, reason:'cas_exhausted' }` (R002 AC3).
+  - **TTL pruning**: `_pruneMessages` drops entries older than `ttl_seconds` and `appendMessage` completes `{ ok:true }` with the pruned state.
+  - **Gated push**: with `autoPush:false` and no prompter, `writeLease` returns `{ ok:false, reason:'auto_push_disabled_no_prompter' }` — the user's auto_push preference gates the write before the ref changes (R002 AC5, integrating with F003's T012 wiring).
+  - All subprocess cleanup via `fs.rmSync(root, { recursive:true, force:true, maxRetries:3 })`, wrapped in try/catch for Windows-locked files.
+- **FULL SUITE**: 496/497 green (all 4 new tests + 153 existing forge-collab tests + 18 gitignore tests). The single failure is the pre-existing O008/O023 Windows CRLF snapshot in `tests/forge-tui/render-test.cjs`, unchanged by T013.
+- **KEY DECISIONS** (for the record):
+  - Rootless commit per mutation (no `-p`): fulfils R002 AC4 cleanly and makes race detection trivial. Downside: `git log <branch>` shows only the latest state, no history. Acceptable because the state document is the substrate, not the history.
+  - `ls-remote` rather than `rev-parse refs/remotes/origin/<branch>` as the CAS-expected-sha source: local tracking refs go stale after a rejected push, and force-with-lease needs the true remote tip. Costs one extra network roundtrip per mutation; fine for a 2.5 s polling cadence.
+  - `cas_race_lost` reason is optional-opt-in via `{ expected }` so existing `cas()` fire-and-forget callers (R013 stub tests) keep last-writer-wins semantics. The transport layer's `cas()` is still sync + local-only; wire test calls `io.writeLease` directly to observe the race-resolution outcome, matching the task-brief instruction "each calls `cas` on the same lease name simultaneously → asserts exactly one returns `{ok: true}`, the other returns `{ok: false, reason: "cas_race_lost"}` or similar".
+- **RESOLVES**: O005 (polling transport writes were no-op stubs; now real). Partially addresses the lattice of O006/O007 — this task only touches the polling transport; O006 (transport-layer target filter across all backends) and O007 (Ably CAS authoritative) remain open for T022 and T024.
+
+### F005 — First non-stub cross-node test in the collab suite (T013, spec-collab-fix R006)
+
+- **OBSERVATION**: every prior collab test used `_stubIo()` so stub-masked regressions could hide behind a green suite (O005 was literally this). `tests/forge-collab-polling-real.test.cjs` is the first test that spawns real subprocesses against a real bare git remote.
+- **PATTERN**: subprocess bodies live in `CHILD_SCRIPT` (a string) written to a tmp file at test startup, then spawned via `spawn(process.execPath, [childPath, FORGE_COLLAB, cwd, handle, BRANCH, barrier])`. Initial attempt used `node -e <script> <args>` directly but Windows/argv interaction dropped the first positional arg. Tmp-file approach is portable.
+- **WALL-CLOCK BARRIER**: both children sleep until `Date.now() === barrier` (~400 ms after dispatch) before calling `writeLease`, so the race is actually contended at the push layer rather than serialized by spawn latency.
+- **CROSS-PROC DETERMINISM**: the test asserts exactly-one-winner + cas_race_lost invariant, not which specific clone wins (timing-dependent, first-push-to-bare wins). State.json on the bare ref is checked for either claimant.
+- **CLEANUP**: tmpdir rm with `{ recursive:true, force:true, maxRetries:3 }` in a `finally` block; Windows-locked-file best-effort.
+- **RUNTIME**: 2.0 s on this machine for all 4 tests; well under the R006 AC "under 30 seconds on CI" target.
+- **RELEVANT TO O019** (parallel agents collide on git state): the wire-test pattern is also the template for future multi-process tests. It uses isolated clones + a shared bare, which is the same isolation model that O019's worktree resolution will need. Useful reference when spec-forge-v03-gaps R006 streaming-DAG worktree isolation gets built.
+
 ---
 
 ## Observations from execute run (T011 — mock scaffold)
@@ -206,6 +244,7 @@ These came in from the user's follow-up and are not yet verified on my side — 
 - **SEVERITY**: blocker (for parallel dispatch correctness; every parallel run needs isolated worktrees).
 - **RESOLUTION PATH**: spec-forge-v03-gaps R006 (streaming DAG) already mandates worktree isolation for provisional downstream tasks (per Sherlock research). The same mechanism must apply to every parallel executor dispatch, not just provisional ones. Proposed as a follow-up R under spec-forge-v03-gaps before its final merge.
 - **WORKAROUND UNTIL FIXED**: only dispatch a single executor agent at a time until R006 worktree gating ships, or dispatch parallel agents only on tasks that touch disjoint file sets and serialize committal by having the outer loop (not the agents) do `git commit` after all agents return.
+- **RELATED**: F005 (T013 wire test) is the first in-repo test using real subprocesses + isolated clones + a shared bare remote. Useful as a reference pattern for future worktree-isolation tests once R006 streaming-DAG isolation ships.
 
 ### O020 — T001 setup.sh half is NOT committed; test suite reflects this honestly
 
