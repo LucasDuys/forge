@@ -770,6 +770,196 @@ function _cavemanCheckpointFields(cp) {
   return cp;
 }
 
+// === Caveman Whitelist Enforcement (R015) ===
+//
+// `formatCavemanValue` itself operates on strings, not paths, so path policy
+// must be enforced at the writers that fan out to disk. The whitelist
+// corresponds to the scope declared in skills/caveman-internal/SKILL.md:
+// state.md bodies, progress checkpoints, artifact summaries, context bundles,
+// and review-report summaries under .forge/summaries/. Anything else throws.
+//
+// Hard-blocked paths also short-circuit the allow list: source files,
+// commits, YAML config, `.git/` internals, and user-facing spec/doc trees.
+
+const CAVEMAN_HARD_BLOCKED_EXTS = new Set([
+  '.js', '.cjs', '.mjs', '.ts', '.tsx', '.jsx',
+  '.py', '.rb', '.go', '.rs', '.java', '.kt', '.swift',
+  '.c', '.cc', '.cpp', '.h', '.hpp',
+  '.sh', '.bash', '.ps1',
+  '.yml', '.yaml', '.toml', '.ini',
+  '.html', '.css', '.scss', '.sql'
+]);
+
+const CAVEMAN_HARD_BLOCKED_PREFIXES = [
+  '.git/',
+  '.forge/specs/',
+  'docs/superpowers/',
+  'docs/audit/',
+  'docs/',
+  'specs/',
+  'skills/',
+  'commands/',
+  'agents/',
+  'hooks/',
+  'scripts/',
+  'tests/',
+  'templates/',
+  'references/'
+];
+
+function _normalizeRelPath(relPath) {
+  if (typeof relPath !== 'string' || relPath.length === 0) return '';
+  // Strip drive letters and leading separators, normalise to forward slashes.
+  let p = relPath.replace(/\\/g, '/');
+  p = p.replace(/^[a-zA-Z]:\//, '');
+  while (p.startsWith('/')) p = p.slice(1);
+  return p;
+}
+
+// Returns true when relPath falls inside the caveman whitelist. The whitelist
+// corresponds to the declared scope in skills/caveman-internal/SKILL.md.
+//
+// Whitelist:
+//   .forge/state.md
+//   .forge/progress/<task>.json        (handoff checkpoints)
+//   .forge/artifacts/<task>.json       (handoff summaries)
+//   .forge/context-bundles/<task>.md   (handoff notes)
+//   .forge/summaries/**                (review + status summaries)
+//   .forge/history/cycles/**/summary*  (review report summaries)
+//   .forge/resume.md                   (budget-exhausted handoff)
+//   .forge/context-summary.md          (compress-context summary)
+function isCavemanAllowedPath(relPath) {
+  const p = _normalizeRelPath(relPath);
+  if (!p) return false;
+
+  // Exact handoff files.
+  if (p === '.forge/state.md') return true;
+  if (p === '.forge/resume.md') return true;
+  if (p === '.forge/context-summary.md') return true;
+
+  // Scoped handoff dirs.
+  if (p.startsWith('.forge/progress/') && p.endsWith('.json')) return true;
+  if (p.startsWith('.forge/artifacts/') && p.endsWith('.json')) return true;
+  if (p.startsWith('.forge/context-bundles/') && p.endsWith('.md')) return true;
+  if (p.startsWith('.forge/summaries/')) return true;
+  if (p.startsWith('.forge/history/cycles/') && /summary|review/i.test(p)) return true;
+
+  return false;
+}
+
+// Throws a descriptive error when relPath is outside the whitelist or matches
+// a hard-blocked extension/prefix. Callers pass the repo-relative path of the
+// artifact they are about to write.
+function assertCavemanWhitelist(relPath) {
+  const p = _normalizeRelPath(relPath);
+  if (!p) {
+    throw new Error(`caveman: refusing to compress empty or non-string path (got ${JSON.stringify(relPath)})`);
+  }
+
+  // Hard block by extension first -- a source file under an otherwise allowed
+  // prefix must still be rejected.
+  const dotIdx = p.lastIndexOf('.');
+  const ext = dotIdx === -1 ? '' : p.slice(dotIdx).toLowerCase();
+  if (CAVEMAN_HARD_BLOCKED_EXTS.has(ext)) {
+    throw new Error(`caveman: refusing to compress ${p} -- extension ${ext} is hard-blocked (source/config/markup files never go through compression)`);
+  }
+
+  // Hard block by prefix: commit messages, specs, docs, skills, scripts live
+  // outside .forge/ and must never see compression.
+  for (const prefix of CAVEMAN_HARD_BLOCKED_PREFIXES) {
+    if (p.startsWith(prefix)) {
+      throw new Error(`caveman: refusing to compress ${p} -- path prefix ${prefix} is hard-blocked (user-facing content never goes through compression)`);
+    }
+  }
+
+  if (!isCavemanAllowedPath(p)) {
+    throw new Error(`caveman: refusing to compress ${p} -- not in the declared whitelist {state.md, progress/, artifacts/, context-bundles/, summaries/, resume.md, context-summary.md}`);
+  }
+}
+
+// === Compression Stats Ledger (R015) ===
+//
+// Per-cycle totals of bytes compressed + bytes saved. `/forge:status` reads
+// these to surface regressions in compression quality over time. Cycle id
+// comes from `.forge/state.md` frontmatter (current_cycle) or defaults to
+// the ISO day so tests and ad-hoc runs still accumulate somewhere sensible.
+
+function _compressionStatsPath(forgeDir) {
+  return path.join(forgeDir, 'compression-stats.json');
+}
+
+function _currentCavemanCycle(forgeDir) {
+  try {
+    const state = parseFrontmatter(fs.readFileSync(path.join(forgeDir, 'state.md'), 'utf8'));
+    const data = state && state.data ? state.data : {};
+    if (data.current_cycle) return String(data.current_cycle);
+    if (data.cycle) return String(data.cycle);
+  } catch (_) { /* fall through */ }
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function recordCompressionStats(forgeDir, relPath, bytesBefore, bytesAfter) {
+  if (typeof bytesBefore !== 'number' || typeof bytesAfter !== 'number') return null;
+  if (bytesBefore < 0 || bytesAfter < 0) return null;
+  const statsPath = _compressionStatsPath(forgeDir);
+  let ledger = { cycles: {} };
+  try {
+    ledger = JSON.parse(fs.readFileSync(statsPath, 'utf8'));
+    if (!ledger || typeof ledger !== 'object') ledger = { cycles: {} };
+    if (!ledger.cycles || typeof ledger.cycles !== 'object') ledger.cycles = {};
+  } catch (_) { /* new ledger */ }
+
+  const cycle = _currentCavemanCycle(forgeDir);
+  const entry = ledger.cycles[cycle] || {
+    bytes_before: 0,
+    bytes_after: 0,
+    bytes_saved: 0,
+    artifact_count: 0,
+    first_at: new Date().toISOString()
+  };
+  entry.bytes_before += bytesBefore;
+  entry.bytes_after += bytesAfter;
+  entry.bytes_saved = Math.max(0, entry.bytes_before - entry.bytes_after);
+  entry.artifact_count += 1;
+  entry.last_at = new Date().toISOString();
+  entry.last_path = _normalizeRelPath(relPath);
+  ledger.cycles[cycle] = entry;
+
+  try {
+    const tmp = statsPath + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(ledger, null, 2));
+    fs.renameSync(tmp, statsPath);
+  } catch (e) {
+    // Stats are best-effort -- never crash the write path.
+    try { fs.unlinkSync(statsPath + '.tmp'); } catch (_) {}
+  }
+  return entry;
+}
+
+function readCompressionStats(forgeDir) {
+  try {
+    return JSON.parse(fs.readFileSync(_compressionStatsPath(forgeDir), 'utf8'));
+  } catch (_) {
+    return { cycles: {} };
+  }
+}
+
+// compressWithGuard is the single entry point used by writers that want
+// both the whitelist check and the stats ledger. It returns the compressed
+// string (or the original if skipCaveman is true) so callers can drop it in
+// place of raw formatCavemanValue calls.
+function compressWithGuard(forgeDir, relPath, text, opts) {
+  opts = opts || {};
+  if (opts.skipCavemanFormat) return text;
+  if (typeof text !== 'string' || text.length === 0) return text;
+  assertCavemanWhitelist(relPath);
+  const before = Buffer.byteLength(text, 'utf8');
+  const out = formatCavemanValue(text);
+  const after = Buffer.byteLength(typeof out === 'string' ? out : '', 'utf8');
+  recordCompressionStats(forgeDir, relPath, before, after);
+  return out;
+}
+
 function readState(forgeDir) {
   const statePath = path.join(forgeDir, 'state.md');
   try {
@@ -832,17 +1022,18 @@ function _atomicWriteFile(targetPath, contents) {
 function writeState(forgeDir, dataOrUpdates, contentOrOpts, maybeOpts) {
   const statePath = path.join(forgeDir, 'state.md');
 
+  const stateRel = '.forge/state.md';
+
   // Detect legacy 3-arg form: 3rd arg is a string (content body).
   if (arguments.length >= 3 && typeof contentOrOpts === 'string') {
     const opts = maybeOpts || {};
-    const body = opts.skipCavemanFormat ? contentOrOpts : formatCavemanValue(contentOrOpts);
+    const body = compressWithGuard(forgeDir, stateRel, contentOrOpts, opts);
     _atomicWriteFile(statePath, serializeFrontmatter(dataOrUpdates, body));
     return;
   }
 
   // 2-arg partial form (with optional opts as 3rd arg).
   const opts = (contentOrOpts && typeof contentOrOpts === 'object') ? contentOrOpts : {};
-  const skipCaveman = !!opts.skipCavemanFormat;
 
   const updates = dataOrUpdates || {};
   let current = { data: {}, content: '' };
@@ -854,9 +1045,9 @@ function writeState(forgeDir, dataOrUpdates, contentOrOpts, maybeOpts) {
   let mergedContent = current.content;
   for (const [key, val] of Object.entries(updates)) {
     if (key === '__content') {
-      mergedContent = skipCaveman ? val : formatCavemanValue(val);
+      mergedContent = compressWithGuard(forgeDir, stateRel, val, opts);
     } else if (key === '__contentAppend') {
-      const piece = skipCaveman ? val : formatCavemanValue(val);
+      const piece = compressWithGuard(forgeDir, stateRel, val, opts);
       mergedContent = (mergedContent || '') + piece;
     } else {
       // Frontmatter values are short / structured -- never caveman them.
@@ -1717,22 +1908,37 @@ function isBlockedByParallelConstraint(taskId, runningTasks, constraints) {
 function writeArtifact(forgeDir, taskId, artifact) {
   const artifactsDir = path.join(forgeDir, 'artifacts');
   try { fs.mkdirSync(artifactsDir, { recursive: true }); } catch (e) {}
+  // R015: enforce whitelist before any compression. Throws on bad paths.
+  const relPath = `.forge/artifacts/${taskId}.json`;
+  assertCavemanWhitelist(relPath);
+  // R005: artifact summary values use caveman compression for compact handoffs.
+  // Track bytes before/after across every string field so the cycle ledger
+  // surfaces regressions via /forge:status.
+  let totalBefore = 0;
+  let totalAfter = 0;
+  const compressedArtifacts = Object.fromEntries(
+    Object.entries(artifact.artifacts || {}).map(([k, v]) => {
+      if (typeof v !== 'string') return [k, v];
+      totalBefore += Buffer.byteLength(v, 'utf8');
+      const compressed = formatCavemanValue(v);
+      totalAfter += Buffer.byteLength(compressed, 'utf8');
+      return [k, compressed];
+    })
+  );
   const data = {
     task_id: taskId,
     status: artifact.status || 'complete',
     commit: artifact.commit || null,
-    // R005: artifact summary values use caveman compression for compact handoffs
-    artifacts: Object.fromEntries(
-      Object.entries(artifact.artifacts || {}).map(([k, v]) =>
-        [k, typeof v === 'string' ? formatCavemanValue(v) : v]
-      )
-    ),
+    artifacts: compressedArtifacts,
     files_created: artifact.files_created || [],
     files_modified: artifact.files_modified || [],
     key_decisions: artifact.key_decisions || [],
     completed_at: new Date().toISOString()
   };
   fs.writeFileSync(path.join(artifactsDir, `${taskId}.json`), JSON.stringify(data, null, 2));
+  if (totalBefore > 0) {
+    recordCompressionStats(forgeDir, relPath, totalBefore, totalAfter);
+  }
   return data;
 }
 
@@ -1837,8 +2043,19 @@ function writeCheckpoint(forgeDir, taskId, checkpoint, opts) {
   validateCheckpoint(cp);
   let normalized = normalizeCheckpoint(cp);
   // Caveman-format free-text fields by default (T029, R013).
+  const relPath = `.forge/progress/${taskId}.json`;
   if (!(opts && opts.skipCavemanFormat)) {
+    // R015: whitelist guard -- throws if someone ever routes checkpoint writes
+    // through a non-progress path. The canonical path is always allowed.
+    assertCavemanWhitelist(relPath);
+    // Measure bytes before/after on free-text fields so the cycle ledger
+    // reflects checkpoint compression alongside artifacts + state.
+    const before = _cavemanFieldByteSize(normalized);
     normalized = _cavemanCheckpointFields(normalized);
+    const after = _cavemanFieldByteSize(normalized);
+    if (before > 0) {
+      recordCompressionStats(forgeDir, relPath, before, after);
+    }
   }
 
   const target = checkpointPath(forgeDir, taskId);
@@ -1846,6 +2063,24 @@ function writeCheckpoint(forgeDir, taskId, checkpoint, opts) {
   fs.writeFileSync(tmp, JSON.stringify(normalized, null, 2));
   fs.renameSync(tmp, target);
   return { written: true, path: target };
+}
+
+// Size only the fields _cavemanCheckpointFields actually touches, so the
+// byte delta in the stats ledger mirrors what compression changed.
+function _cavemanFieldByteSize(cp) {
+  let total = 0;
+  if (cp && cp.context_bundle && typeof cp.context_bundle === 'object') {
+    for (const v of Object.values(cp.context_bundle)) {
+      if (typeof v === 'string') total += Buffer.byteLength(v, 'utf8');
+    }
+  }
+  if (cp && Array.isArray(cp.error_log)) {
+    for (const entry of cp.error_log) {
+      if (typeof entry === 'string') total += Buffer.byteLength(entry, 'utf8');
+      else if (entry && typeof entry.msg === 'string') total += Buffer.byteLength(entry.msg, 'utf8');
+    }
+  }
+  return total;
 }
 
 function readCheckpoint(forgeDir, taskId) {
@@ -1951,6 +2186,11 @@ function buildContextBundle(forgeDir, task, specContent, frontierTasks) {
   }
 
   // Key decisions from dependency artifacts (caveman-compressed)
+  const bundleRel = `.forge/context-bundles/${task.id}.md`;
+  // R015: whitelist guard -- bundle path is inside the declared handoff scope.
+  assertCavemanWhitelist(bundleRel);
+  let bundleBefore = 0;
+  let bundleAfter = 0;
   if (task.depends && task.depends.length > 0) {
     const decisions = [];
     const fileList = [];
@@ -1959,7 +2199,14 @@ function buildContextBundle(forgeDir, task, specContent, frontierTasks) {
       if (!artifact) continue;
       if (artifact.key_decisions && artifact.key_decisions.length > 0) {
         for (const d of artifact.key_decisions) {
-          decisions.push(`- ${depId}: ${formatCavemanValue(d)}`);
+          if (typeof d === 'string') {
+            bundleBefore += Buffer.byteLength(d, 'utf8');
+            const compressed = formatCavemanValue(d);
+            bundleAfter += Buffer.byteLength(compressed, 'utf8');
+            decisions.push(`- ${depId}: ${compressed}`);
+          } else {
+            decisions.push(`- ${depId}: ${d}`);
+          }
         }
       }
       if (artifact.files_created) fileList.push(...artifact.files_created);
@@ -1975,6 +2222,9 @@ function buildContextBundle(forgeDir, task, specContent, frontierTasks) {
 
   const bundlePath = path.join(bundleDir, `${task.id}.md`);
   fs.writeFileSync(bundlePath, sections.join('\n\n'));
+  if (bundleBefore > 0) {
+    recordCompressionStats(forgeDir, bundleRel, bundleBefore, bundleAfter);
+  }
   return bundlePath;
 }
 
@@ -5390,6 +5640,8 @@ module.exports = {
   parseFrontmatter, serializeFrontmatter,
   loadConfig, DEFAULT_CONFIG, deepMerge, getConfig,
   estimateTokensFromTranscript, readState, writeState, formatCavemanValue,
+  assertCavemanWhitelist, isCavemanAllowedPath,
+  recordCompressionStats, readCompressionStats, compressWithGuard,
   acquireLock, releaseLock, heartbeat, detectStaleLock, readLock,
   updateTokenLedger, parseFrontier,
   detectFileConflicts, serializeConflictingTasks, logConflictEvent, planTierExecution, detectParallelConflicts,

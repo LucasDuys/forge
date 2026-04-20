@@ -24,6 +24,7 @@
 //   .forge/progress/{T###}.json — per-task checkpoint step + token usage
 //   .forge/plans/*-frontier.md  — total task count for the progress bar
 //   .forge/config.json          — per_task_budget, depth, status_header opt-out
+//   .forge/compression-stats.json — per-cycle caveman bytes-saved (R015)
 
 'use strict';
 
@@ -165,6 +166,29 @@ const runningTasks = (reg && reg.tasks)
 const sessionBudget = ledger.session_budget_total || (config && config.session_budget_tokens) || ledger.token_budget || 500000;
 const sessionUsed = ledger.session_used || tokIn || 0;
 
+// Compression stats (R015) -- read the per-cycle ledger written by the
+// caveman guard. Aggregate the current cycle into a single display line;
+// fall back to a rolled-up total across all cycles when no current cycle
+// matches.
+const compressionStats = safeJSON(path.join(FORGE_DIR, 'compression-stats.json')) || { cycles: {} };
+let compCycleKey = stateFM.current_cycle || stateFM.cycle || null;
+let compEntry = null;
+if (compCycleKey && compressionStats.cycles && compressionStats.cycles[compCycleKey]) {
+  compEntry = compressionStats.cycles[compCycleKey];
+} else if (compressionStats.cycles && Object.keys(compressionStats.cycles).length > 0) {
+  // No frontmatter cycle id -- roll up across every cycle so the status line
+  // still shows a useful running total for ad-hoc runs and CI.
+  const rolled = { bytes_before: 0, bytes_after: 0, artifact_count: 0 };
+  for (const e of Object.values(compressionStats.cycles)) {
+    rolled.bytes_before += (e.bytes_before || 0);
+    rolled.bytes_after += (e.bytes_after || 0);
+    rolled.artifact_count += (e.artifact_count || 0);
+  }
+  rolled.bytes_saved = Math.max(0, rolled.bytes_before - rolled.bytes_after);
+  compEntry = rolled;
+  compCycleKey = 'all';
+}
+
 // ─── Build status block ───────────────────────────────────────────────────
 
 const lines = [];
@@ -219,6 +243,15 @@ if (currentTaskTokens != null && currentTaskBudget) {
 const restartCount = loop.restart_count || 0;
 const maxRestarts = loop.max_restarts || 10;
 lines.push(`  Lock    ${lockLabel}   ${c('gray', `restarts ${restartCount}/${maxRestarts}`)}`);
+
+// Compression line (R015) -- only when the ledger has any data.
+if (compEntry && (compEntry.bytes_before || 0) > 0) {
+  const before = compEntry.bytes_before || 0;
+  const saved = Math.max(0, before - (compEntry.bytes_after || 0));
+  const savedPct = before > 0 ? Math.floor((saved / before) * 100) : 0;
+  const label = compCycleKey === 'all' ? 'all cycles' : `cycle ${compCycleKey}`;
+  lines.push(`  Caveman ${c('gray', label)}  ${fmtK(before)}B in / ${fmtK(saved)}B saved (${savedPct}%) over ${compEntry.artifact_count || 0} artifact(s)`);
+}
 
 // Blocked banner takes the bottom slot when present
 if (blockedReason) {
