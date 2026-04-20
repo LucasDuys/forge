@@ -104,6 +104,83 @@ You read the diffs. You merge the branch. You move on.
 
 The pipeline is strictly sequential, enforced programmatically: `brainstorm` → `plan` → `execute`. You cannot skip brainstorming, skip planning, or bypass the approval gate. The spec is the contract. Every acceptance criterion has an R-number; every task maps to at least one R-number; the verifier checks R-numbers, not checklists.
 
+## How Forge Actually Works
+
+Forge runs five phases in a loop. Four of them always run in order. The fifth, `backprop`, fires whenever a later phase catches a bug the spec did not anticipate, and its output feeds back into the first phase.
+
+```mermaid
+flowchart LR
+    Brainstorm["brainstorm<br/>idea to spec"] --> Plan["plan<br/>spec to task DAG"]
+    Plan --> Execute["execute<br/>tasks to commits"]
+    Execute --> Review["review<br/>spec compliance"]
+    Review --> Backprop["backprop<br/>gap to new ACs"]
+    Backprop -.->|spec update| Brainstorm
+    Review -->|all ACs pass| Done([FORGE_COMPLETE])
+
+    classDef phase fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef done fill:#c8e6c9,stroke:#1b5e20,color:#0d2818
+    class Brainstorm,Plan,Execute,Review,Backprop phase
+    class Done done
+```
+
+Each phase has one owner agent, one input artifact, and one output artifact. The state file `.forge/state.md` records which phase is active; the Stop hook fires `routeDecision()` after every Claude turn and picks the next phase based on that state.
+
+### Worked example: add a logout button
+
+```bash
+/forge:brainstorm "add a logout button to the header that clears the session and redirects to /login"
+```
+
+The speccer asks three to seven questions one at a time (does logout also revoke refresh tokens, should it confirm first, where in the header). It writes `.forge/specs/spec-logout-button.md` with R001 through R004 and acceptance criteria for each.
+
+```bash
+/forge:plan
+```
+
+The planner decomposes the spec into a dependency-ordered task DAG, written to `.forge/plans/spec-logout-button-frontier.md`. For this spec that is usually T001 add `POST /auth/logout` route, T002 build `<LogoutButton>` React component, T003 wire the button into the header, T004 e2e test covering the happy path and the already-logged-out case.
+
+```bash
+/forge:execute --autonomy gated
+```
+
+The executor runs each task in its own git worktree under `.forge/worktrees/T00N/`. For T002 it writes `src/components/LogoutButton.tsx` and `src/components/__tests__/LogoutButton.test.tsx`, runs the targeted tests, then the reviewer checks the change against R002's ACs. Passing tasks squash-merge to the branch with a structured commit message. Failing tasks stay in their worktree for `/forge:resume` or `/forge:backprop` to pick up.
+
+### What Forge does automatically vs what requires your explicit approval
+
+| Action | `gated` (default) | `full` |
+|---|---|---|
+| Write spec from your one-line idea | automatic (asks you questions during Q&A) | automatic |
+| Decompose spec into tasks | automatic | automatic |
+| Write code + tests for each task | automatic | automatic |
+| Run tests, review, verify each task | automatic | automatic |
+| Squash-merge passing tasks to the working branch | automatic | automatic |
+| Install a new dependency not already in the manifest | pauses and asks | assumes prior consent, installs |
+| Hit a paid API (Stripe, OpenAI beyond Claude) | pauses and asks | assumes prior consent, calls |
+| Push to a remote | pauses and asks | pauses and asks (both modes require explicit approval) |
+| Run destructive git ops (force push, reset --hard) | refuses unless the spec explicitly requests | refuses unless the spec explicitly requests |
+| Propose a spec update when tests hit a gap | automatic (backprop proposal in `.forge/backprop-log.md`) | automatic, applied immediately on high-confidence gaps |
+
+The headline difference: `full` mode assumes you already authorized the side-effect class when you ran `/forge:execute --autonomy full`, so it does not pause again. It still refuses destructive git ops and it still pauses before pushing.
+
+### When `<promise>FORGE_COMPLETE</promise>` fires but the feature is broken
+
+The completion promise is a structural gate. Tasks done, tests green, reviewer satisfied, verifier satisfied. A feature that passes all four can still look visibly broken in the browser (blurred canvas, empty panel, wrong state after a click) because unit and integration tests do not render pixels. Three recipes when that happens.
+
+**Visual smoke test first.** Open the dev server and click through the feature by hand for 90 seconds. Note exactly what is wrong in plain language. A single sentence like "clicking logout shows the login page for a frame then flashes back to the dashboard" is enough for backprop to work.
+
+**Then `/forge:backprop "<what-is-wrong>"`.** The backprop command traces the bug to the R-number whose acceptance criteria should have caught it, proposes a new or tightened acceptance criterion, and generates a regression test that would have failed against the shipped code. You approve the spec update; the regression test runs; fix work picks up automatically.
+
+**If backprop cannot locate the gap, manual spec review.** Open `.forge/specs/spec-<domain>.md` and read the acceptance criteria against the behavior you saw. Criteria written as "feature exists" or "tests pass" are the usual culprits. Rewrite them as observable behaviors ("after clicking logout the URL becomes `/login` and the session cookie is cleared"), then rerun `/forge:execute` on the updated spec.
+
+Full backprop workflow: [docs/backpropagation.md](docs/backpropagation.md). Visual verification gate (planned for 0.3, spec-forge-v03-gaps R007): [docs/superpowers/specs/spec-forge-v03-gaps.md](docs/superpowers/specs/spec-forge-v03-gaps.md).
+
+### Where to go next
+
+- [docs/mechanics/commands-reference.md](docs/mechanics/commands-reference.md): every slash command, one table
+- [docs/mechanics/token-savings.md](docs/mechanics/token-savings.md): the five mechanisms that keep a long run inside budget
+- [docs/mechanics/subsystem-reference.md](docs/mechanics/subsystem-reference.md): where each subsystem lives in the repo
+- [docs/architecture.md](docs/architecture.md): deeper walkthrough with four detail diagrams
+
 ## Why Forge
 
 Six outcomes, each traceable to a mechanism.
@@ -129,47 +206,11 @@ The failure becomes a better spec, not just a fixed bug. Opt out with `auto_back
 
 ### What Forge does vs what you do
 
-| Action | Forge | You |
-|---|:---:|:---:|
-| Write the spec from a one-line idea | autonomous (via Q&A) | approve the approach |
-| Decompose spec into task DAG | autonomous | review if you like |
-| Write code + tests for each task | autonomous | |
-| Review each task against the spec | autonomous (separate agent) | |
-| Verify all R-numbers satisfied | autonomous | |
-| Squash-merge passing tasks to main | autonomous | read the diffs before pushing |
-| Propose spec updates when tests fail | autonomous (via backprop) | approve the proposed update |
-| Install new dependencies, hit paid APIs, push to remote | never without you | authorize explicitly |
+The detailed autonomy-vs-approval breakdown lives in the "How Forge Actually Works" section above; the per-phase ownership table is in [docs/architecture.md](docs/architecture.md).
 
 ## How Forge saves tokens
 
-Five mechanisms. Numbers are either measured from the repo's own benchmark suite or tagged as estimates.
-
-**Hard per-task and session budgets** ([budgets.md](docs/budgets.md)). Task budgets scale with detected complexity:
-
-```
-quick     5 000 tokens
-standard 15 000 tokens
-thorough 40 000 tokens
-session 500 000 tokens
-```
-
-At 80% the next prompt gets a warning injected. At 100% the phase flips to `budget_exhausted`, state halts, a resume doc is written. No silent drift over hours of autonomous work.
-
-**Caveman compression** ([caveman.md](docs/caveman.md), [benchmark](docs/benchmarks/caveman-integration.md)). Three intensity modes compress internal agent artifacts (state notes, handoff bundles, checkpoint context, review reports). Never compresses source code, commits, specs, or PR descriptions.
-
-| Mode | When | Measured reduction |
-|---|---|---|
-| lite | budget > 50% | ~1% on mixed artifacts (filler-word strip only) |
-| full | 20-50% | **12% on the 10-scenario benchmark** |
-| ultra | < 20% | 18% on the same benchmark, up to 65% on dense prose |
-
-The 12% full-intensity figure is below the original 30% target and ships behind a `terse_internal: false` flag pending tuning. The 26.8% figure cited elsewhere comes from write-path benchmarks on pure-prose artifacts; the agent-output benchmark is the honest headline.
-
-**Tool-call cache** ([hooks/tool-cache.js](hooks/tool-cache.js)). PreToolUse intercept with a 120s TTL on read-only operations (`git status/log/diff/branch`, `ls`, `find`, `Glob`, `Grep`, `Read`). On a hit it returns the cached result and skips the LLM round-trip entirely. Estimated savings: significant on iterative workflows that re-read the same files; not yet benchmarked end-to-end.
-
-**Test-output filter** ([hooks/test-output-filter.js](hooks/test-output-filter.js)). For test runner output over 2000 characters (vitest / jest / pytest / cargo test / go test / npm test / mocha), the hook keeps only the failure blocks, eight lines of surrounding context, and the summary tail. Estimated compression: 50-80% on large test suites; measurement pending.
-
-**Graphify integration** ([skills/graphify-integration/SKILL.md](skills/graphify-integration/SKILL.md)). Optional. When `graphify-out/graph.json` exists, the planner aligns task boundaries with community clusters, the researcher queries the graph before external docs, the reviewer runs a blast-radius check, the executor pulls only the relevant subgraph instead of scanning the whole codebase. Graceful degradation: no graph, no change. Token impact estimated, not yet measured.
+Five mechanisms keep a long autonomous run inside its budget: hard per-task and session budgets, caveman compression on internal agent artifacts, a 120-second tool-call cache, a test-output filter that keeps only failure blocks, and optional graphify-aware context scoping. Full reference with measured numbers: [docs/mechanics/token-savings.md](docs/mechanics/token-savings.md).
 
 ## How it compares
 
@@ -346,18 +387,7 @@ flowchart TB
 
 ### Subsystem reference
 
-Short version. Full table with every file pointer: [docs/architecture.md](docs/architecture.md).
-
-| Layer | Key files | What it does |
-|---|---|---|
-| State machine | `scripts/forge-tools.cjs::routeDecision` | 12-phase router called by the Stop hook every Claude turn |
-| DAG dispatch | `scripts/forge-tools.cjs::findAllUnblockedTasks` | Tiers sequential, tasks within a tier parallel |
-| Model routing | `scripts/forge-router.cjs::selectModel` | Per-role baseline + complexity + budget → haiku / sonnet / opus |
-| Budget tracking | `scripts/forge-budget.cjs` | Per-task + session spend with model cost weights, hard 100% gate |
-| Agents | `agents/forge-*.md` | Speccer, planner, researcher, executor, reviewer, verifier, complexity |
-| Hooks | `hooks/*.{js,sh}` | Seven hooks: tool cache, token monitor, test filter, progress, auto-backprop, cache store, stop |
-| Recovery | `scripts/forge-tools.cjs` (lock + checkpoints + forensic) | Lock with heartbeat, 10-step checkpoints, rebuild from git log |
-| TUI + headless | `scripts/forge-tui.cjs`, `scripts/forge-tools.cjs::queryHeadlessState` | Read-only; `/forge watch` renders at 10Hz, JSON snapshot in ~2ms |
+Eight subsystems (state machine, DAG dispatch, model routing, budget tracking, agents, hooks, recovery, TUI + headless). Full table with file pointers: [docs/mechanics/subsystem-reference.md](docs/mechanics/subsystem-reference.md).
 
 ## Receipts
 
