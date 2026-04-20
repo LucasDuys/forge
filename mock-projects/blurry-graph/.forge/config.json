@@ -1,0 +1,10 @@
+{
+  "autonomy": "gated",
+  "depth": "standard",
+  "completion_promise": "FORGE_COMPLETE",
+  "sandbox": {
+    "dev_server": "bun dev --port 5174",
+    "wait_url": "http://localhost:5174",
+    "wait_timeout_ms": 15000
+  }
+}

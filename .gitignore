@@ -2,6 +2,10 @@
 .forge/
 # TUI dashboard log — explicit entry for discoverability (already covered above)
 .forge/.tui-log.jsonl
+# Mock fixtures ship their own .forge/ configs + specs as tracked fixture data.
+# Per-mock .gitignore still excludes runtime state like .forge/baselines/.
+!mock-projects/**/.forge/
+!mock-projects/**/.forge/**
 
 # OS
 .DS_Store
