@@ -202,6 +202,22 @@ These came in from the user's follow-up and are not yet verified on my side — 
 - **SEVERITY**: ux (expected Anthropic API behaviour; Forge has no graceful-partial-commit protocol).
 - **FIX SKETCH**: executor agent could write a `PARTIAL` checkpoint at every significant milestone (file written, test passing) so a rate-limit-interrupted task can be resumed by a fresh agent reading `.forge/progress/<task>.json`. Forge's existing checkpoint schema already supports this; the executor just needs to write more frequently than "end of task".
 
+### O022 — Legacy `discover` found <10% of installed surface; new walker closes the gap
+
+- **CLAIM** (spec-forge-v03-gaps R002 intro): "forge-tools.cjs discover currently finds semantic-scholar as the only MCP server and misses 9+ other servers active on the user's machine, zero skills vs 65+ installed, and 3 CLIs vs many on $PATH."
+- **REALITY (pre-T003)**: legacy `discoverCapabilities` read MCP servers only from `.claude.json`-style paths, relied on a non-existent `installed_plugins.json` manifest for plugins, and never walked SKILL.md anywhere. On this machine the legacy run returned 1 MCP server + 0 skills + 0 plugins + 3 CLI tools.
+- **REALITY (post-T003)**: 10 MCP servers (merged from `~/.mcp.json` + `~/.claude.json`), 72 skills (user + plugin-shipped), 16 plugin manifests via `.claude-plugin/plugin.json` walk, 3 CLI tools from the declared allow-list (node/npm/stripe — others like `git`, `bun`, `claude` genuinely absent from the sandbox PATH under MSYS even though binaries exist on the machine). Total discover runtime 215ms on Windows dev machine, well under the 3s target.
+- **SEVERITY**: gap closed.
+- **NOTE**: plugin manifests are at `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/.claude-plugin/plugin.json`, not at `<root>/plugin.json`. The walker handles both by matching the `plugin.json` basename at any depth ≤ 4 below the cache root.
+- **FOLLOW-UP**: CLI probe reports only what is on `$PATH` in the current sandbox. If Forge ever runs agents in a shell where `git` or `bun` is elsewhere, the probe correctly reports absence. Downstream callers that need "is git reachable anywhere" should not rely on `cli_tools.git`.
+
+### O023 — Pre-existing TUI snapshot test fails on Windows with CRLF-sensitive fixtures
+
+- **CLAIM** (nothing): noticed while running the full suite for T003 verification.
+- **REALITY**: `tests/forge-tui/render-test.cjs` "snapshot matches saved render" fails with a diff of trailing `\r\n` lines against a fixture that stores `\n`. The failure exists on HEAD (`c98c0b3`) before any T003 edit; verified by `git stash` + re-run.
+- **SEVERITY**: test-only; CI might not hit this if CI is Linux, but every Windows contributor sees a red suite.
+- **FIX SKETCH**: either normalize the snapshot's line endings on read, or write fixtures with `\r\n` and compare byte-for-byte. Out of scope for T003; logged here so the next TUI-touching task can sweep it.
+
 ---
 
 ## Next entries to be added as brainstorming progresses.

@@ -2236,63 +2236,256 @@ function cleanupContextBundle(forgeDir, taskId) {
 
 // === Capability Discovery ===
 
-function discoverCapabilities(projectDir, claudeJsonPath) {
-  const caps = { mcp_servers: {}, skills: {}, plugins: {}, discovered_at: new Date().toISOString() };
+// === Discover helpers (R002) ===
 
-  // Read MCP config
+// Recursively collect files matching a basename under `root` up to `maxDepth`
+// directories below root. Returns absolute paths. Silent on unreadable dirs.
+function _discoverWalk(root, basename, maxDepth) {
+  const hits = [];
+  if (!root) return hits;
+  const stack = [{ dir: root, depth: 0 }];
+  while (stack.length) {
+    const { dir, depth } = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) { continue; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isFile() && e.name === basename) {
+        hits.push(full);
+      } else if (e.isDirectory() && depth < maxDepth) {
+        // Skip node_modules / .git to keep discovery quick on a dev machine
+        if (e.name === 'node_modules' || e.name === '.git') continue;
+        stack.push({ dir: full, depth: depth + 1 });
+      }
+    }
+  }
+  return hits;
+}
+
+// Probe for a CLI on $PATH. Returns { available, version } or null.
+// Uses PATHEXT-aware resolution on Windows; avoids invoking a shell.
+function _discoverProbeCli(name, versionArgs) {
+  const pathDirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  const exts = process.platform === 'win32'
+    ? ['.exe', '.cmd', '.bat', ''].concat(
+        (process.env.PATHEXT || '').split(';').map(s => s.toLowerCase()).filter(Boolean))
+    : [''];
+  let resolved = null;
+  for (const dir of pathDirs) {
+    for (const ext of exts) {
+      const candidate = path.join(dir, name + ext);
+      try {
+        const st = fs.statSync(candidate);
+        if (st.isFile()) { resolved = candidate; break; }
+      } catch (e) { /* not here */ }
+    }
+    if (resolved) break;
+  }
+  if (!resolved) return null;
+  let version = 'unknown';
+  try {
+    const out = execFileSync(resolved, versionArgs, {
+      encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+    }).trim();
+    const first = out.split('\n')[0] || '';
+    const m = first.match(/\d+(?:\.\d+)+[\w.-]*/);
+    if (m) version = m[0];
+    else if (first) version = first.slice(0, 80);
+  } catch (e) { /* tool present but version probe failed */ }
+  return { path: resolved, version };
+}
+
+// Given a plugin.json path, derive the enclosing plugin root (directory that
+// holds the `.claude-plugin` folder, or the cache subdirectory for manifests
+// placed at the plugin root).
+function _discoverPluginRoot(manifestPath) {
+  const parent = path.dirname(manifestPath);
+  if (path.basename(parent) === '.claude-plugin') return path.dirname(parent);
+  return parent;
+}
+
+// Split a SKILL.md path into { marketplace, plugin, skill } for clustering.
+// Accepts both user-skill and plugin-shipped skill locations.
+function _discoverSkillSource(skillPath, home) {
+  const norm = skillPath.replace(/\\/g, '/');
+  const homeNorm = (home || '').replace(/\\/g, '/');
+  if (homeNorm && norm.startsWith(homeNorm + '/.claude/skills/')) {
+    const rel = norm.slice((homeNorm + '/.claude/skills/').length);
+    const parts = rel.split('/');
+    // ~/.claude/skills/<name>/SKILL.md  OR  ~/.claude/skills/_archived-*/...
+    if (parts[0] && parts[0].startsWith('_archived')) {
+      return { source: 'archived', marketplace: null, plugin: parts[0], skill: parts[1] || parts[0] };
+    }
+    if (parts[0] === '.system') {
+      return { source: 'system', marketplace: null, plugin: '.system', skill: parts[1] || '.system' };
+    }
+    return { source: 'user-skills', marketplace: null, plugin: null, skill: parts[0] };
+  }
+  if (homeNorm && norm.startsWith(homeNorm + '/.claude/plugins/cache/')) {
+    const rel = norm.slice((homeNorm + '/.claude/plugins/cache/').length);
+    const parts = rel.split('/');
+    // cache/<marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md
+    const mkt = parts[0] || 'unknown';
+    const plug = parts[1] || 'unknown';
+    const skillsIdx = parts.indexOf('skills');
+    const skill = skillsIdx !== -1 ? (parts[skillsIdx + 1] || plug) : plug;
+    return { source: `plugin:${plug}`, marketplace: mkt, plugin: plug, skill };
+  }
+  return { source: 'other', marketplace: null, plugin: null, skill: path.basename(path.dirname(norm)) };
+}
+
+function discoverCapabilities(projectDir, claudeJsonPath, opts) {
+  const options = opts || {};
+  const expand = !!options.expand;
+  const timeBudgetMs = typeof options.timeBudgetMs === 'number' ? options.timeBudgetMs : 5000;
+  const clusterThreshold = typeof options.clusterThreshold === 'number' ? options.clusterThreshold : 50;
+  const homeOverride = options.homeOverride || null;
+  const skillRootsOverride = options.skillRoots || null;
+  const pluginCacheOverride = options.pluginCache || null;
+
+  const started = Date.now();
+  const warnings = [];
+  const caps = {
+    mcp_servers: {},
+    skills: {},
+    plugins: {},
+    discovered_at: new Date().toISOString(),
+  };
+
+  // Read MCP config: merge ~/.mcp.json and ~/.claude.json, prefer entries from
+  // the project-local files first (active project) then home (user default).
+  const home = homeOverride || process.env.HOME || process.env.USERPROFILE || '';
   const mcpPaths = [
     claudeJsonPath || path.join(projectDir, '.claude.json'),
     path.join(projectDir, '.mcp.json'),
   ];
-  // Also check home directory
-  const home = process.env.HOME || process.env.USERPROFILE || '';
-  if (home) mcpPaths.push(path.join(home, '.claude.json'));
+  if (home) {
+    mcpPaths.push(path.join(home, '.mcp.json'));
+    mcpPaths.push(path.join(home, '.claude.json'));
+  }
 
   for (const mcpPath of mcpPaths) {
     try {
       const data = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
-      if (data.mcpServers) {
+      if (data && data.mcpServers) {
         for (const [name, config] of Object.entries(data.mcpServers)) {
-          caps.mcp_servers[name] = { command: config.command, use_for: inferMcpUse(name) };
+          // Prefer first write (active project beats home default) but merge
+          // command / source so later callers can see where it came from.
+          if (!caps.mcp_servers[name]) {
+            caps.mcp_servers[name] = {
+              command: (config && config.command) || null,
+              use_for: inferMcpUse(name),
+              source: mcpPath,
+            };
+          }
         }
       }
     } catch (e) { /* file not found or invalid */ }
   }
 
-  // Read installed plugins (best-effort, internal path)
+  // Walk plugin manifests under ~/.claude/plugins/cache (depth ≤ 4 from cache).
+  // Manifests live either at <root>/plugin.json or <root>/.claude-plugin/plugin.json.
+  const pluginCache = pluginCacheOverride
+    || (home ? path.join(home, '.claude', 'plugins', 'cache') : null);
+  caps.plugins = {};
+  if (pluginCache) {
+    const manifests = _discoverWalk(pluginCache, 'plugin.json', 4);
+    for (const manifestPath of manifests) {
+      try {
+        const data = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        if (!data || !data.name) continue;
+        // Dedup on name+version; keep the first-seen path.
+        const key = data.version ? `${data.name}@${data.version}` : data.name;
+        if (caps.plugins[key]) continue;
+        caps.plugins[key] = {
+          name: data.name,
+          version: data.version || null,
+          description: data.description || null,
+          path: _discoverPluginRoot(manifestPath),
+        };
+      } catch (e) { /* malformed manifest */ }
+    }
+  }
+  // Preserve legacy installed_plugins.json entries if available so callers that
+  // read shape-specific fields keep working.
   try {
     const pluginsPath = path.join(home, '.claude', 'plugins', 'installed_plugins.json');
     const plugins = JSON.parse(fs.readFileSync(pluginsPath, 'utf8'));
     if (Array.isArray(plugins)) {
       for (const p of plugins) {
-        if (p.name) caps.plugins[p.name] = { scope: p.scope || 'user' };
+        if (p && p.name && !caps.plugins[p.name]) {
+          caps.plugins[p.name] = { name: p.name, scope: p.scope || 'user' };
+        }
       }
     }
   } catch (e) { /* best-effort */ }
 
-  // Discover CLI tools available on the system
-  const cliToolChecks = [
-    { name: 'gh', check: 'gh --version', use_for: 'GitHub PR/issue management, CI/CD, and API access' },
-    { name: 'vercel', check: 'vercel --version', use_for: 'deployment, preview URLs, and serverless functions' },
-    { name: 'stripe', check: 'stripe --version', use_for: 'payment testing, webhook simulation, and billing' },
-    { name: 'ffmpeg', check: 'ffmpeg -version', use_for: 'video/audio processing, transcoding, and rendering' },
-    { name: 'playwright', check: 'npx playwright --version', use_for: 'browser automation and E2E testing' },
-    { name: 'gws', check: 'gws --version', use_for: 'Google Workspace — Drive, Gmail, Calendar, Sheets, Docs' },
-    { name: 'notebooklm', check: 'python -m notebooklm --version', use_for: 'research with grounded citations from knowledge bases' },
-    { name: 'supabase', check: 'supabase --version', use_for: 'database, auth, edge functions, and realtime' },
-    { name: 'firebase', check: 'firebase --version', use_for: 'app hosting, auth, Firestore, and cloud functions' },
-    { name: 'docker', check: 'docker --version', use_for: 'container management and isolated environments' },
-    { name: 'wrangler', check: 'wrangler --version', use_for: 'Cloudflare Workers deployment and KV management' },
-    { name: 'graphify', check: 'graphify -h', use_for: 'codebase knowledge graphs for architecture-aware planning' },
+  // Walk skills from both ~/.claude/skills and plugin-shipped skills.
+  // Depth ≤ 4 per spec; parse YAML frontmatter for name + description.
+  const skillRoots = skillRootsOverride || [
+    home ? path.join(home, '.claude', 'skills') : null,
+    pluginCache,
+  ].filter(Boolean);
+
+  caps.skills = {};
+  caps.deprecated = {};
+  for (const root of skillRoots) {
+    const files = _discoverWalk(root, 'SKILL.md', 4);
+    for (const skillPath of files) {
+      try {
+        const raw = fs.readFileSync(skillPath, 'utf8');
+        const { data } = parseFrontmatter(raw);
+        const name = (data && data.name) || path.basename(path.dirname(skillPath));
+        const desc = (data && data.description) || '';
+        const src = _discoverSkillSource(skillPath, home);
+        const entry = {
+          name,
+          description: desc,
+          path: skillPath,
+          source: src.source,
+          plugin: src.plugin,
+        };
+        const key = src.plugin ? `${src.plugin}:${name}` : name;
+        // Deprecated: description begins with "Deprecated" (case-sensitive per spec).
+        if (/^Deprecated\b/.test(desc.trim())) {
+          entry.status = 'deprecated';
+          caps.deprecated[key] = entry;
+          continue;
+        }
+        if (src.source === 'archived') entry.status = 'archived';
+        if (!caps.skills[key]) caps.skills[key] = entry;
+      } catch (e) { /* unreadable SKILL.md */ }
+    }
+  }
+
+  // Probe $PATH for the declared allow-list. Keep the legacy cli_tools shape
+  // { available, use_for, version } so existing callers continue to work.
+  const cliAllowList = [
+    { name: 'node', args: ['--version'], use_for: 'JavaScript runtime for running tools and tests' },
+    { name: 'npm', args: ['--version'], use_for: 'Node.js package manager' },
+    { name: 'bun', args: ['--version'], use_for: 'fast JavaScript runtime and package manager' },
+    { name: 'git', args: ['--version'], use_for: 'version control and worktree management' },
+    { name: 'gh', args: ['--version'], use_for: 'GitHub PR/issue management, CI/CD, and API access' },
+    { name: 'playwright', args: ['--version'], use_for: 'browser automation and E2E testing' },
+    { name: 'stripe', args: ['--version'], use_for: 'payment testing, webhook simulation, and billing' },
+    { name: 'claude', args: ['--version'], use_for: 'Claude Code CLI for headless orchestration' },
+    { name: 'docker', args: ['--version'], use_for: 'container management and isolated environments' },
+    { name: 'psql', args: ['--version'], use_for: 'PostgreSQL client for database introspection and migrations' },
   ];
 
   caps.cli_tools = {};
-  for (const tool of cliToolChecks) {
-    try {
-      const output = execSync(tool.check, { stdio: 'pipe', timeout: 5000 }).toString().trim();
-      const version = output.split('\n')[0].replace(/^[^0-9]*/, '').trim();
-      caps.cli_tools[tool.name] = { available: true, use_for: tool.use_for, version: version || 'unknown' };
-    } catch (e) { /* tool not installed — skip */ }
+  for (const tool of cliAllowList) {
+    const probe = _discoverProbeCli(tool.name, tool.args);
+    if (probe) {
+      caps.cli_tools[tool.name] = {
+        available: true,
+        use_for: tool.use_for,
+        version: probe.version,
+        path: probe.path,
+      };
+    }
   }
 
   // Discover CLI-Anything generated CLIs (cli-anything-*)
@@ -2327,57 +2520,128 @@ function discoverCapabilities(projectDir, claudeJsonPath) {
 
   // Detect Codex CLI and plugin availability
   caps.codex = { available: false, reason: 'not checked' };
-  try {
-    // Check Codex CLI
-    let codexVersion = null;
+  codex_block: {
     try {
-      codexVersion = execFileSync('codex', ['--version'], {
-        encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
-      }).trim();
-    } catch (e) {
-      caps.codex = { available: false, reason: 'Codex CLI not installed' };
-      return caps;
-    }
-
-    // Check codex-companion.mjs in plugin cache
-    let pluginRoot = null;
-    const pluginSearchPaths = [
-      path.join(home, '.claude', 'plugins', 'cache', 'openai-codex'),
-      path.join(home, '.claude', 'plugins', 'marketplaces', 'openai-codex'),
-    ];
-    for (const searchPath of pluginSearchPaths) {
+      // Check Codex CLI
+      let codexVersion = null;
       try {
-        const walkDir = (dir, depth) => {
-          if (depth > 3) return null;
-          const entries = fs.readdirSync(dir, { withFileTypes: true });
-          for (const e of entries) {
-            if (e.name === 'codex-companion.mjs') return dir;
-            if (e.isDirectory()) {
-              const found = walkDir(path.join(dir, e.name), depth + 1);
-              if (found) return found;
-            }
-          }
-          return null;
-        };
-        const found = walkDir(searchPath, 0);
-        if (found) { pluginRoot = found; break; }
-      } catch (e) { /* path not found */ }
-    }
+        codexVersion = execFileSync('codex', ['--version'], {
+          encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
+        }).trim();
+      } catch (e) {
+        caps.codex = { available: false, reason: 'Codex CLI not installed' };
+        break codex_block;
+      }
 
-    if (!pluginRoot) {
-      caps.codex = { available: false, version: codexVersion, reason: 'Codex plugin not installed' };
-    } else {
-      caps.codex = {
-        available: true,
-        version: codexVersion,
-        pluginRoot,
-        companionPath: path.join(pluginRoot, 'codex-companion.mjs'),
-        reason: null
-      };
+      // Check codex-companion.mjs in plugin cache
+      let pluginRoot = null;
+      const pluginSearchPaths = [
+        path.join(home, '.claude', 'plugins', 'cache', 'openai-codex'),
+        path.join(home, '.claude', 'plugins', 'marketplaces', 'openai-codex'),
+      ];
+      for (const searchPath of pluginSearchPaths) {
+        try {
+          const walkDir = (dir, depth) => {
+            if (depth > 3) return null;
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const e of entries) {
+              if (e.name === 'codex-companion.mjs') return dir;
+              if (e.isDirectory()) {
+                const found = walkDir(path.join(dir, e.name), depth + 1);
+                if (found) return found;
+              }
+            }
+            return null;
+          };
+          const found = walkDir(searchPath, 0);
+          if (found) { pluginRoot = found; break; }
+        } catch (e) { /* path not found */ }
+      }
+
+      if (!pluginRoot) {
+        caps.codex = { available: false, version: codexVersion, reason: 'Codex plugin not installed' };
+      } else {
+        caps.codex = {
+          available: true,
+          version: codexVersion,
+          pluginRoot,
+          companionPath: path.join(pluginRoot, 'codex-companion.mjs'),
+          reason: null
+        };
+      }
+    } catch (e) {
+      caps.codex = { available: false, reason: 'Detection failed: ' + e.message };
     }
-  } catch (e) {
-    caps.codex = { available: false, reason: 'Detection failed: ' + e.message };
   }
+
+  // ── Clustering + profile tail (R002 AC3, AC4) ─────────────────────────────
+  // When skills + plugins > clusterThreshold (default 50) and caller did not
+  // request --expand, emit clustered counts by source instead of inlining
+  // every entry. `skills_full` / `plugins_full` stay available under `--expand`.
+  const skillEntries = Object.entries(caps.skills);
+  const pluginEntries = Object.entries(caps.plugins);
+  const totalBulk = skillEntries.length + pluginEntries.length;
+  const clustersNeeded = totalBulk > clusterThreshold && !expand;
+
+  if (clustersNeeded) {
+    const skillClusters = {};
+    for (const [key, entry] of skillEntries) {
+      const src = entry.source || 'other';
+      if (!skillClusters[src]) skillClusters[src] = { count: 0, sample: [] };
+      skillClusters[src].count += 1;
+      if (skillClusters[src].sample.length < 5) skillClusters[src].sample.push(entry.name);
+    }
+    const pluginClusters = {};
+    for (const [key, entry] of pluginEntries) {
+      // Cluster plugins by marketplace segment in path, falling back to 'unknown'.
+      let mkt = 'unknown';
+      if (entry.path) {
+        const norm = entry.path.replace(/\\/g, '/');
+        const m = norm.match(/\/plugins\/cache\/([^/]+)\//);
+        if (m) mkt = m[1];
+      }
+      if (!pluginClusters[mkt]) pluginClusters[mkt] = { count: 0, sample: [] };
+      pluginClusters[mkt].count += 1;
+      if (pluginClusters[mkt].sample.length < 5) pluginClusters[mkt].sample.push(entry.name);
+    }
+    caps.clustered = true;
+    caps.clusters = { skills: skillClusters, plugins: pluginClusters };
+    caps.totals = {
+      skills: skillEntries.length,
+      plugins: pluginEntries.length,
+      deprecated: Object.keys(caps.deprecated).length,
+      mcp_servers: Object.keys(caps.mcp_servers).length,
+      cli_tools: Object.keys(caps.cli_tools).length,
+    };
+    // Replace the verbose skills + plugins maps with empty objects so the
+    // default output stays readable; full tree is available via --expand.
+    caps.skills = {};
+    caps.plugins = {};
+  } else {
+    caps.clustered = false;
+    caps.totals = {
+      skills: skillEntries.length,
+      plugins: pluginEntries.length,
+      deprecated: Object.keys(caps.deprecated).length,
+      mcp_servers: Object.keys(caps.mcp_servers).length,
+      cli_tools: Object.keys(caps.cli_tools).length,
+    };
+  }
+
+  const elapsed = Date.now() - started;
+  if (elapsed > timeBudgetMs) {
+    warnings.push({
+      code: 'DISCOVER_TIMEOUT',
+      message: `discovery exceeded time budget (${elapsed}ms > ${timeBudgetMs}ms); partial results returned`,
+    });
+  }
+  caps.meta = {
+    completed_in_ms: elapsed,
+    time_budget_ms: timeBudgetMs,
+    aborted: elapsed > timeBudgetMs,
+    warnings,
+    expand,
+  };
 
   return caps;
 }
@@ -4213,7 +4477,8 @@ if (require.main === module) {
 
   if (command === 'discover') {
     const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
-    const caps = discoverCapabilities(path.dirname(forgeDir));
+    const expand = args.includes('--expand');
+    const caps = discoverCapabilities(path.dirname(forgeDir), null, { expand });
     fs.writeFileSync(path.join(forgeDir, 'capabilities.json'), JSON.stringify(caps, null, 2));
     process.stdout.write(JSON.stringify(caps, null, 2));
   }
