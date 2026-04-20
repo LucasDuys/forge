@@ -145,4 +145,14 @@ These came in from the user's follow-up and are not yet verified on my side — 
 
 ---
 
+### O018 — README "squash-merge to main" phrasing does not match actual-branch behaviour
+
+- **CLAIM** (pre-T005 README lines 44 + 99 + 103 + 211 + 245 + 334): Forge "squash-merges to main" and "One squash-merge to main" in the quickstart, hero, and execute-loop diagram.
+- **REALITY**: successful task worktrees squash-merge to the *current working branch*, not `main`. This branch (`fix/collab-and-forge-audit`) is the live example: all T001..T017 merges landed here, never on `main`. Forge never force-pushes to `main`; it does not even push to remote without an explicit user action. The phrase "to main" conflates the most common demo path with the actual behaviour.
+- **SEVERITY**: ux (works correctly; the word "main" misleads new readers who do feature-branch work)
+- **STATUS**: T005 README rewrite introduced the phrasing "squash-merge to the branch" / "squash-merge to the working branch" in the new "How Forge Actually Works" section and its autonomy table. Older inline examples in README (Quickstart ASCII block, older mechanics diagrams) still say "main" and were left intact per the task's surgical-edits rule. A follow-up pass can sweep those once this observation is in the audit.
+- **FIX SKETCH**: grep `README.md docs/` for `squash.?merge to main` and replace with `squash-merge to the working branch`; mention `main` only when describing the specific case of someone running Forge directly on the main branch.
+
+---
+
 ## Next entries to be added as brainstorming progresses.
