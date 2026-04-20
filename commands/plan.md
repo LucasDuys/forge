@@ -63,6 +63,28 @@ This returns god nodes (top 10 most-connected concepts), community structure, an
 
 Neither is required. If absent, planning proceeds with standard spec-only decomposition.
 
+## Spec Path-Validation Gate (R011)
+
+Before invoking the planner, run the **forge-speccer-validator** agent on every spec that will be planned. This catches stale or misspelled paths in the spec before the planner decomposes it into tasks that would target files that do not exist.
+
+For each spec file being planned:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-speccer-validator.cjs" <spec-path> <repo-root>
+```
+
+Interpret the exit code and JSON output:
+
+- **Exit 0 / `status: OK`** — All paths in the spec resolve. Proceed to planning.
+- **Exit 2 / `status: REPLAN_NEEDED`** — One or more paths are missing. Do NOT dispatch the planner against this spec yet. Instead:
+  1. For each missing entry, compute an autocorrect suggestion via `findNearestPath(missingPath, repoRoot)` from the same module.
+  2. Dispatch a replan pass: invoke the **forge-speccer** agent (or a replan sub-task) with the original spec plus the list of `{line, path, suggested, alternatives}` entries and instructions to rewrite the spec with the corrected paths. If no `suggested` match exists for a given missing path, flag it for human review rather than inventing a path.
+  3. Write the corrected spec back to the same path (preserve the original under `.forge/specs/<name>.pre-replan.bak` for audit).
+  4. Re-run the validator on the corrected spec. If it now returns OK, proceed to planning. If it still returns REPLAN_NEEDED and the missing paths are unchanged, stop and surface the issue to the user with the unresolved entries — do not loop indefinitely.
+- **Exit 1 / fatal error** — surface the validator error to the user and stop. Do not plan against an unreadable spec.
+
+This gate is mandatory. Skipping it risks a frontier whose tasks point at nonexistent files.
+
 ## Invoke Planning
 
 Invoke the **forge:planning** skill with the following context:

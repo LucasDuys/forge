@@ -218,6 +218,23 @@ These came in from the user's follow-up and are not yet verified on my side — 
 - **SEVERITY**: test-only; CI might not hit this if CI is Linux, but every Windows contributor sees a red suite.
 - **FIX SKETCH**: either normalize the snapshot's line endings on read, or write fixtures with `\r\n` and compare byte-for-byte. Out of scope for T003; logged here so the next TUI-touching task can sweep it.
 
+### O024 — Bare-name path references in specs are flagged as "missing" by the R011 validator
+
+- **CLAIM** (spec-forge-v03-gaps R011): "Before planning, a `forge-speccer-validator` step enumerates every path token in the spec (heuristic: anything that parses as a file path and lives in a code fence or backticks)."
+- **REALITY** (T004 implementation, `scripts/forge-speccer-validator.cjs`): running the validator on `docs/superpowers/specs/spec-forge-v03-gaps.md` flags 8 paths as missing, most of which are correct concepts but referenced by bare name: `setup.sh` (lives at `scripts/setup.sh`), `config.json` (lives at `.forge/config.json`), `state.md` (lives at `.forge/state.md`), `token-ledger.json` (lives at `.forge/token-ledger.json`), `forge-tools.cjs` (lives at `scripts/forge-tools.cjs`), `task-status.json` (lives at `.forge/task-status.json`), `history/backprop-log.md` (lives at `.forge/history/backprop-log.md`).
+- **SEVERITY**: ux (the spec is semantically correct for humans; the validator correctly catches that the bare names do not resolve under the repo root).
+- **NOTE**: `agents/forge-visual-verifier.md` is also flagged because T020 has not shipped yet — this is a valid "will-exist-after-R007-lands" reference. The validator cannot distinguish forward-looking path claims from typos.
+- **FIX SKETCH**: two options for spec authors — (1) always write fully-qualified paths (`scripts/setup.sh` not `setup.sh`), or (2) extend the heuristic to treat bare-name references as "probable" rather than "claim" and demote them from missing to warning. Option (1) is simpler and makes specs more precise; option (2) preserves natural prose style. Recommend option (1) and a follow-up sweep of existing specs.
+- **STATUS** (T004): validator ships as-is. Replan autocorrect uses `findNearestPath` which will suggest `scripts/setup.sh` for a bare `setup.sh` reference (matching basename, zero shared segments → still the only same-basename hit). So downstream replan behaviour is correct; the noise is at the user-surface layer.
+
+### O025 — No git binary on the sandbox PATH means T004 cannot self-verify its commit
+
+- **CLAIM** (forge-executor protocol step 4): "Create an atomic commit for this task."
+- **REALITY**: the sandbox shell used by the T004 executor agent has no `git` on PATH (`git --version` → `command not found`). The agent authored all files, ran the full test suite (455/457 green, the 2 failures are pre-existing O023 + unrelated T006 skills-audit), but cannot execute `git add` / `git commit`.
+- **SEVERITY**: partial (work is complete and tested; human-operator must finalise the commit).
+- **WORKAROUND**: executor returns DONE_WITH_CONCERNS with a pre-drafted commit message (`feat(planner): spec path validation gate [T004]`) and the list of files touched; outer loop runs the actual git commands.
+- **FILES**: `scripts/forge-speccer-validator.cjs` (new), `agents/forge-speccer-validator.md` (new), `tests/spec-path-validation.test.cjs` (new), `commands/plan.md` (modified — new "Spec Path-Validation Gate (R011)" section inserted before "Invoke Planning").
+
 ---
 
 ## Next entries to be added as brainstorming progresses.
