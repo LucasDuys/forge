@@ -1760,6 +1760,158 @@ function listActiveTaskClaims(transport, opts) {
     .map(l => Object.assign({}, l, { task_id: l.name.slice(CLAIM_PREFIX.length) }));
 }
 
+// ======================================================================
+// .gitignore migration helper (R001).
+//
+// Existing checkouts initialized before the collab carve-out landed have a
+// plain `.forge/` line in .gitignore that silently drops every collab
+// artifact the skill instructs git to add. These helpers detect that case
+// and patch the rules in-place so /forge:collaborate start can prompt the
+// user before the first brainstorm dump is swallowed.
+// ======================================================================
+
+const GITIGNORE_CARVE_OUT_MARKER = '# forge: collab carve-out';
+// Anchored `/.forge/*` plus un-ignore re-entry rules. The glob form (not a
+// bare `.forge/`) is required so git will descend into the collab subdir;
+// git refuses to re-include files under an ignored parent directory.
+const GITIGNORE_CARVE_OUT_BLOCK =
+  GITIGNORE_CARVE_OUT_MARKER + '\n' +
+  '/.forge/*\n' +
+  '!/.forge/collab/\n' +
+  '!/.forge/collab/**\n';
+
+const COLLAB_NESTED_GITIGNORE =
+  '# forge: collab per-machine state (re-ignored under the repo carve-out)\n' +
+  'participant.json\n' +
+  'flag-emit-log-*.jsonl\n' +
+  '.enabled\n';
+
+/**
+ * Classify the state of .gitignore in the repo at `cwd` relative to the
+ * collab carve-out rules. Pure: no filesystem writes.
+ *
+ * Returns:
+ *   { status: 'missing_gitignore',         needsPatching: true }
+ *   { status: 'missing_forge_rule',        needsPatching: true }
+ *   { status: 'legacy_rule_no_carve_out',  needsPatching: true }
+ *   { status: 'missing_nested_gitignore',  needsPatching: true }
+ *   { status: 'ok',                        needsPatching: false }
+ *
+ * `reason` is a human-readable string suitable for surfacing in the
+ * collaborate command's preflight output.
+ */
+function detectLegacyGitignore(opts) {
+  opts = opts || {};
+  const cwd = opts.cwd || process.cwd();
+  const gitignorePath = path.join(cwd, '.gitignore');
+  const nestedPath = path.join(cwd, '.forge', 'collab', '.gitignore');
+
+  if (!fs.existsSync(gitignorePath)) {
+    return {
+      status: 'missing_gitignore',
+      needsPatching: true,
+      reason: 'No .gitignore exists. Collab needs carve-out rules so shared artifacts propagate via git.',
+      gitignorePath,
+      nestedPath
+    };
+  }
+
+  const contents = fs.readFileSync(gitignorePath, 'utf8');
+  const hasCarveOut = contents.includes(GITIGNORE_CARVE_OUT_MARKER);
+  const hasLegacyRule = /^\.forge\/?\s*$/m.test(contents);
+  const nestedExists = fs.existsSync(nestedPath);
+
+  if (hasCarveOut && nestedExists) {
+    return { status: 'ok', needsPatching: false, reason: 'Carve-out rules already present.', gitignorePath, nestedPath };
+  }
+
+  if (hasCarveOut && !nestedExists) {
+    return {
+      status: 'missing_nested_gitignore',
+      needsPatching: true,
+      reason: 'Root carve-out present but .forge/collab/.gitignore is missing. Per-machine state would leak.',
+      gitignorePath,
+      nestedPath
+    };
+  }
+
+  if (hasLegacyRule) {
+    return {
+      status: 'legacy_rule_no_carve_out',
+      needsPatching: true,
+      reason: 'Legacy `.forge/` rule ignores all collab artifacts. Run the migration helper to add the carve-out.',
+      gitignorePath,
+      nestedPath
+    };
+  }
+
+  return {
+    status: 'missing_forge_rule',
+    needsPatching: true,
+    reason: 'No .forge/ rule in .gitignore. Adding the carve-out block.',
+    gitignorePath,
+    nestedPath
+  };
+}
+
+/**
+ * Patch .gitignore and create .forge/collab/.gitignore so that collab
+ * artifacts are tracked while per-machine state stays local.
+ *
+ * Idempotent: running twice is a no-op. Returns a summary of what changed.
+ */
+function patchGitignore(opts) {
+  opts = opts || {};
+  const cwd = opts.cwd || process.cwd();
+  const detection = detectLegacyGitignore({ cwd });
+  const actions = [];
+
+  const gitignorePath = detection.gitignorePath;
+  const nestedPath = detection.nestedPath;
+  const nestedDir = path.dirname(nestedPath);
+
+  if (detection.status === 'ok') {
+    return { patched: false, actions, detection };
+  }
+
+  // Root .gitignore handling.
+  if (detection.status === 'missing_gitignore') {
+    fs.writeFileSync(gitignorePath, GITIGNORE_CARVE_OUT_BLOCK);
+    actions.push('created_gitignore');
+  } else if (detection.status === 'legacy_rule_no_carve_out') {
+    // Replace the first bare `.forge/` line with the full carve-out block,
+    // preserving surrounding rules so we don't clobber other user entries.
+    const original = fs.readFileSync(gitignorePath, 'utf8');
+    const lines = original.split(/\r?\n/);
+    const newLines = [];
+    let replaced = false;
+    for (const line of lines) {
+      if (!replaced && /^\.forge\/?\s*$/.test(line)) {
+        newLines.push(GITIGNORE_CARVE_OUT_BLOCK.trimEnd());
+        replaced = true;
+      } else {
+        newLines.push(line);
+      }
+    }
+    fs.writeFileSync(gitignorePath, newLines.join('\n'));
+    actions.push('replaced_legacy_forge_rule');
+  } else if (detection.status === 'missing_forge_rule') {
+    const original = fs.readFileSync(gitignorePath, 'utf8');
+    const sep = original.endsWith('\n') ? '' : '\n';
+    fs.appendFileSync(gitignorePath, sep + '\n' + GITIGNORE_CARVE_OUT_BLOCK);
+    actions.push('appended_carve_out_block');
+  }
+
+  // Nested .forge/collab/.gitignore handling.
+  if (!fs.existsSync(nestedPath)) {
+    fs.mkdirSync(nestedDir, { recursive: true });
+    fs.writeFileSync(nestedPath, COLLAB_NESTED_GITIGNORE);
+    actions.push('created_nested_gitignore');
+  }
+
+  return { patched: true, actions, detection };
+}
+
 module.exports = {
   sessionIdFromOrigin,
   scoreParticipant,
@@ -1818,6 +1970,11 @@ module.exports = {
   gatedPush,
   filterClaimableForLateJoin,
   lateJoinBootstrap,
+  detectLegacyGitignore,
+  patchGitignore,
+  GITIGNORE_CARVE_OUT_MARKER,
+  GITIGNORE_CARVE_OUT_BLOCK,
+  COLLAB_NESTED_GITIGNORE,
   // Exposed for tests and future-task extension points:
   _internal: {
     readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,

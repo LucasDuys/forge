@@ -33,6 +33,29 @@ Verify a git `origin` remote exists. If not, tell the user to set one and stop:
 
 > `/forge:collaborate` needs a git `origin` remote to derive the session ID. Run `git remote add origin <url>` first.
 
+**Gitignore migration check (R001).** Before any `start` subcommand writes
+participant state, detect whether this checkout predates the collab
+carve-out rules. If so, prompt the user to patch them; silently ignoring
+this step would cause every brainstorm dump and flag write to be swallowed
+by the legacy `.forge/` rule.
+
+```bash
+node -e "const c=require('${CLAUDE_PLUGIN_ROOT}/scripts/forge-collab.cjs');const r=c.detectLegacyGitignore({cwd:process.cwd()});console.log(JSON.stringify(r));"
+```
+
+If `needsPatching` is `true` on a `start` subcommand, surface the detection
+`reason` to the user and offer to run:
+
+```bash
+node -e "const c=require('${CLAUDE_PLUGIN_ROOT}/scripts/forge-collab.cjs');console.log(JSON.stringify(c.patchGitignore({cwd:process.cwd()})));"
+```
+
+On confirmation, run the patch. On decline, stop with a clear message:
+collab cannot proceed until `.gitignore` allows `.forge/collab/` through.
+For non-`start` subcommands (status, claim, flags, ...) the check may be
+informational only -- those paths do not depend on git-tracked artifacts
+being propagated.
+
 ## Step 2: Parse subcommand
 
 Read the first word of the user's arguments. Default to `status` if empty.
