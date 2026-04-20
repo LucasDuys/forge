@@ -91,6 +91,13 @@ These came in from the user's follow-up and are not yet verified on my side — 
 
 ### O011 — Brainstorm Q&A is not asked one-question-at-a-time
 - Command file says "minimum 3 clarifying questions" but doesn't enforce single-question cadence. Need to inspect the skill.
+- **VERIFIED 2026-04-20 (T010 pre-fix read)**: `skills/brainstorming/SKILL.md` Phase 3 rule 1 already said "ONE question at a time. Never ask multiple questions in a single message" and Key Principles repeated it — so part of R004 AC1 was already in the prose. What was missing vs R004:
+  - No mandate to summarise each answer in two sentences or fewer before the next question (rule 6 said "summarize periodically, every 3-4 answers" — too loose).
+  - No hard maximum on question count (table said Medium 8-12 and Complex 8-12 per sub-project, which conflicts with R004 max 7).
+  - No anti-pattern example block labelled "DO NOT do this".
+  - No manual test protocol documenting expected behaviour.
+- **FIX (T010)**: rewrote Phase 3 rules to mandate `Captured:` summary after every answer, tightened question bounds to min 3 / max 7, added correct-pattern and anti-pattern example blocks, created `skills/brainstorming/test.md` with a 5-question scripted run, and tightened Phase 2 `--from-code` / `--from-docs` paths to cap at 7.
+- **SEVERITY (pre-fix)**: partial — single-question rule existed but summary cadence and upper bound did not.
 
 ### O012 — Dependency DAG streaming from upstream tasks to downstream tasks is missing
 - User's memory is that earlier Forge versions streamed "criteria fulfilled on previous task → update and start next task" without waiting for full task completion. Need to compare `skills/executing/SKILL.md` + `scripts/forge-tools.cjs` frontier code against that claim.
@@ -103,6 +110,38 @@ These came in from the user's follow-up and are not yet verified on my side — 
 
 ### O015 — Sandbox blind spots: no dev server, no browser, no Playwright baseline recording in loop
 - Verifiable by trying to wire Playwright MCP into the loop during this brainstorm. If it works here, then the framework can do it but doesn't by default; that's a spec gap, not an impossibility.
+
+---
+
+## Fix notes
+
+### F001 — setup.sh idempotency gate fixed (T002, spec B R001)
+
+- **CHANGE**: `scripts/setup.sh` now gates the early-exit on `[ -f "${FORGE_DIR}/config.json" ]` instead of `[ -d "${FORGE_DIR}" ]`. When the directory exists without `config.json`, setup emits `Completing partial Forge init in ...` and re-runs every `mkdir -p` plus a `cp -n` (never-clobber) copy of `templates/config.json` and `templates/state.md`. Token ledger + backprop log are written only if missing.
+- **MESSAGE**: second run emits exactly `Forge already initialized (config.json present)` per AC4.
+- **REGRESSION COVER**: `tests/setup.test.cjs` — four cases: (a) partial state with `.tui-log.jsonl` still scaffolds everything, (b) second invocation emits the sentinel message, (c) second invocation leaves git working tree clean in a git-initialized project, (d) directory-only (no config.json) does not short-circuit and still creates config.
+- **OBSERVATION while fixing**: T001 (collab-fix R001) landed a parallel edit on the same file, adding `mkdir -p "${FORGE_DIR}/collab"` and the `.gitignore` carve-out block. The changes merged cleanly because T002 only touched the gate and the copy primitives. T001's own `tests/forge-collab-gitignore.test.cjs` has four residual failures unrelated to T002 — those live in T001's work-in-progress; switching `cp` -> `cp -n` actually moved T001 from 10/18 to 14/18 passing because several T001 test cases expected the second-run no-clobber behavior.
+- **PRE-EXISTING UNRELATED FAILURE**: `tests/forge-tui/render-test.cjs` snapshot comparison fails on Windows because the saved snapshot uses `\r\n` while the live render emits `\n`. Confirmed failure exists on HEAD without any T002 change. Not addressed here.
+
+---
+
+## Observations from execute run (T011 — mock scaffold)
+
+### O016 — spec R001 requires root `.gitignore` but frontier T011 task instruction lists `src/.gitignore`
+- **CLAIM** (task T011 instructions at dispatch): scaffold should include `src/.gitignore`.
+- **REALITY**: a `.gitignore` inside `src/` cannot exclude `node_modules/` and `dist/` that live at the mock root — those patterns only take effect from the directory where the `.gitignore` lives or below. The spec's R001 AC (and R006) requires `node_modules/`, `dist/`, `.forge/baselines/` excluded, which forces the file to be at the mock root.
+- **RESOLUTION**: T011 placed the `.gitignore` at `mock-projects/blurry-graph/.gitignore` (spec-correct location). No `src/.gitignore` was created. The task instruction appears to be a minor typo in the frontier dispatch; spec R001 + R006 are the source of truth.
+- **SEVERITY**: ux (dispatch-prompt typo, not a code bug)
+
+### O017 — T011 ships three deliberate regressions as the first real fixture for the visual-verifier gate
+- **CLAIM** (spec-mock-and-visual-verify R001): "the exact failure pattern from the real graph-visual-quality run: halo overlays on every node, random zoom-out on mount, empty synthesis panel."
+- **REALITY** (commit 5598dc1): `mock-projects/blurry-graph/` renders a 10-node D3 force-directed graph. Three flag-toggled regressions are live with defaults `halo=true, zoomOut=true, synthesis=true, off=false`:
+  - Halo: every node draws a translucent ring at 3x node radius (14 * 3 = 42px) in indigo, overlapping neighbours at the default 80px link distance.
+  - Zoom-out: on mount `d3.zoom.transform` scales by `0.15 + Math.random() * 0.1`, producing a tiny cluster offset from centre.
+  - Synthesis: right-side `<aside data-testid="synthesis">` renders only the `<h2>Synthesis</h2>` heading with no `<h3>Agreed</h3>` / `<h3>Disputed</h3>` sections.
+  - `off = true` is the master kill-switch — all three bugs disable for golden-path screenshots.
+- **NOTE**: `bun install` was intentionally not run per task instructions; the install happens in T023 when the E2E fix run executes.
+- **SEVERITY**: n/a (observation, not a claim-vs-reality gap)
 
 ---
 
