@@ -2740,6 +2740,16 @@ function discoverCapabilities(projectDir, claudeJsonPath, opts) {
     }
   }
 
+  // ── Sandbox affordances (R010 AC3) ────────────────────────────────────────
+  // Reports what the sandbox CAN do so specs decide feasibility before
+  // planning. 1 s ceiling on the network probe keeps discover fast.
+  try {
+    const { probeSandbox } = require('./forge-dev-server.cjs');
+    caps.sandbox = probeSandbox(caps, { networkTimeoutMs: 1000 });
+  } catch (e) {
+    caps.sandbox = { browser: false, spawn: false, network: false, error: e.message };
+  }
+
   // ── Clustering + profile tail (R002 AC3, AC4) ─────────────────────────────
   // When skills + plugins > clusterThreshold (default 50) and caller did not
   // request --expand, emit clustered counts by source instead of inlining
@@ -4805,6 +4815,39 @@ if (require.main === module) {
     process.stdout.write(JSON.stringify(caps, null, 2));
   }
 
+  // === Sandbox dev-server lifecycle (T016 / R010) ===
+  // Usage:
+  //   forge-tools dev-server --forge-dir .forge --action start
+  //       -> JSON: { pid, state: "ready"|"timeout"|"missing_config" }
+  //   forge-tools dev-server --forge-dir .forge --action stop --pid 1234
+  //       -> JSON: { killed: boolean, signal: "SIGTERM"|"SIGKILL"|"taskkill"|null }
+  if (command === 'dev-server') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const action = args.find((a, i) => args[i - 1] === '--action') || '';
+    const pidArg = args.find((a, i) => args[i - 1] === '--pid');
+    const { startDevServer, stopDevServer } = require('./forge-dev-server.cjs');
+    (async () => {
+      if (action === 'start') {
+        const res = await startDevServer(forgeDir, {});
+        process.stdout.write(JSON.stringify(res));
+      } else if (action === 'stop') {
+        const pid = pidArg ? parseInt(pidArg, 10) : null;
+        if (!pid) {
+          process.stderr.write('dev-server stop: --pid required\n');
+          process.exit(2);
+        }
+        const res = await stopDevServer(pid, {});
+        process.stdout.write(JSON.stringify(res));
+      } else {
+        process.stderr.write('dev-server: --action start|stop required\n');
+        process.exit(2);
+      }
+    })().catch((err) => {
+      process.stderr.write('dev-server error: ' + (err && err.message || err) + '\n');
+      process.exit(1);
+    });
+  }
+
   // === Spec approval validation ===
   // Prevents /forge execute from running without approved specs and valid frontiers.
   if (command === 'validate-workflow') {
@@ -4865,6 +4908,11 @@ if (require.main === module) {
     const maxIter = args.find((a, i) => args[i - 1] === '--max-iterations') || '100';
     const budget = args.find((a, i) => args[i - 1] === '--token-budget') || '500000';
     const promise = args.find((a, i) => args[i - 1] === '--completion-promise') || 'FORGE_COMPLETE';
+    // T016 / R010 AC4: `--record-baselines` marks the run as the
+    // first-successful-visual-AC path so T020's visual verifier writes
+    // baselines instead of comparing. Setup-state only lands the flag in
+    // state.md frontmatter; the verifier (T020) consumes it.
+    const recordBaselines = args.includes('--record-baselines');
 
     // === WORKFLOW GATE: Validate specs are approved and frontiers exist ===
     const workflowErrors = validateWorkflowPrerequisites(forgeDir);
@@ -4933,6 +4981,9 @@ if (require.main === module) {
     state.data.current_task = firstTaskId || 'T001';
     state.data.completed_tasks = [];
     state.data.blocked_reason = null;
+    if (recordBaselines) {
+      state.data.record_baselines = true;
+    }
     writeState(forgeDir, state.data, state.content);
 
     // Clear progress history for fresh start
@@ -6379,5 +6430,10 @@ module.exports = {
   // T014 / R005: research aggregator re-exports for convenience.
   // The canonical implementation lives in forge-research-aggregator.cjs.
   get appendResearchSection() { return require('./forge-research-aggregator.cjs').appendResearchSection; },
-  get readResearchFile() { return require('./forge-research-aggregator.cjs').readResearchFile; }
+  get readResearchFile() { return require('./forge-research-aggregator.cjs').readResearchFile; },
+  // T016 / R010: dev-server lifecycle re-exports. Canonical implementation
+  // lives in forge-dev-server.cjs.
+  get startDevServer() { return require('./forge-dev-server.cjs').startDevServer; },
+  get stopDevServer() { return require('./forge-dev-server.cjs').stopDevServer; },
+  get probeSandbox() { return require('./forge-dev-server.cjs').probeSandbox; }
 };

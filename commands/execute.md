@@ -1,6 +1,6 @@
 ---
 description: "Run the autonomous implementation loop"
-argument-hint: "[--autonomy full|gated|supervised] [--max-iterations N] [--token-budget N] [--depth quick|standard|thorough] [--filter NAME]"
+argument-hint: "[--autonomy full|gated|supervised] [--max-iterations N] [--token-budget N] [--depth quick|standard|thorough] [--filter NAME] [--record-baselines]"
 allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tui-attach.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Bash(*)", "Agent(*)"]
 ---
 
@@ -59,6 +59,7 @@ Parse flags from `$ARGUMENTS`:
 | `--token-budget N` | Value from config (default: `500000`) | Total token budget for execution |
 | `--depth quick\|standard\|thorough` | Value from config (default: `standard`) | Quality/ceremony level |
 | `--filter NAME` | *(all specs)* | Only execute tasks for specs whose domain matches NAME |
+| `--record-baselines` | `false` | Mark this run as the first-successful-visual-AC path: visual verifier will save baselines instead of comparing. Consumed by T020 (visual verification gate, R007). When present, `setup-state` sets `record_baselines: true` in `.forge/state.md` frontmatter. |
 
 If a flag is not provided, fall back to `.forge/config.json`, then to the built-in default.
 
@@ -99,10 +100,11 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" setup-state \
   --depth "{resolved-depth}" \
   --max-iterations "{resolved-max-iterations}" \
   --token-budget "{resolved-token-budget}" \
-  --completion-promise "FORGE_COMPLETE"
+  --completion-promise "FORGE_COMPLETE" \
+  ${RECORD_BASELINES:+--record-baselines}
 ```
 
-This sets `phase: executing` in state.md and creates the loop file that activates the Stop hook.
+This sets `phase: executing` in state.md and creates the loop file that activates the Stop hook. When `--record-baselines` is passed from `/forge:execute`, setup-state stamps `record_baselines: true` into state.md frontmatter; T020's visual verifier reads that flag to switch from compare-mode to record-mode on the first passing visual AC.
 
 ## Auto-Attach TUI (full autonomy only)
 
