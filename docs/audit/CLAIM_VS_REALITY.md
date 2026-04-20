@@ -98,6 +98,10 @@ These came in from the user's follow-up and are not yet verified on my side — 
 
 ### O010 — `/forge:brainstorm` does not dispatch parallel web-search subagents based on input
 - Need to inspect `skills/brainstorming/SKILL.md` and the `forge-researcher` wiring to see whether multi-agent web search is spec'd vs implemented.
+- **VERIFIED 2026-04-20 (T014 pre-fix read)**: `skills/brainstorming/SKILL.md` pre-T014 had zero mentions of `forge-researcher`, `run_in_background`, or a research-dispatch phase. Phase 3.5 "Knowledge Graph Context" was the only pre-proposal research surface and it only read a local graph.json; no subagent was ever spawned while the user was still answering questions. O010's claim was accurate.
+- **FIX (T014)**: added Phase 3.4 "Parallel research dispatch" between Phase 3 Q&A and Phase 3.5 Knowledge Graph with: two dispatch points (after Q2 and after Q4), `forge-researcher` subagent_type with `run_in_background: true`, output path `.forge/specs/<spec-id>.research.md`, named-citation requirement at proposal stage, config gate `brainstorm.web_search_enabled` (default true), and fallback paths when the Agent tool is unavailable or the flag is false. Persistence goes through the new `scripts/forge-research-aggregator.cjs::appendResearchSection` helper with a shell bridge via `node scripts/forge-tools.cjs research-append --spec --heading --body-file`.
+- **SEVERITY (pre-fix)**: silent-gap — no prose or code path existed to dispatch research subagents.
+- **STATUS**: RESOLVED by T014. See F006 below.
 
 ### O011 — Brainstorm Q&A is not asked one-question-at-a-time
 - Command file says "minimum 3 clarifying questions" but doesn't enforce single-question cadence. Need to inspect the skill.
@@ -199,6 +203,38 @@ These came in from the user's follow-up and are not yet verified on my side — 
 - **CLEANUP**: tmpdir rm with `{ recursive:true, force:true, maxRetries:3 }` in a `finally` block; Windows-locked-file best-effort.
 - **RUNTIME**: 2.0 s on this machine for all 4 tests; well under the R006 AC "under 30 seconds on CI" target.
 - **RELEVANT TO O019** (parallel agents collide on git state): the wire-test pattern is also the template for future multi-process tests. It uses isolated clones + a shared bare, which is the same isolation model that O019's worktree resolution will need. Useful reference when spec-forge-v03-gaps R006 streaming-DAG worktree isolation gets built.
+
+### F006 — Parallel forge-researcher dispatch wired into brainstorming (T014, spec-forge-v03-gaps R005)
+
+- **CHANGE** (`skills/brainstorming/SKILL.md`): new Phase 3.4 "Parallel research dispatch" slots between Phase 3 Q&A and Phase 3.5 Knowledge Graph. Two dispatch triggers (after Q2 and after Q4), both call the Agent tool with `subagent_type: forge-researcher` and `run_in_background: true`. Prompt shapes derived from accumulated Q&A: first dispatch is broad ("find 3 prior-art approaches to <topic> and summarise tradeoffs"), second dispatch narrows using Q3+Q4 answers. The skill explicitly forbids dispatch after Q5-Q7 so the final stretch of Q&A is not drowned in background research noise.
+- **NEW FILE** (`scripts/forge-research-aggregator.cjs`): zero-dependency module exporting `appendResearchSection(forgeDir, specId, { heading, body, sources })` and `readResearchFile(forgeDir, specId)`. Writes to `.forge/specs/<spec-id>.research.md` with a stable contract:
+  - YAML frontmatter: `spec`, `created` (YYYY-MM-DD), `sections` (integer, stays in sync with body).
+  - Body sections: `## Section N: <heading>` ordinals are append-only and monotonic; duplicate headings (case-insensitive) get a ` (2)`, ` (3)`, ... suffix automatically so every section id is unique and can be cited.
+  - Sources: rendered as `**Sources:**` followed by `- <url or doc ref>` bullets. Empty sources omit the block entirely.
+  - SpecId guard rejects path separators (`/`, `\`, `..`) so a malformed spec name cannot escape `.forge/specs/`.
+- **NEW CLI** (`scripts/forge-tools.cjs research-append`): shell bridge called from the skill runtime after a background researcher returns. Required flags `--spec`, `--heading`, `--body-file`; optional `--sources url1,url2` and `--forge-dir`. Exits 2 on missing required flags or unreadable body-file, exits 1 on aggregator error. `--body-file` is used rather than inline `--body` to avoid shell-escaping pitfalls when a researcher emits multi-paragraph markdown with quotes and backticks.
+- **RE-EXPORT** (`scripts/forge-tools.cjs` module.exports): lazy getters `appendResearchSection` and `readResearchFile` delegate to the aggregator so callers that already have a `require('./forge-tools.cjs')` handle do not need a second require. Avoids a circular dependency by using getters rather than top-level requires.
+- **CONFIG GATE**: the whole phase is gated on `brainstorm.web_search_enabled` (default `true`). When the flag is `false`, the skill skips both dispatches and adds a one-line note `Research dispatch disabled (brainstorm.web_search_enabled=false).` to the spec's Future Considerations section — a user-visible disclosure, not a silent skip.
+- **FALLBACK PATHS**: three paths spelled out in the skill prose:
+  1. Agent tool unavailable in the runtime -> skip dispatch, log to `.forge/state.md` `## decisions`, proceed to Phase 4 without research.
+  2. Dispatch succeeds but the subagent errors or returns empty -> no section written for that dispatch; do NOT retry.
+  3. Flag is `false` -> skip both, require the Future Considerations note.
+  When no research file exists by the time Phase 4 runs, the proposal block must open with `Note: no research file available -- approaches below are drawn from the Q&A only.` This is required disclosure per R005 AC6.
+- **CITATIONS**: proposal stage must cite findings by path, e.g. `per .forge/specs/forge-v03-gaps.research.md#section-1-dagster-asset-graph` or when quoting pre-existing research `per docs/audit/research/streaming-dag.md#dagster`. The skill shows both forms as examples.
+- **REGRESSION COVER** (`tests/researcher-dispatch.test.cjs`, 25/25 green across 4 suites):
+  - Aggregator unit tests (10): first-append creates frontmatter, multiple appends stay in stable monotonic order, duplicate heading -> `(2)`/`(3)` (case-insensitive), optional sources, missing-file returns null, path-separator rejection, missing-heading rejection, file-location contract `.forge/specs/<spec>.research.md`, markdown subheadings inside a section preserved, frontmatter sections count stays in sync with body.
+  - CLI bridge tests (3): happy path with sources, exit 2 on missing `--spec`, exit 2 on unreadable body-file.
+  - Skill prose anchors (9): verifies the SKILL.md contains the exact invariants the runtime keys off (phase name, `forge-researcher`, `run_in_background: true`, after-Q2 / after-Q4 triggers, output path, named-citation example, `brainstorm.web_search_enabled` gate with `true` default, Agent-tool-unavailable fallback, `research-append` CLI reference).
+  - Flag-disabled behaviour (2): the "skip when flag is false" and "user-visible note" prose exist inside the Phase 3.4 section specifically, not just anywhere in the skill.
+  - Markdown format contract (1): end-to-end file-shape check — frontmatter delimiters, keys, ordinals `Section 1`/`Section 2`, sources bullet count, empty-sources omits the block.
+- **FULL SUITE**: 518/519 green (25 new + 493 existing). The one failure is the pre-existing O023 TUI CRLF snapshot, unrelated to T014.
+- **KEY DECISIONS** (for the record):
+  - Aggregator lives in its own file rather than inside `forge-tools.cjs` so the 6330-line forge-tools module does not grow further and the aggregator can be required standalone from the skill runtime without loading the whole toolset. Re-exports in forge-tools are lazy getters to preserve convenience without circular-require risk.
+  - CLI uses `--body-file` not `--body` so researchers can drop raw markdown to a tempfile and the shell never has to escape it. Same reason `--sources` is a comma list of short strings (URLs + doc refs), not a JSON payload.
+  - Dedupe is case-insensitive and scans existing headings including any pre-existing `(N)` suffix, so the third `Dagster asset graph` dispatch lands as `Dagster asset graph (3)`, not `Dagster asset graph (2) (2)`.
+  - The skill tests are prose-anchor assertions rather than runtime behaviour checks, same pattern as T010's `skills/brainstorming/test.md` manual protocol. Running an actual Agent dispatch in unit tests would require stubbing the Claude tool surface, which is out of scope for T014. The manual test protocol in `skills/brainstorming/test.md` covers the integrated behaviour.
+  - Did NOT modify `commands/brainstorm.md` — the command file already delegates all workflow prose to the skill, and Phase 3.4 is a skill-internal phase insertion that inherits from the existing delegation.
+- **RESOLVES**: O010 (parallel web-search subagent dispatch from brainstorm).
 
 ---
 

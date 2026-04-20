@@ -157,6 +157,54 @@ Stop at or before 7. If you still feel blocked on design decisions, that is a si
 
 If option B, generate a DESIGN.md using the template from `skills/design-system/SKILL.md` and write it to the project root. Reference the awesome-design-md catalog (github.com/VoltAgent/awesome-design-md) for established brand design systems.
 
+### Phase 3.4: Parallel research dispatch
+
+While the user is still answering questions 3 through 7, the skill should fire **forge-researcher** subagents in the background so that by the time Phase 4 (approach proposals) starts, 1-2 research artefacts are already on disk and can be cited directly in the trade-off table.
+
+**Config gate.** Read `.forge/config.json`. If `brainstorm.web_search_enabled` is `false`, skip this entire phase and add a one-line note to the spec's Future Considerations section: `Research dispatch disabled (brainstorm.web_search_enabled=false).` The default when the flag is missing is `true`.
+
+**When to dispatch.**
+
+| Trigger | Prompt shape |
+|--------|--------------|
+| Immediately after question 2 is answered | `find 3 prior-art approaches to <topic derived from Q1+Q2 answers> and summarise tradeoffs` |
+| Immediately after question 4 is answered (only if the run reaches Q4) | narrower follow-up using Q3+Q4 answers, e.g. `for <approach family from Q3>, compare <specific constraint from Q4> across the 3 candidates found previously` |
+
+Do NOT dispatch after questions 5-7; by then you should be converging on the proposal, not widening research.
+
+**How to dispatch.**
+
+1. Determine the active spec id from `.forge/state.md` frontmatter (`spec:` field) or, if no spec file exists yet, from the domain slug you intend to write in Phase 5.
+2. Call the Agent tool with:
+   - `subagent_type: "forge-researcher"` (or `"forge:forge-researcher"` when the plugin namespace is required)
+   - `run_in_background: true`
+   - A prompt following the shape above, with the user's actual answers inlined.
+3. When the subagent returns, capture its structured report and persist the relevant section by calling:
+   ```bash
+   node scripts/forge-tools.cjs research-append \
+     --spec <spec-id> \
+     --heading "<short heading — e.g. 'Dagster asset graph'>" \
+     --body-file <tempfile with the research markdown> \
+     --sources "<comma-separated URLs or doc refs>"
+   ```
+   The file lands at `.forge/specs/<spec-id>.research.md` with YAML frontmatter and `## Section N: <heading>` blocks. Duplicate headings get a `(2)`, `(3)`, ... suffix automatically.
+
+**Proposal-stage citations.** When you present Phase 4 approaches, every non-obvious trade-off claim MUST cite a specific research section by path, e.g.:
+> Approach B builds on the Dagster-style asset graph — per `.forge/specs/forge-v03-gaps.research.md#section-1-dagster-asset-graph`, the key trade-off is worker-level AC tracking vs frontier-level.
+
+Or when quoting pre-existing research under `docs/audit/research/`:
+> per `docs/audit/research/streaming-dag.md#dagster`
+
+If no research file exists (flag disabled, Agent tool unavailable, or every dispatch failed), add an explicit note at the top of the Phase 4 proposal block: `Note: no research file available -- approaches below are drawn from the Q&A only.` This is a required disclosure, not a silent skip.
+
+**Fallback paths.**
+
+- **Agent tool not available in this runtime.** Proceed to Phase 4 without dispatch. Log the absence to `.forge/state.md` under `## decisions` (e.g. `brainstorm: research dispatch skipped, Agent tool missing`).
+- **Dispatch succeeds but subagent errors or returns empty.** Treat as "no section for this dispatch". Do NOT retry; the goal is fresh context for the proposal stage, not perfect research.
+- **`brainstorm.web_search_enabled: false`.** Skip both dispatches. The spec's Future Considerations must contain the disabled-flag note described above.
+
+The whole phase is best-effort: brainstorming never blocks on research. If the user is already on question 6 before the first subagent returns, mention the pending research in your Captured summary and continue.
+
 ### Phase 3.5: Knowledge Graph Context (if available)
 
 If `graphify-out/graph.json` exists, load it before proposing approaches:

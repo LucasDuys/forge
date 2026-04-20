@@ -5317,6 +5317,55 @@ if (require.main === module) {
       process.exit(1);
     }
   }
+
+  // research-append (T014 / R005) -- shell bridge into forge-research-aggregator.
+  // Called from skill runtime after a background forge-researcher dispatch
+  // returns so the output lands in .forge/specs/<spec>.research.md.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs research-append \
+  //     --spec forge-v03-gaps \
+  //     --heading "Dagster-style asset graph" \
+  //     --body-file /tmp/researcher-out.md \
+  //     [--sources url1,url2,url3] \
+  //     [--forge-dir .forge]
+  if (command === 'research-append') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const spec = args.find((a, i) => args[i - 1] === '--spec');
+    const heading = args.find((a, i) => args[i - 1] === '--heading');
+    const bodyFile = args.find((a, i) => args[i - 1] === '--body-file');
+    const sourcesRaw = args.find((a, i) => args[i - 1] === '--sources');
+    if (!spec) {
+      process.stderr.write('research-append: --spec is required\n');
+      process.exit(2);
+    }
+    if (!heading) {
+      process.stderr.write('research-append: --heading is required\n');
+      process.exit(2);
+    }
+    if (!bodyFile) {
+      process.stderr.write('research-append: --body-file is required\n');
+      process.exit(2);
+    }
+    let body;
+    try { body = fs.readFileSync(bodyFile, 'utf8'); }
+    catch (e) {
+      process.stderr.write('research-append: cannot read --body-file: ' + e.message + '\n');
+      process.exit(2);
+    }
+    const sources = sourcesRaw
+      ? sourcesRaw.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
+    try {
+      const { appendResearchSection } = require('./forge-research-aggregator.cjs');
+      const r = appendResearchSection(forgeDir, spec, { heading, body, sources });
+      process.stdout.write(JSON.stringify(r) + '\n');
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write('research-append failed: ' + e.message + '\n');
+      process.exit(1);
+    }
+  }
 }
 
 function padRight(str, len) {
@@ -6326,5 +6375,9 @@ module.exports = {
   ERROR_TAXONOMY, classifyError, getRecoveryAction, logError,
   captureTrajectory, trajectoryStats, tokenReport, promoteToGlobalLearning,
   compressContext, shouldCompress, getCompressionThreshold,
-  appendTranscript, readTranscript
+  appendTranscript, readTranscript,
+  // T014 / R005: research aggregator re-exports for convenience.
+  // The canonical implementation lives in forge-research-aggregator.cjs.
+  get appendResearchSection() { return require('./forge-research-aggregator.cjs').appendResearchSection; },
+  get readResearchFile() { return require('./forge-research-aggregator.cjs').readResearchFile; }
 };
