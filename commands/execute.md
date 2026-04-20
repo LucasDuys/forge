@@ -1,7 +1,7 @@
 ---
 description: "Run the autonomous implementation loop"
 argument-hint: "[--autonomy full|gated|supervised] [--max-iterations N] [--token-budget N] [--depth quick|standard|thorough] [--filter NAME]"
-allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Bash(*)", "Agent(*)"]
+allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tui-attach.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Bash(*)", "Agent(*)"]
 ---
 
 # Forge Execute
@@ -103,6 +103,30 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" setup-state \
 ```
 
 This sets `phase: executing` in state.md and creates the loop file that activates the Stop hook.
+
+## Auto-Attach TUI (full autonomy only)
+
+When the resolved autonomy is `full`, the executor spawns a detached TUI session so a long unattended run has live visibility without blocking stdout. This is a no-op for `gated` and `supervised` modes, so the manual `/forge:watch` path is preserved.
+
+Invoke the helper after `setup-state` runs and **before** handing off to `forge:executing`:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tui-attach.cjs" \
+  --autonomy "{resolved-autonomy}" \
+  --forge-dir .forge
+```
+
+The helper decides what to do based on the environment (spec R003):
+
+| Condition | Action |
+|-----------|--------|
+| `autonomy !== "full"` | Silent no-op. Manual flow unchanged. |
+| `.forge/config.json` has `tui.auto_attach: false` | Silent no-op. Opt-out flag respected. Default when absent is `true`. |
+| `process.platform === "win32"` | Print `Monitor progress with: /forge:watch` to stdout and continue headless. No fork attempt. |
+| `tmux` not on `$PATH` (non-Windows) | Print `Monitor progress with: /forge:watch` to stdout and continue headless. |
+| Unix + `tmux` available | Start a detached session named `forge-tui-<pid>` running the TUI command, print `Attach: tmux attach -t forge-tui-<pid>` to stdout. Does not block. |
+
+The helper always exits 0; `/forge:execute` never stalls waiting on it. If `tmux` spawn itself fails, the helper writes a diagnostic to stderr and falls back to the headless message so the loop keeps moving.
 
 ## Identify First Task
 

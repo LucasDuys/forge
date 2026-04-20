@@ -85,6 +85,15 @@ These came in from the user's follow-up and are not yet verified on my side — 
 
 ### O009 — TUI does not run automatically when a Forge command starts
 - Not yet reproduced on this session. Need to run `/forge:execute` or equivalent and observe whether the TUI auto-attaches.
+- **VERIFIED 2026-04-20 (T012 pre-fix read)**: `commands/execute.md` had no hook to spawn the TUI between `setup-state` and the `forge:executing` handoff, so `/forge:execute` in `autonomy: full` stayed headless by design. The `/forge:watch` path existed as a separate command but had to be launched manually in a second terminal.
+- **FIX (T012)**: added `scripts/forge-tui-attach.cjs` -- a decision helper invoked by `commands/execute.md` immediately after `setup-state`. Branches:
+  - `autonomy !== "full"` -> silent no-op (gated/supervised flow preserved, R003 AC4).
+  - `.forge/config.json` `tui.auto_attach: false` -> silent no-op (opt-out, default true per R003 AC5).
+  - `process.platform === "win32"` -> prints `Monitor progress with: /forge:watch` to stdout and exits, no fork attempt (R003 AC3).
+  - `tmux` missing on `$PATH` (non-Windows) -> same headless message, no fork attempt (R003 AC3).
+  - Unix + tmux available -> `tmux new-session -d -s forge-tui-<pid> node scripts/forge-tui.cjs --forge-dir .forge` detached, unref'd, stdout `Attach: tmux attach -t forge-tui-<pid>` (R003 AC1, AC2).
+  Regression test at `tests/tui-auto-attach.test.cjs` covers the five AC branches plus a malformed-config fallback via a `FORGE_TUI_ATTACH_DRY_RUN=1` hook and `FORGE_TUI_ATTACH_FAKE_PATH` / `FORGE_TUI_ATTACH_FAKE_PLATFORM` / `FORGE_TUI_ATTACH_FAKE_PID` injection points. 8/8 green.
+- **SEVERITY (pre-fix)**: medium -- feature was implied by the architecture (the TUI renderer already existed) but wiring was absent from `/forge:execute`.
 
 ### O010 — `/forge:brainstorm` does not dispatch parallel web-search subagents based on input
 - Need to inspect `skills/brainstorming/SKILL.md` and the `forge-researcher` wiring to see whether multi-agent web search is spec'd vs implemented.
