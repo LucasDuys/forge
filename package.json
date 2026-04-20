@@ -1,0 +1,18 @@
+{
+  "name": "forge",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Claude Code plugin: brainstorm-to-commit pipeline. Installed via `claude plugin install`, not npm. This manifest exists only to declare the optional `ably` peer dependency used by collab mode (spec-collab R013).",
+  "license": "MIT",
+  "scripts": {
+    "test": "node scripts/run-tests.cjs"
+  },
+  "peerDependencies": {
+    "ably": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ably": {
+      "optional": true
+    }
+  }
+}
