@@ -27,6 +27,7 @@ mkdir -p "${FORGE_DIR}/specs"
 mkdir -p "${FORGE_DIR}/plans"
 mkdir -p "${FORGE_DIR}/history/cycles"
 mkdir -p "${FORGE_DIR}/summaries"
+mkdir -p "${FORGE_DIR}/collab"
 
 # Copy default config (cp -n: never overwrite an existing file)
 cp -n "${PLUGIN_ROOT}/templates/config.json" "${FORGE_DIR}/config.json"
@@ -44,16 +45,51 @@ if [ ! -f "${FORGE_DIR}/history/backprop-log.md" ]; then
   echo "# Backpropagation Log" > "${FORGE_DIR}/history/backprop-log.md"
 fi
 
-# Add .forge to .gitignore if not already there
+# Add collab carve-out rules to .gitignore (R001 AC1).
+# Must use the glob form `/.forge/*` plus un-ignore re-entries so git descends
+# into .forge/collab/ and publishes shared artifacts while keeping per-machine
+# state (participant.json, flag-emit-log-*.jsonl, .enabled) local. A bare
+# `.forge/` rule would ignore the whole tree and git refuses to re-include
+# files under an ignored parent directory.
+#
+# Idempotency: the outer `[ -f "${FORGE_DIR}/config.json" ]` gate above means
+# setup.sh only falls through here on first init or partial re-init. Inside
+# this block we still check for the carve-out marker so a partial re-init on
+# top of an already-patched .gitignore is a no-op.
+#
+# Legacy migration: if an existing checkout has a bare `.forge/` rule (from
+# pre-collab setup.sh), it is left alone here. The migration path lives in
+# `scripts/forge-collab.cjs::patchGitignore` and is surfaced by
+# `/forge:collaborate start` when it detects `legacy_rule_no_carve_out`.
 GITIGNORE="${PROJECT_DIR}/.gitignore"
+CARVE_OUT_MARKER="# forge: collab carve-out"
+CARVE_OUT_BLOCK="${CARVE_OUT_MARKER}
+/.forge/*
+!/.forge/collab/
+!/.forge/collab/**"
+
 if [ -f "$GITIGNORE" ]; then
-  if ! grep -q '^\.forge/' "$GITIGNORE" 2>/dev/null; then
-    echo ".forge/" >> "$GITIGNORE"
-    echo "Added .forge/ to .gitignore"
+  if grep -qF "$CARVE_OUT_MARKER" "$GITIGNORE" 2>/dev/null; then
+    : # carve-out already present, no-op
+  else
+    # Append with a separating blank line if the file does not already end in
+    # a newline so the marker lands on its own line.
+    if [ -s "$GITIGNORE" ] && [ -n "$(tail -c 1 "$GITIGNORE")" ]; then
+      printf '\n' >> "$GITIGNORE"
+    fi
+    printf '\n%s\n' "$CARVE_OUT_BLOCK" >> "$GITIGNORE"
+    echo "Added .forge/ collab carve-out to .gitignore"
   fi
 else
-  echo ".forge/" > "$GITIGNORE"
-  echo "Created .gitignore with .forge/"
+  printf '%s\n' "$CARVE_OUT_BLOCK" > "$GITIGNORE"
+  echo "Created .gitignore with .forge/ collab carve-out"
+fi
+
+# Nested .forge/collab/.gitignore so per-machine state never propagates via
+# git pull, even though the carve-out above un-ignores the whole collab dir.
+NESTED_GITIGNORE="${FORGE_DIR}/collab/.gitignore"
+if [ ! -f "$NESTED_GITIGNORE" ]; then
+  cp "${PLUGIN_ROOT}/templates/collab-gitignore" "$NESTED_GITIGNORE"
 fi
 
 echo "Forge initialized. Run /forge brainstorm to get started."

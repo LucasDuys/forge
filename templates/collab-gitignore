@@ -1,0 +1,4 @@
+# Per-machine collab state (never propagates via git)
+participant.json
+flag-emit-log-*.jsonl
+.enabled

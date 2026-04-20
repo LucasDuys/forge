@@ -123,6 +123,16 @@ These came in from the user's follow-up and are not yet verified on my side — 
 - **OBSERVATION while fixing**: T001 (collab-fix R001) landed a parallel edit on the same file, adding `mkdir -p "${FORGE_DIR}/collab"` and the `.gitignore` carve-out block. The changes merged cleanly because T002 only touched the gate and the copy primitives. T001's own `tests/forge-collab-gitignore.test.cjs` has four residual failures unrelated to T002 — those live in T001's work-in-progress; switching `cp` -> `cp -n` actually moved T001 from 10/18 to 14/18 passing because several T001 test cases expected the second-run no-clobber behavior.
 - **PRE-EXISTING UNRELATED FAILURE**: `tests/forge-tui/render-test.cjs` snapshot comparison fails on Windows because the saved snapshot uses `\r\n` while the live render emits `\n`. Confirmed failure exists on HEAD without any T002 change. Not addressed here.
 
+### F002 — setup.sh collab carve-out landed; 7 T001 residual failures now green (T001, spec-collab-fix R001 AC1 + AC4)
+
+- **CHANGE**: `scripts/setup.sh` now emits the glob-form collab carve-out (`/.forge/*`, `!/.forge/collab/`, `!/.forge/collab/**`) under a `# forge: collab carve-out` marker instead of the legacy bare `.forge/` rule, and copies `templates/collab-gitignore` to `.forge/collab/.gitignore` so per-machine state (`participant.json`, `flag-emit-log-*.jsonl`, `.enabled`) stays local while shared collab artifacts propagate via git. `mkdir -p "${FORGE_DIR}/collab"` added to the scaffolding list so the nested .gitignore has a parent on first init.
+- **NEW FILE**: `templates/collab-gitignore` — three lines (`participant.json`, `flag-emit-log-*.jsonl`, `.enabled`) with a header comment.
+- **IDEMPOTENCY**: two paths. Outer gate `[ -f "${FORGE_DIR}/config.json" ]` short-circuits second invocations with `Forge already initialized (config.json present)` per F001. Inside the gitignore writer, a `grep -qF "# forge: collab carve-out"` check makes partial re-inits a no-op even if config.json is missing but the marker is already present.
+- **LEGACY MIGRATION**: setup.sh deliberately does NOT rewrite an existing bare `.forge/` rule. That path is handled out-of-band by `scripts/forge-collab.cjs::patchGitignore`, surfaced by `/forge:collaborate start` on detection of `legacy_rule_no_carve_out`. This keeps setup.sh idempotent across re-inits of existing checkouts without clobbering user-curated ignores.
+- **TEST RESULT**: `node scripts/run-tests.cjs --filter gitignore` — 18/18 pass (all 11 git-gated tests run when git is on PATH, duration jumps from 87 ms stub-skip to 3.8 s real-git). Full suite 425/426; the 1 failure is the pre-existing TUI CRLF/LF snapshot mismatch on Windows documented in O008.
+- **MANUAL VERIFICATION**: `git check-ignore` on a fresh `bash scripts/setup.sh` temp dir confirms AC3 (`.forge/collab/inputs-lucas.md` and `.forge/collab/brainstorm/inputs-lucas.md` not ignored), AC4 (`participant.json`, `flag-emit-log-*.jsonl`, `.enabled` ignored by nested rule), and the outside-collab baseline (`.forge/state.md` still ignored, `.forge/collab/flags/FLAG-123.json` tracked).
+- **RESOLVES**: O004 (setup.sh gitignored `.forge/` unconditionally), O020 (T001 setup.sh half never landed).
+
 ---
 
 ## Observations from execute run (T011 — mock scaffold)
