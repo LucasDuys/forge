@@ -116,6 +116,7 @@ These came in from the user's follow-up and are not yet verified on my side — 
 
 ### O014 — setup-state silently sets `task_status: complete, current_task: null` on new spec
 - Would cause "done" at iteration 0 unless caught manually. Need to reproduce.
+- **STATUS**: RESOLVED by T009 (spec-forge-v03-gaps R008). See F003 below.
 
 ### O015 — Sandbox blind spots: no dev server, no browser, no Playwright baseline recording in loop
 - Verifiable by trying to wire Playwright MCP into the loop during this brainstorm. If it works here, then the framework can do it but doesn't by default; that's a spec gap, not an impossibility.
@@ -141,6 +142,25 @@ These came in from the user's follow-up and are not yet verified on my side — 
 - **TEST RESULT**: `node scripts/run-tests.cjs --filter gitignore` — 18/18 pass (all 11 git-gated tests run when git is on PATH, duration jumps from 87 ms stub-skip to 3.8 s real-git). Full suite 425/426; the 1 failure is the pre-existing TUI CRLF/LF snapshot mismatch on Windows documented in O008.
 - **MANUAL VERIFICATION**: `git check-ignore` on a fresh `bash scripts/setup.sh` temp dir confirms AC3 (`.forge/collab/inputs-lucas.md` and `.forge/collab/brainstorm/inputs-lucas.md` not ignored), AC4 (`participant.json`, `flag-emit-log-*.jsonl`, `.enabled` ignored by nested rule), and the outside-collab baseline (`.forge/state.md` still ignored, `.forge/collab/flags/FLAG-123.json` tracked).
 - **RESOLVES**: O004 (setup.sh gitignored `.forge/` unconditionally), O020 (T001 setup.sh half never landed).
+
+### F003 — writeState R008 guard + setup-state ingest hardening (T009, spec-forge-v03-gaps R008)
+
+- **CHANGE** (scripts/forge-tools.cjs):
+  1. `writeState()` now runs `_assertStateCompleteAllowed` before every serialize (both legacy 3-arg and partial 2-arg forms). A write that sets `task_status: complete` is rejected unless all three gates are green: (a) an active spec is declared in frontmatter, (b) `.forge/plans/<spec>-frontier.md` exists and parses, (c) every task id from that frontier has a registry entry in `.forge/task-status.json` whose status is one of `{complete, complete_with_concerns, DONE, DONE_WITH_CONCERNS}` (both the internal lowercase form and the forge-executor status-report form are accepted).
+  2. Violations append one JSONL line to `.forge/history/cycles/<cycle>/state-violations.jsonl` with a stable shape: `{at, attempted, reason, frontier_path, missing_task_ids}`. Cycle id reuses `state.data.cycle` when present, otherwise a compact ISO stamp (`YYYYMMDDTHHMMZ`). After logging, the guard throws an `Error` with `code: 'E_STATE_WRITE_GUARD'` so the caller sees the problem at the write site.
+  3. `setup-state` CLI is now authoritative for three frontmatter fields on ingest: it unconditionally writes `task_status: pending`, `current_task: <first task id of the active spec>`, `completed_tasks: []`, and `blocked_reason: null`, regardless of whatever frontmatter the inbound `state.md` happens to claim. The first-task lookup prefers the active spec's frontier; if that is unknown it falls back to the first task across all frontiers, then to `T001`. This is what closes the graph-visual-quality "fresh spec ships with `task_status: complete`" trap.
+- **REGRESSION COVER** (`tests/setup-state-guard.test.cjs`, 12/12 green):
+  - Direct writeState attempts with `task_status: complete` on a fresh spec produce `E_STATE_WRITE_GUARD` and a single JSONL line that names the three non-DONE tasks.
+  - Frontier-missing and spec-missing cases both throw with distinct, actionable reasons.
+  - All-gates-green writes succeed (registry uses internal `complete`/`complete_with_concerns`; second test covers the `DONE`/`DONE_WITH_CONCERNS` status-report shape).
+  - Pending tasks are singled out in `missing_task_ids` so operators can tell at a glance which work is still open.
+  - Non-complete writes (pending/testing/reviewing/blocked/null) pass through untouched.
+  - Legacy 3-arg full-write form is also guarded.
+  - CLI `setup-state` run against an adversarial state.md (`task_status: complete, current_task: null, completed_tasks: [...]`) rewrites frontmatter to the hard-coded defaults. Multi-spec workspace test confirms `current_task` lands on the active spec's first task, not some other frontier's T001.
+  - Violation JSONL shape is locked to exactly five keys in sorted order; `at` is a real ISO timestamp; `reason` is >10 chars and prefixed `Refusing task_status=complete`.
+- **FULL SUITE**: 485/486 green. The one failure is the pre-existing O023 TUI CRLF snapshot, unrelated to T009.
+- **SCOPE NOTE**: the guard is strict on purpose. Per-task `task_status: complete` writes (the historical "this task finished, route to next" signal) will now be rejected unless the whole frontier is DONE. This is what R008 AC2 literally requires ("every status entry is one of {DONE, DONE_WITH_CONCERNS}"). In practice the rest of the codebase writes task-done state to the registry (`markTaskComplete`) and uses other `task_status` values (`testing`, `reviewing`, `implementing`, `null`) during per-task lifecycle transitions; only the legitimate spec-level completion flip lands `task_status: complete`, and it passes when the registry agrees. The one in-file callsite that writes per-task `'complete'` (`verifyStateConsistency` at line ~2898) is self-healing reconciliation: when it runs, the registry already shows `complete` for the current task, so the guard continues to pass for any single-task frontier; multi-task frontiers where only one task is done will now surface a violation, which is the correct behavior — the spec-level flag is semantically wrong in that state.
+- **RESOLVES**: O014.
 
 ---
 

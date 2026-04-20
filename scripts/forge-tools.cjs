@@ -1012,6 +1012,160 @@ function _atomicWriteFile(targetPath, contents) {
   throw lastErr || new Error('atomic write failed');
 }
 
+// === Setup-state Guard (T009, R008) ===
+//
+// R008 exists because of the graph-visual-quality real run where a fresh spec
+// entered state.md with `task_status: complete, current_task: null` which
+// would have short-circuited execute had a human not spotted it. The guard
+// refuses any frontmatter write that lands `task_status: complete` unless
+// ALL of the following are true:
+//   (a) A frontier file exists for the active spec
+//       (.forge/plans/<spec>-frontier.md).
+//   (b) Every task id in the frontier has a status entry in the registry
+//       (.forge/task-status.json) — "or the equivalent structured field"
+//       per the spec prompt; the registry is that field.
+//   (c) Every status entry is one of {complete, complete_with_concerns,
+//       DONE, DONE_WITH_CONCERNS} — we accept both the internal lowercase
+//       form and the forge-executor status-report form for robustness.
+//
+// Violations append a JSONL line to
+// .forge/history/cycles/<cycle>/state-violations.jsonl with a stable shape
+// so /forge:review-branch can audit after the fact, then throw so the caller
+// sees an actionable error.
+
+const _COMPLETE_ALLOWED_STATUSES = new Set([
+  'complete',
+  'complete_with_concerns',
+  'DONE',
+  'DONE_WITH_CONCERNS'
+]);
+
+// Derive the cycle directory name used by the violation log. If state.md
+// already carries a `cycle` frontmatter key (transcript cycle convention),
+// reuse it so violations and transcripts co-locate. Otherwise synthesize a
+// compact UTC stamp `YYYYMMDDTHHmmZ` from `opts.now` or the wall clock.
+// Tests pass `opts.now` for deterministic filenames.
+function _deriveViolationCycleId(currentData, opts) {
+  if (currentData && typeof currentData.cycle === 'string' && currentData.cycle) {
+    // Reuse the active transcript cycle when present.
+    const c = currentData.cycle;
+    if (!/[\\/]/.test(c) && c !== '.' && c !== '..') return c;
+  }
+  const now = (opts && opts.now) ? new Date(opts.now) : new Date();
+  const iso = now.toISOString(); // e.g. 2026-04-20T17:30:12.345Z
+  // Strip to YYYYMMDDTHHMMZ — 14 chars, no separators, always valid as a dir name.
+  return iso.slice(0, 16).replace(/[-:]/g, '').replace(/\.\d+$/, '') + 'Z';
+}
+
+function _logStateViolation(forgeDir, violation, opts) {
+  // Best-effort sink. Never throw from the logger itself; the caller throws
+  // after we return so the root cause is visible at the write site.
+  try {
+    const cycleId = _deriveViolationCycleId(violation.currentData || {}, opts || {});
+    const cycleDir = path.join(forgeDir, 'history', 'cycles', cycleId);
+    fs.mkdirSync(cycleDir, { recursive: true });
+    const filePath = path.join(cycleDir, 'state-violations.jsonl');
+    const record = {
+      at: (opts && opts.now) || new Date().toISOString(),
+      attempted: violation.attempted || {},
+      reason: violation.reason || '',
+      frontier_path: violation.frontier_path || null,
+      missing_task_ids: Array.isArray(violation.missing_task_ids)
+        ? violation.missing_task_ids
+        : []
+    };
+    fs.appendFileSync(filePath, JSON.stringify(record) + '\n');
+    return filePath;
+  } catch (_) {
+    // Never swallow the guard error because logging failed.
+    return null;
+  }
+}
+
+// Inspect `mergedData` (the frontmatter about to be written) + the filesystem,
+// and if the combination is the R008 trap, log a violation and throw.
+function _assertStateCompleteAllowed(forgeDir, mergedData, currentData, opts) {
+  if (!mergedData || mergedData.task_status !== 'complete') return;
+
+  const spec = mergedData.spec || (currentData && currentData.spec) || null;
+  const frontierFile = spec ? `${spec}-frontier.md` : null;
+  const frontierPath = spec ? path.join(forgeDir, 'plans', frontierFile) : null;
+
+  const violation = {
+    attempted: {
+      task_status: mergedData.task_status,
+      current_task: mergedData.current_task || null,
+      spec: spec
+    },
+    currentData: currentData || {},
+    frontier_path: frontierPath
+  };
+
+  // Gate (a): frontier file exists.
+  if (!spec) {
+    violation.reason = 'Refusing task_status=complete: no active spec declared in state.md frontmatter.';
+    violation.missing_task_ids = [];
+    _logStateViolation(forgeDir, violation, opts);
+    const err = new Error(violation.reason);
+    err.code = 'E_STATE_WRITE_GUARD';
+    throw err;
+  }
+  if (!fs.existsSync(frontierPath)) {
+    violation.reason = `Refusing task_status=complete: frontier file not found at ${frontierPath}.`;
+    violation.missing_task_ids = [];
+    _logStateViolation(forgeDir, violation, opts);
+    const err = new Error(violation.reason);
+    err.code = 'E_STATE_WRITE_GUARD';
+    throw err;
+  }
+
+  // Parse the frontier and cross-check every task id against the registry.
+  let frontierTasks = [];
+  try {
+    const frontierText = fs.readFileSync(frontierPath, 'utf8');
+    frontierTasks = parseFrontier(frontierText);
+  } catch (e) {
+    violation.reason = `Refusing task_status=complete: frontier at ${frontierPath} is unreadable (${e.message}).`;
+    violation.missing_task_ids = [];
+    _logStateViolation(forgeDir, violation, opts);
+    const err = new Error(violation.reason);
+    err.code = 'E_STATE_WRITE_GUARD';
+    throw err;
+  }
+
+  const registry = readTaskRegistry(forgeDir);
+  const missing = [];
+  const nonDone = [];
+  for (const t of frontierTasks) {
+    const entry = registry.tasks ? registry.tasks[t.id] : null;
+    if (!entry) {
+      missing.push(t.id);
+    } else if (!_COMPLETE_ALLOWED_STATUSES.has(entry.status)) {
+      nonDone.push({ id: t.id, status: entry.status || null });
+    }
+  }
+
+  if (missing.length > 0 || nonDone.length > 0) {
+    const parts = [];
+    if (missing.length > 0) parts.push(`missing registry entries for ${missing.join(', ')}`);
+    if (nonDone.length > 0) {
+      parts.push(
+        'non-DONE statuses for ' +
+          nonDone.map(n => `${n.id}=${n.status == null ? 'null' : n.status}`).join(', ')
+      );
+    }
+    violation.reason =
+      `Refusing task_status=complete: ${parts.join('; ')}. ` +
+      `Every task in ${frontierFile} must have a registry entry in ` +
+      `{complete, complete_with_concerns, DONE, DONE_WITH_CONCERNS} before the spec-level complete flag can flip.`;
+    violation.missing_task_ids = missing.concat(nonDone.map(n => n.id));
+    _logStateViolation(forgeDir, violation, opts);
+    const err = new Error(violation.reason);
+    err.code = 'E_STATE_WRITE_GUARD';
+    throw err;
+  }
+}
+
 // writeState supports two calling conventions for backward compatibility:
 //   writeState(forgeDir, data, content [, opts])   -- legacy full-write (atomic)
 //   writeState(forgeDir, updates [, opts])         -- partial frontmatter merge.
@@ -1019,6 +1173,8 @@ function _atomicWriteFile(targetPath, contents) {
 //                                              __content       -- replaces body
 //                                              __contentAppend -- appended to body
 //   opts: { skipCavemanFormat: bool }  -- default false; caveman is on by default
+//         { now: ISOString }           -- injected clock for deterministic
+//                                        violation-log cycle ids in tests.
 function writeState(forgeDir, dataOrUpdates, contentOrOpts, maybeOpts) {
   const statePath = path.join(forgeDir, 'state.md');
 
@@ -1027,6 +1183,13 @@ function writeState(forgeDir, dataOrUpdates, contentOrOpts, maybeOpts) {
   // Detect legacy 3-arg form: 3rd arg is a string (content body).
   if (arguments.length >= 3 && typeof contentOrOpts === 'string') {
     const opts = maybeOpts || {};
+    // R008 guard: inspect full-write frontmatter before serializing.
+    let currentData = {};
+    try {
+      currentData = parseFrontmatter(fs.readFileSync(statePath, 'utf8')).data || {};
+    } catch (e) { /* first write is fine */ }
+    _assertStateCompleteAllowed(forgeDir, dataOrUpdates || {}, currentData, opts);
+
     const body = compressWithGuard(forgeDir, stateRel, contentOrOpts, opts);
     _atomicWriteFile(statePath, serializeFrontmatter(dataOrUpdates, body));
     return;
@@ -1054,6 +1217,9 @@ function writeState(forgeDir, dataOrUpdates, contentOrOpts, maybeOpts) {
       mergedData[key] = val;
     }
   }
+
+  // R008 guard: inspect merged frontmatter before serializing.
+  _assertStateCompleteAllowed(forgeDir, mergedData, current.data || {}, opts);
 
   _atomicWriteFile(statePath, serializeFrontmatter(mergedData, mergedContent));
 }
@@ -4733,18 +4899,41 @@ if (require.main === module) {
     state.data.tokens_used = 0;
     state.data.review_iterations = 0;
     state.data.debug_attempts = 0;
-    writeState(forgeDir, state.data, state.content);
 
     // Fix #4: Initialize task registry from all frontier files
+    let firstTaskId = null;
     try {
       const plans = fs.readdirSync(path.join(forgeDir, 'plans')).filter(f => f.endsWith('-frontier.md'));
       const allTasks = [];
+      const perSpecTasks = {};
       for (const plan of plans) {
         const text = fs.readFileSync(path.join(forgeDir, 'plans', plan), 'utf8');
-        allTasks.push(...parseFrontier(text));
+        const tasks = parseFrontier(text);
+        allTasks.push(...tasks);
+        // Remember the first task id for the active spec so ingest lands on T001.
+        // Spec-plan naming is `<spec>-frontier.md` (see writeState R008 guard).
+        const specKey = plan.replace(/-frontier\.md$/, '');
+        perSpecTasks[specKey] = tasks;
       }
       initTaskRegistry(forgeDir, allTasks);
+      if (spec && perSpecTasks[spec] && perSpecTasks[spec].length > 0) {
+        firstTaskId = perSpecTasks[spec][0].id;
+      } else if (allTasks.length > 0) {
+        firstTaskId = allTasks[0].id;
+      }
     } catch (e) { /* no plans yet */ }
+
+    // T009 / R008: Setup-state hardening.
+    // Unconditionally land `task_status=pending`, `current_task=<first>`,
+    // `completed_tasks=[]` regardless of whatever frontmatter the inbound
+    // state.md happens to carry. This closes the graph-visual-quality
+    // "fresh spec ships with task_status: complete" trap by making the
+    // ingest path authoritative for these three fields.
+    state.data.task_status = 'pending';
+    state.data.current_task = firstTaskId || 'T001';
+    state.data.completed_tasks = [];
+    state.data.blocked_reason = null;
+    writeState(forgeDir, state.data, state.content);
 
     // Clear progress history for fresh start
     try { fs.unlinkSync(path.join(forgeDir, '.progress-history.json')); } catch (e) {}
