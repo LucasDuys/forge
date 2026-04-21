@@ -125,12 +125,12 @@ const DEFAULT_CONFIG = {
       model: null
     }
   },
-  // T029 / R006: per-AC streaming DAG. Opt-in; default off. When enabled,
-  // downstream tasks dispatch provisionally the moment an upstream AC they
-  // declared as a dependency is met, with rollback on regression and
-  // bounded speculation.
+  // T029 / R006: per-AC streaming DAG. Default on. Downstream tasks dispatch
+  // provisionally the moment an upstream AC they declared as a dependency is
+  // met, with rollback on regression and bounded speculation. Set to false
+  // only if you need strict tier-by-tier serial execution (rare).
   streaming_dag: {
-    enabled: false,
+    enabled: true,
     max_provisional: 3,
     max_failures_before_fallback: 2
   }
@@ -7370,7 +7370,7 @@ module.exports = {
   get stopDevServer() { return require('./forge-dev-server.cjs').stopDevServer; },
   get probeSandbox() { return require('./forge-dev-server.cjs').probeSandbox; },
   // T029 / R006: streaming DAG re-exports. Canonical implementation lives
-  // in forge-streaming-dag.cjs. Opt-in via config.streaming_dag.enabled.
+  // in forge-streaming-dag.cjs. Default on via config.streaming_dag.enabled.
   get createStreamingScheduler() { return require('./forge-streaming-dag.cjs').createStreamingScheduler; },
   get computeWitnessHash() { return require('./forge-streaming-dag.cjs').computeWitnessHash; },
   get streamingDagToMermaid() { return require('./forge-streaming-dag.cjs').toMermaid; },

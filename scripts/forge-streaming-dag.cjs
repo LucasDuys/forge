@@ -40,7 +40,7 @@
 //     emitted_at: "2026-04-20T10:34:00Z"
 //   }
 //
-// Opt-in: `.forge/config.json` `streaming_dag.enabled: true`. Default false.
+// Default-on. Set `.forge/config.json` `streaming_dag.enabled: false` to disable.
 // When the flag is off the scheduler is never instantiated and existing
 // per-task dispatch (parseFrontier + tier planning) runs unchanged.
 
@@ -523,10 +523,12 @@ function _mermaidEscape(text) {
 // ---------- config helper ----------
 
 function isStreamingEnabled(config) {
-  if (!config || typeof config !== 'object') return false;
+  // Default-on: missing config, missing streaming_dag block, or missing
+  // `enabled` key all mean on. Only an explicit `enabled: false` turns it off.
+  if (!config || typeof config !== 'object') return true;
   const s = config.streaming_dag;
-  if (!s || typeof s !== 'object') return false;
-  return s.enabled === true;
+  if (!s || typeof s !== 'object') return true;
+  return s.enabled !== false;
 }
 
 module.exports = {

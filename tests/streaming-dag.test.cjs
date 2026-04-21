@@ -247,12 +247,12 @@ suite('forge-streaming-dag: back-compat (streaming off)', () => {
     assert.strictEqual(s.getSnapshot().status.T002, 'ready');
   });
 
-  test('isStreamingEnabled honors opt-in config flag (default off)', () => {
-    assert.strictEqual(dag.isStreamingEnabled({}), false);
-    assert.strictEqual(dag.isStreamingEnabled(null), false);
-    assert.strictEqual(dag.isStreamingEnabled({ streaming_dag: {} }), false);
-    assert.strictEqual(dag.isStreamingEnabled({ streaming_dag: { enabled: false } }), false);
-    assert.strictEqual(dag.isStreamingEnabled({ streaming_dag: { enabled: true } }), true);
+  test('isStreamingEnabled is default-on; only explicit false disables', () => {
+    assert.strictEqual(dag.isStreamingEnabled({}), true, 'empty config defaults on');
+    assert.strictEqual(dag.isStreamingEnabled(null), true, 'null config defaults on');
+    assert.strictEqual(dag.isStreamingEnabled({ streaming_dag: {} }), true, 'missing enabled key defaults on');
+    assert.strictEqual(dag.isStreamingEnabled({ streaming_dag: { enabled: false } }), false, 'explicit false disables');
+    assert.strictEqual(dag.isStreamingEnabled({ streaming_dag: { enabled: true } }), true, 'explicit true stays on');
   });
 });
 

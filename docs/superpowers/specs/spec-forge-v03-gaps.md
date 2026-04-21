@@ -95,7 +95,7 @@ Today's frontier is task-level (`depends: [T003]`). Downstream tasks block on fu
 - [ ] Rollback: if upstream transitions a previously-emitted AC from `verified` back to `failed`, every downstream task that consumed it is marked STALE, worktree preserved, re-queued.
 - [ ] Bounded speculation: scheduler caps at 3 provisional downstream tasks per upstream chain; after 2 verification failures on a chain, scheduler disables streaming for that spec and logs `streaming_disabled: <reason>`.
 - [ ] Visual rendering: `/forge:watch` renders the AC-granular DAG as a Mermaid flowchart with subgraphs per task, nodes per AC, edges by AC dependency, live status dots.
-- [ ] Opt-in via `.forge/config.json` `streaming_dag.enabled: true` (default false until proven stable).
+- [ ] Default on via `.forge/config.json` `streaming_dag.enabled: true`. Explicitly set `enabled: false` to fall back to strict tier-by-tier serial execution (rare).
 - [ ] Integration test using Spec C mock: 3 tasks with AC-level deps, provisional dispatch triggers, upstream regression causes rollback, final state converges.
 
 ### R007: Visual verification gate with Playwright MCP

@@ -91,7 +91,7 @@
     "fallback_jaccard": false
   },
   "streaming_dag": {
-    "enabled": false,
+    "enabled": true,
     "max_provisional": 3,
     "max_failures_before_fallback": 2
   }
