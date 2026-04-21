@@ -283,9 +283,23 @@ function _nowMs(opts) {
  *   list() -> lease[]
  *
  * A lease object is shaped { name, claimant, acquiredAt, expiresAt }.
+ *
+ * Also exposes the messaging surface (publish/subscribe/sendTargeted) so
+ * tests can exercise the same interface as the polling and ably backends.
+ * When two `createMemoryTransport` instances need to see each other's
+ * messages, pass the same `opts.bus` object (created via `createMemoryBus()`)
+ * to both. Each instance keeps its own `clientId` and filters subscription
+ * callbacks by the envelope `target` field per R004.
  */
-function createMemoryTransport() {
+function createMemoryBus() {
+  return { subs: [] }; // flat list of { event, cb, clientId }
+}
+
+function createMemoryTransport(opts) {
+  opts = opts || {};
   const store = new Map();
+  const bus = opts.bus || createMemoryBus();
+  const factoryClientId = opts.clientId || 'unknown';
   function read(name) {
     return store.has(name) ? Object.assign({}, store.get(name)) : null;
   }
@@ -314,7 +328,43 @@ function createMemoryTransport() {
   function list() {
     return Array.from(store.values()).map(v => Object.assign({}, v));
   }
-  return { read, cas, del, list };
+  async function publish(event, data) {
+    const envelope = { event, data: data || {}, from: factoryClientId };
+    // Deliver synchronously to every subscriber whose filter matches.
+    // Transport-layer filter (R004): when data.target is set and the
+    // subscriber's clientId differs, cb is never invoked.
+    const snapshot = bus.subs.slice();
+    for (const s of snapshot) {
+      if (s.event !== event) continue;
+      if (!_targetAllowsDelivery(envelope.data, s.clientId)) continue;
+      try { s.cb(envelope); } catch (_) {}
+    }
+  }
+  function subscribe(event, cb, subOpts) {
+    subOpts = subOpts || {};
+    const clientId = subOpts.clientId || factoryClientId;
+    bus.subs.push({ event, cb, clientId });
+  }
+  async function sendTargeted(handle, event, data) {
+    await publish(event, Object.assign({ target: handle }, data || {}));
+  }
+  return {
+    read, cas, del, list,
+    publish, subscribe, sendTargeted,
+    _internal: { get bus() { return bus; } }
+  };
+}
+
+/**
+ * R004 transport-layer scoping predicate. Broadcast messages (target
+ * undefined/null) are delivered to every subscriber. Targeted messages are
+ * only delivered to the subscriber whose clientId matches `data.target`.
+ * Non-target subscribers must see zero invocations of their cb per spec
+ * R015 + R004 ACs.
+ */
+function _targetAllowsDelivery(data, subscriberClientId) {
+  if (!data || data.target === undefined || data.target === null) return true;
+  return data.target === subscriberClientId;
 }
 
 function _isExpired(lease, now) {
@@ -548,9 +598,17 @@ function createAblyTransport(opts) {
     await channel.publish(event, data);
   }
 
-  function subscribe(event, cb) {
+  function subscribe(event, cb, subOpts) {
     if (!connected) throw new Error('ably transport not connected');
-    channel.subscribe(event, (msg) => cb({ event: msg.name, data: msg.data, from: msg.clientId }));
+    subOpts = subOpts || {};
+    const scopedClientId = subOpts.clientId || clientId;
+    channel.subscribe(event, (msg) => {
+      // R004: transport-layer target filter. If the envelope carries a
+      // `target` that is not this subscriber's clientId, drop the message
+      // before invoking the callback.
+      if (!_targetAllowsDelivery(msg.data, scopedClientId)) return;
+      cb({ event: msg.name, data: msg.data, from: msg.clientId });
+    });
   }
 
   async function sendTargeted(handle, event, data) {
@@ -662,8 +720,13 @@ function createPollingTransport(opts) {
       seenIds.add(m.id);
       pendingMessages.push(m);
       const subs = subscribers.get(m.event) || [];
-      for (const cb of subs) {
-        try { cb({ event: m.event, data: m.data, from: m.from }); } catch (_) {}
+      for (const s of subs) {
+        // R004: transport-layer target filter. If the envelope carries a
+        // `target` field that is not this subscriber's clientId, the
+        // callback is never invoked. Broadcast messages (no target) fire
+        // on every subscriber.
+        if (!_targetAllowsDelivery(m.data, s.clientId)) continue;
+        try { s.cb({ event: m.event, data: m.data, from: m.from }); } catch (_) {}
       }
     }
   }
@@ -679,9 +742,14 @@ function createPollingTransport(opts) {
     await io.appendMessage(branch, msg);
   }
 
-  function subscribe(event, cb) {
+  function subscribe(event, cb, subOpts) {
+    subOpts = subOpts || {};
+    // R004: resolve the clientId the transport should use for target
+    // filtering. Per-call opts.clientId wins over the factory clientId so
+    // a single process can multiplex distinct logical clients during tests.
+    const scopedClientId = subOpts.clientId || opts.clientId || 'unknown';
     const arr = subscribers.get(event) || [];
-    arr.push(cb);
+    arr.push({ cb, clientId: scopedClientId });
     subscribers.set(event, arr);
   }
 
@@ -1084,7 +1152,7 @@ function createTransport(opts) {
   if (mode === 'setup-required') {
     return { mode, guide: renderSetupGuide() };
   }
-  if (mode === 'memory') return Object.assign(createMemoryTransport(), { mode: 'memory' });
+  if (mode === 'memory') return Object.assign(createMemoryTransport(opts), { mode: 'memory' });
   if (mode === 'ably') return createAblyTransport(opts);
   if (mode === 'polling') return createPollingTransport(opts);
   throw new Error('unknown transport mode: ' + mode);
@@ -2311,6 +2379,7 @@ module.exports = {
   DEFAULT_HEARTBEAT_SECONDS,
   DEFAULT_CONSOLIDATION_TTL_SECONDS,
   createMemoryTransport,
+  createMemoryBus,
   tryAcquireLease,
   refreshLease,
   releaseLease,
@@ -2373,6 +2442,7 @@ module.exports = {
     _inputsPath, _consolidatedPath, _categoriesPath, _questionsDir,
     _defaultPollingIo,
     _validateStateShape,
+    _targetAllowsDelivery,
     MESSAGE_QUEUE_CAP,
     SCHEMA_PATH
   }

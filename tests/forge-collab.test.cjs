@@ -660,7 +660,10 @@ suite('polling transport (R013, R015)', () => {
     await tA.disconnect(); await tB.disconnect();
   });
 
-  test('sendTargeted addresses a specific handle via target field (R015)', async () => {
+  test('sendTargeted addresses a specific handle via target field (R015, R004)', async () => {
+    // R004: transport-layer target filter. Subscriber callbacks get no
+    // application-layer `if (m.data.target === handle)` guard — the
+    // transport drops non-matching messages before invoking cb.
     const io = _stubIo();
     const tA = createPollingTransport({ ioAdapter: io, clientId: 'alice', intervalMs: 60_000 });
     const tDaniel = createPollingTransport({ ioAdapter: io, clientId: 'daniel', intervalMs: 60_000 });
@@ -668,13 +671,14 @@ suite('polling transport (R013, R015)', () => {
     await tA.connect(); await tDaniel.connect(); await tLucas.connect();
     const danMsgs = [];
     const lucMsgs = [];
-    tDaniel.subscribe('flag-ping', m => { if (m.data.target === 'daniel') danMsgs.push(m); });
-    tLucas.subscribe('flag-ping',  m => { if (m.data.target === 'lucas')  lucMsgs.push(m); });
+    tDaniel.subscribe('flag-ping', m => danMsgs.push(m));
+    tLucas.subscribe('flag-ping',  m => lucMsgs.push(m));
     await tA.sendTargeted('daniel', 'flag-ping', { flag: 'F001' });
     await tDaniel._internal._refresh();
     await tLucas._internal._refresh();
     assert.strictEqual(danMsgs.length, 1);
-    assert.strictEqual(lucMsgs.length, 0, 'non-target must receive zero messages per R015 AC');
+    assert.strictEqual(danMsgs[0].data.target, 'daniel');
+    assert.strictEqual(lucMsgs.length, 0, 'non-target must receive zero messages per R015 + R004 AC');
     await tA.disconnect(); await tDaniel.disconnect(); await tLucas.disconnect();
   });
 
