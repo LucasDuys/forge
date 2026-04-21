@@ -5061,6 +5061,34 @@ function checkCompletionGates(forgeDir, opts) {
   return { complete, gates, reasons };
 }
 
+/**
+ * Build the wire form of the completion promise, gated on the four
+ * completion gates (T017 / R009 AC2).
+ *
+ * When gates pass: returns `<promise>FORGE_COMPLETE</promise>\n`.
+ * When any gate fails: returns
+ *   `<promise>FORGE_BLOCKED</promise>\n{"reasons":[...]}\n`
+ * with the reasons JSON inlined on the next line so humans and tooling
+ * can discriminate why the loop did not complete without re-running the
+ * check. `opts` is forwarded to `checkCompletionGates`.
+ *
+ * Return shape:
+ *   { emission: string, result: { complete, gates, reasons } }
+ * so callers can both write the wire form and inspect the underlying
+ * gate state in a single call.
+ */
+function emitCompletionPromise(forgeDir, opts) {
+  const result = checkCompletionGates(forgeDir, opts || {});
+  let emission;
+  if (result.complete) {
+    emission = '<promise>FORGE_COMPLETE</promise>\n';
+  } else {
+    emission = '<promise>FORGE_BLOCKED</promise>\n'
+      + JSON.stringify({ reasons: result.reasons }) + '\n';
+  }
+  return { emission, result };
+}
+
 // === CLI Entry Point ===
 
 if (require.main === module) {
@@ -5696,8 +5724,9 @@ if (require.main === module) {
   // === T017 / R009 — completion-check ===
   // Emits the JSON result of checkCompletionGates so callers (stop hook,
   // review-branch, TUI, humans) can decide whether FORGE_COMPLETE is
-  // legitimate. Exit code: 0 when complete === true, 1 when false.
-  // Errors parsing the forge dir exit with code 2 so callers can
+  // legitimate. Exit code: 0 when complete === true, 3 when false (gates
+  // failed — distinguished from generic errors so wrappers can branch on
+  // it). Errors parsing the forge dir exit with code 2 so callers can
   // discriminate "gates failed" from "check itself failed".
   if (command === 'completion-check') {
     const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
@@ -5709,9 +5738,34 @@ if (require.main === module) {
         collabDir, gatesFile, requireTaskRegistry
       });
       process.stdout.write(JSON.stringify(result) + '\n');
-      process.exit(result.complete ? 0 : 1);
+      process.exit(result.complete ? 0 : 3);
     } catch (e) {
       process.stderr.write('completion-check failed: ' + e.message + '\n');
+      process.exit(2);
+    }
+  }
+
+  // === T017 / R009 — completion-emit ===
+  // Emits the gated wire form of the completion promise:
+  //   - `<promise>FORGE_COMPLETE</promise>` when all four gates pass
+  //   - `<promise>FORGE_BLOCKED</promise>` + inline `{reasons:[...]}`
+  //     JSON on the next line when any gate fails
+  // Used by the stop hook to override a bare FORGE_COMPLETE emission
+  // from the agent when gates have regressed. Exit code mirrors
+  // completion-check: 0 on complete, 3 on blocked, 2 on internal error.
+  if (command === 'completion-emit') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const collabDir = args.find((a, i) => args[i - 1] === '--collab-dir') || null;
+    const gatesFile = args.find((a, i) => args[i - 1] === '--gates-file') || null;
+    const requireTaskRegistry = !args.includes('--allow-empty-registry');
+    try {
+      const { emission, result } = emitCompletionPromise(forgeDir, {
+        collabDir, gatesFile, requireTaskRegistry
+      });
+      process.stdout.write(emission);
+      process.exit(result.complete ? 0 : 3);
+    } catch (e) {
+      process.stderr.write('completion-emit failed: ' + e.message + '\n');
       process.exit(2);
     }
   }
@@ -6727,6 +6781,7 @@ module.exports = {
   appendTranscript, readTranscript,
   // T017 / R009: completion-promise gates (tasks + visual + non-visual + flags).
   checkCompletionGates,
+  emitCompletionPromise,
   // T014 / R005: research aggregator re-exports for convenience.
   // The canonical implementation lives in forge-research-aggregator.cjs.
   get appendResearchSection() { return require('./forge-research-aggregator.cjs').appendResearchSection; },
