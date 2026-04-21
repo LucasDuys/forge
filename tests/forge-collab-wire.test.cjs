@@ -184,7 +184,10 @@ function out(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
       rationale: 'already in our stack',
       source_contributors: ['sarah'],
       participants,
-      transport
+      transport,
+      // spec-collab-fix R007: Jaccard is opt-in. This wire test relies on
+      // the heuristic for deterministic routing without a live LLM.
+      fallback_jaccard: true
     });
 
     // Let the flag's sendTargeted write-through settle on origin too.

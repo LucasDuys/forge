@@ -152,12 +152,21 @@ function keywordScorer(keyword) {
 
 suite('scoreParticipant -- shape', () => {
   test('returns a number in [0, 1]', () => {
-    const s = scoreParticipant('hello world', { handle: 'a', contributions: 'hello there world' });
+    // Jaccard is now explicit opt-in (spec-collab-fix R007); legacy test
+    // migrated to pass fallback_jaccard:true to keep asserting the
+    // heuristic's shape contract.
+    const s = scoreParticipant(
+      'hello world',
+      { handle: 'a', contributions: 'hello there world' },
+      { fallback_jaccard: true }
+    );
     assert.ok(typeof s === 'number');
     assert.ok(s >= 0 && s <= 1, `expected [0,1], got ${s}`);
   });
 
   test('zero contribution participant scores exactly 0', () => {
+    // Contribution shortcut fires before scorer resolution, so these
+    // continue to return 0 without a scorer wired.
     const s = scoreParticipant('anything', { handle: 'a', contributions: '' });
     assert.strictEqual(s, 0);
     const s2 = scoreParticipant('anything', { handle: 'a', contributions: '   ' });
@@ -178,12 +187,18 @@ suite('scoreParticipant -- shape', () => {
 
 suite('routeToParticipant -- similarity', () => {
   test('three mock participants -- clearly relevant one wins', () => {
+    // Legacy test: spec-collab-fix R007 flipped Jaccard to opt-in, so
+    // pass fallback_jaccard:true to keep this as a Jaccard shape check.
     const participants = [
       { handle: 'alice', contributions: 'redis cache invalidation ttl pub sub', active_tasks: 0 },
       { handle: 'bob',   contributions: 'react frontend css tailwind design', active_tasks: 0 },
       { handle: 'carol', contributions: 'payments stripe webhook retries', active_tasks: 0 }
     ];
-    const winner = routeToParticipant('cache invalidation strategy for redis', participants);
+    const winner = routeToParticipant(
+      'cache invalidation strategy for redis',
+      participants,
+      { fallback_jaccard: true }
+    );
     assert.strictEqual(winner, 'alice');
   });
 });
@@ -1023,7 +1038,7 @@ suite('routeClarifyingQuestion (R015)', () => {
       text: 'which cache eviction policy should we use?',
       topic: 'cache',
       source_section: 'Topic 1'
-    });
+    }, { fallback_jaccard: true });
     assert.ok(fs.existsSync(r.path));
     assert.strictEqual(r.routed_to, 'daniel');
     const raw = fs.readFileSync(r.path, 'utf8');
@@ -1381,7 +1396,8 @@ suite('writeForwardMotionFlag -- targeted notification (R015)', () => {
       rationale: 'cache invalidation strategy',
       source_contributors: ['daniel'],
       participants,
-      transport
+      transport,
+      fallback_jaccard: true // legacy test; R007 flipped Jaccard to opt-in
     });
     assert.strictEqual(r.written, true);
     assert.strictEqual(r.notified.mode, 'targeted');

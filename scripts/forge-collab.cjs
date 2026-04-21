@@ -160,6 +160,96 @@ function _readEpsilonFromConfig(forgeDir) {
   return null;
 }
 
+/**
+ * Read the configured scorer module path from `.forge/config.json` at
+ * `collab.scorer` (a shell-style command string like
+ * "node scripts/forge-collab-scorer.cjs"). Returns the resolved absolute
+ * script path and the default export function when it loads, or null when
+ * the config key is missing or the module cannot be required.
+ *
+ * Spec-collab-fix R007 AC 1/2.
+ */
+function _readScorerFromConfig(forgeDir) {
+  try {
+    if (!forgeDir) return null;
+    const p = path.join(forgeDir, 'config.json');
+    if (!fs.existsSync(p)) return null;
+    const raw = fs.readFileSync(p, 'utf8');
+    const cfg = JSON.parse(raw);
+    const spec = cfg && cfg.collab && cfg.collab.scorer;
+    if (typeof spec !== 'string' || spec.trim() === '') return null;
+    // Accept "node path/to/file.cjs" or a bare path; pull the last whitespace
+    // token and resolve it relative to the project root (parent of forgeDir).
+    const parts = spec.trim().split(/\s+/);
+    const rel = parts[parts.length - 1];
+    const projectRoot = path.dirname(path.resolve(forgeDir));
+    const abs = path.isAbsolute(rel) ? rel : path.join(projectRoot, rel);
+    const mod = require(abs);
+    if (typeof mod === 'function') return mod;
+    if (mod && typeof mod.llmScorer === 'function') return mod.llmScorer;
+    if (mod && typeof mod.default === 'function') return mod.default;
+    return null;
+  } catch (_) { /* fall through to null -- caller decides whether this is fatal */ }
+  return null;
+}
+
+/**
+ * Read the explicit Jaccard-fallback opt-in flag from `.forge/config.json`
+ * at `collab.fallback_jaccard`. Returns boolean or null when unset.
+ *
+ * Spec-collab-fix R007 AC 4.
+ */
+function _readFallbackJaccardFromConfig(forgeDir) {
+  try {
+    if (!forgeDir) return null;
+    const p = path.join(forgeDir, 'config.json');
+    if (!fs.existsSync(p)) return null;
+    const raw = fs.readFileSync(p, 'utf8');
+    const cfg = JSON.parse(raw);
+    const v = cfg && cfg.collab && cfg.collab.fallback_jaccard;
+    if (typeof v === 'boolean') return v;
+  } catch (_) { /* fall through to null */ }
+  return null;
+}
+
+/**
+ * Resolve which scorer to use given the layered options. Precedence:
+ *   1. opts.scorer (function) -- explicit injection wins
+ *   2. collab.scorer in .forge/config.json (when forgeDir provided)
+ *   3. Jaccard heuristic, ONLY when opts.fallback_jaccard === true or
+ *      collab.fallback_jaccard === true in config
+ *
+ * Returns { scorer, source } on success or { error } when nothing is wired
+ * and Jaccard fallback is not explicitly enabled. Callers surface `error`
+ * via a thrown Error so misrouting can never happen silently
+ * (spec-collab-fix R007 AC 1).
+ */
+function _resolveScorer(opts) {
+  opts = opts || {};
+  if (typeof opts.scorer === 'function') {
+    return { scorer: opts.scorer, source: 'opts.scorer' };
+  }
+  if (opts.forgeDir) {
+    const fromCfg = _readScorerFromConfig(opts.forgeDir);
+    if (typeof fromCfg === 'function') {
+      return { scorer: fromCfg, source: 'config.collab.scorer' };
+    }
+  }
+  // Explicit Jaccard fallback: opts wins, then config, then no.
+  let fallback = null;
+  if (typeof opts.fallback_jaccard === 'boolean') {
+    fallback = opts.fallback_jaccard;
+  } else if (opts.forgeDir) {
+    fallback = _readFallbackJaccardFromConfig(opts.forgeDir);
+  }
+  if (fallback === true) {
+    return { scorer: _heuristicScorer, source: 'fallback_jaccard' };
+  }
+  return {
+    error: 'forge:collab routing requires a scorer; set collab.scorer in .forge/config.json or pass opts.scorer'
+  };
+}
+
 function _tokenSet(text) {
   if (text == null) return new Set();
   return new Set(
@@ -190,25 +280,58 @@ function _heuristicScorer(targetText, contributions) {
 }
 
 /**
+ * Clamp raw scorer output to [0, 1]. Non-numbers and NaN collapse to 0.
+ * Extracted so both sync and async code paths apply identical shaping.
+ */
+function _clampScore(raw) {
+  if (typeof raw !== 'number' || Number.isNaN(raw)) return 0;
+  if (raw < 0) return 0;
+  if (raw > 1) return 1;
+  return raw;
+}
+
+/**
  * Score a single participant's relevance to `targetText`.
  *
- * Returns a number in [0, 1]. Participants with no contributions score
+ * Returns a number in [0, 1], OR a Promise<number> when the resolved scorer
+ * is async (e.g., LLM-backed). Participants with no contributions score
  * exactly 0 per spec-collab R005 AC. Unrecognized or non-numeric scorer
- * output also clamps to 0.
+ * output clamps to 0.
  *
- * opts.scorer: (targetText, contributions, participant) => number in [0,1]
- *              Inject to swap the default Jaccard heuristic for an LLM call.
+ * Scorer resolution (spec-collab-fix R007):
+ *   1. opts.scorer if provided
+ *   2. config.collab.scorer (via opts.forgeDir)
+ *   3. Jaccard heuristic ONLY when opts.fallback_jaccard === true or
+ *      config.collab.fallback_jaccard === true
+ *   4. Otherwise throws with a clear error
+ *
+ * opts.scorer: (targetText, contributions, participant) => number | Promise<number>
  */
 function scoreParticipant(targetText, participant, opts) {
   opts = opts || {};
   const contrib = (participant && participant.contributions) || '';
   if (!contrib || !String(contrib).trim()) return 0;
-  const scorer = typeof opts.scorer === 'function' ? opts.scorer : _heuristicScorer;
-  const raw = scorer(targetText, contrib, participant);
-  if (typeof raw !== 'number' || Number.isNaN(raw)) return 0;
-  if (raw < 0) return 0;
-  if (raw > 1) return 1;
-  return raw;
+
+  const resolved = _resolveScorer(opts);
+  if (resolved.error) throw new Error(resolved.error);
+  const scorer = resolved.scorer;
+
+  let raw;
+  try {
+    raw = scorer(targetText, contrib, participant);
+  } catch (err) {
+    // Surface errors rather than silently misroute. AC: scorer errors
+    // propagate with clear messages, not a silent 0.
+    throw new Error('forge:collab scorer threw: ' + (err && err.message ? err.message : String(err)));
+  }
+
+  // Async scorer -- return a promise that clamps and rethrows.
+  if (raw && typeof raw.then === 'function') {
+    return raw.then(_clampScore, err => {
+      throw new Error('forge:collab scorer rejected: ' + (err && err.message ? err.message : String(err)));
+    });
+  }
+  return _clampScore(raw);
 }
 
 /**
@@ -219,8 +342,14 @@ function scoreParticipant(targetText, participant, opts) {
  * combined scores tie within epsilon (default 0.05, overridable via opts or
  * via `collab.route.epsilon` in `.forge/config.json`).
  *
+ * Returns Promise<string> when any resolved scorer is async; returns a
+ * plain string for sync scorers (backward-compat per T027 task note).
+ *
  * Participants are expected to shape as { handle, contributions, active_tasks? }.
  * Deterministic tiebreak on handle string order avoids per-run drift.
+ *
+ * Throws when no scorer is wired and fallback_jaccard is not enabled
+ * (spec-collab-fix R007 AC 1).
  */
 function routeToParticipant(targetText, participants, opts) {
   opts = opts || {};
@@ -234,25 +363,47 @@ function routeToParticipant(targetText, participants, opts) {
     if (fromCfg !== null) epsilon = fromCfg;
   }
 
+  // Resolve the scorer once so all participants score through the same
+  // function and any "no scorer wired" error throws before we kick off
+  // per-participant work.
+  const resolved = _resolveScorer(opts);
+  if (resolved.error) throw new Error(resolved.error);
+
+  // Score every participant. scoreParticipant will reuse the same
+  // resolution logic internally; passing opts unchanged keeps semantics
+  // aligned when a user invokes scoreParticipant directly.
   const scored = participants.map(p => {
     const sim = scoreParticipant(targetText, p, opts);
     const active = Number(p && p.active_tasks) || 0;
     const loadPenalty = 1 / (1 + active);
-    return { handle: p.handle, combined: sim * loadPenalty, sim };
+    return { handle: p.handle, sim, active, loadPenalty };
   });
 
-  scored.sort((a, b) => {
-    if (b.combined !== a.combined) return b.combined - a.combined;
-    if (a.handle < b.handle) return -1;
-    if (a.handle > b.handle) return 1;
-    return 0;
-  });
+  const anyAsync = scored.some(s => s.sim && typeof s.sim.then === 'function');
 
-  const top = scored[0];
-  if (!top || top.combined === 0) return 'broadcast';
-  const second = scored[1];
-  if (second && (top.combined - second.combined) <= epsilon) return 'broadcast';
-  return top.handle;
+  function finalize(resolvedSims) {
+    const rows = resolvedSims.map((sim, i) => ({
+      handle: scored[i].handle,
+      combined: sim * scored[i].loadPenalty,
+      sim
+    }));
+    rows.sort((a, b) => {
+      if (b.combined !== a.combined) return b.combined - a.combined;
+      if (a.handle < b.handle) return -1;
+      if (a.handle > b.handle) return 1;
+      return 0;
+    });
+    const top = rows[0];
+    if (!top || top.combined === 0) return 'broadcast';
+    const second = rows[1];
+    if (second && (top.combined - second.combined) <= epsilon) return 'broadcast';
+    return top.handle;
+  }
+
+  if (anyAsync) {
+    return Promise.all(scored.map(s => Promise.resolve(s.sim))).then(finalize);
+  }
+  return finalize(scored.map(s => s.sim));
 }
 
 // ======================================================================
@@ -1660,7 +1811,9 @@ async function routeClarifyingQuestion(transport, collabDir, participants, quest
   fs.mkdirSync(qDir, { recursive: true });
   const id = opts.id || generateFlagId();
   const qPath = path.join(qDir, id + '.md');
-  const target = routeToParticipant(
+  // routeToParticipant may return a Promise when the resolved scorer is
+  // async (e.g., the LLM default); `await` handles both cases.
+  const target = await routeToParticipant(
     String(question.text || '') + '\n' + String(question.source_section || ''),
     participants,
     opts
@@ -2078,7 +2231,9 @@ async function writeForwardMotionFlag(opts) {
       !opts.source_contributors || (opts.source_contributors || []).includes(p.handle)
     );
     const pool = candidates.length > 0 ? candidates : opts.participants;
-    const target = routeToParticipant(
+    // routeToParticipant may return a Promise when the resolved scorer is
+    // async (e.g., the LLM default); `await` handles both cases.
+    const target = await routeToParticipant(
       String(flag.decision) + '\n' + String(flag.rationale || ''),
       pool,
       opts
@@ -2637,6 +2792,8 @@ module.exports = {
   // Exposed for tests and future-task extension points:
   _internal: {
     readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,
+    _readScorerFromConfig, _readFallbackJaccardFromConfig, _resolveScorer,
+    _clampScore,
     _isExpired, _claimName, _safeHandle, _safeKind,
     _parseFrontmatter, _extractSections, _defaultClassifier, _defaultContradictionDetector,
     _inputsPath, _consolidatedPath, _categoriesPath, _questionsDir,

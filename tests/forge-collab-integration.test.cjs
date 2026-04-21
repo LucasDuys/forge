@@ -80,7 +80,8 @@ suite('T013 integration -- full brainstorm -> consolidate -> claim -> execute lo
     };
     const q = await collab.routeClarifyingQuestion(
       realtimeTransport, collabDir, participants,
-      { text: 'which cache eviction policy?', topic: 'cache', source_section: 'redis topic' }
+      { text: 'which cache eviction policy?', topic: 'cache', source_section: 'redis topic' },
+      { fallback_jaccard: true } // spec-collab-fix R007: Jaccard is opt-in
     );
     assert.strictEqual(q.routed_to, 'daniel', 'cache question should route to daniel');
     assert.strictEqual(sent.filter(s => s.handle === 'lucas').length, 0, 'lucas must not receive a non-target ping (R015)');
@@ -106,7 +107,8 @@ suite('T013 integration -- full brainstorm -> consolidate -> claim -> execute lo
       phase: 'executing', collabDir, task_id: 'C001', author: 'daniel',
       decision: 'use redis pubsub', alternatives: ['nats'],
       rationale: 'already in stack', source_contributors: ['daniel'],
-      participants, transport: realtimeTransport
+      participants, transport: realtimeTransport,
+      fallback_jaccard: true // spec-collab-fix R007: Jaccard is opt-in
     });
     assert.strictEqual(flag.written, true);
     assert.strictEqual(flag.notified.mode, 'targeted');
@@ -240,7 +242,8 @@ suite('T013 integration -- R015 scoped routing never leaks to non-targets', () =
     await collab.writeForwardMotionFlag({
       phase: 'executing', collabDir, task_id: 'T1', author: 'bot',
       decision: 'redis pubsub', alternatives: [], rationale: 'cache',
-      source_contributors: ['daniel'], participants, transport
+      source_contributors: ['daniel'], participants, transport,
+      fallback_jaccard: true // spec-collab-fix R007: Jaccard is opt-in
     });
     assert.strictEqual(received.daniel, 1);
     assert.strictEqual(received.lucas, 0);

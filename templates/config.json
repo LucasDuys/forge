@@ -85,5 +85,9 @@
       "debug_attempts_before_rescue": 2,
       "model": null
     }
+  },
+  "collab": {
+    "scorer": "node scripts/forge-collab-scorer.cjs",
+    "fallback_jaccard": false
   }
 }
