@@ -89,5 +89,10 @@
   "collab": {
     "scorer": "node scripts/forge-collab-scorer.cjs",
     "fallback_jaccard": false
+  },
+  "streaming_dag": {
+    "enabled": false,
+    "max_provisional": 3,
+    "max_failures_before_fallback": 2
   }
 }

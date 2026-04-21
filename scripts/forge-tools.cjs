@@ -124,6 +124,15 @@ const DEFAULT_CONFIG = {
       debug_attempts_before_rescue: 2,
       model: null
     }
+  },
+  // T029 / R006: per-AC streaming DAG. Opt-in; default off. When enabled,
+  // downstream tasks dispatch provisionally the moment an upstream AC they
+  // declared as a dependency is met, with rollback on regression and
+  // bounded speculation.
+  streaming_dag: {
+    enabled: false,
+    max_provisional: 3,
+    max_failures_before_fallback: 2
   }
 };
 
@@ -1723,7 +1732,11 @@ function parseFrontier(text) {
       const repoMatch = rest.match(/repo:\s*(\S+)/);
       const dependsMatch = rest.match(/depends:\s*([A-Z0-9.,\s]+?)(?:\s*\||$)/);
       const estMatch = rest.match(/est:\s*~?(\d+)k/);
-      const providesMatch = rest.match(/provides:\s*([a-z0-9_,\s-]+?)(?:\s*\||$)/);
+      // T029 (R006): `provides` now accepts AC-level tokens like `R002.AC1`
+      // in addition to the legacy lowercase coarse tokens (`register_endpoint`).
+      // Character class is expanded to allow uppercase + `.` while remaining
+      // back-compatible with every existing frontier.
+      const providesMatch = rest.match(/provides:\s*([A-Za-z0-9_.,\s-]+?)(?:\s*\||$)/);
       const consumesMatch = rest.match(/consumes:\s*([a-z0-9_,\s-]+?)(?:\s*\||$)/);
       // T015 (R005): files: path/a.ts, path/b.ts -- declared overlap surface for conflict detection.
       // Accepts both `files:` and `filesTouched:` for forwards compatibility.
@@ -6229,6 +6242,108 @@ if (require.main === module) {
       process.exit(2);
     }
   }
+
+  // ac-met (T029 / R006) — executor agents emit AC events as they pass
+  // each acceptance criterion. The CLI appends one JSONL line to
+  // `.forge/streaming/events.jsonl`; the dispatcher replays events on its
+  // next tick to advance the streaming scheduler. If `streaming_dag.enabled`
+  // is false in config, the emission still records (harmless) so enabling
+  // the feature later does not lose history.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs ac-met \
+  //     --task T013 --ac R002.AC1 \
+  //     --witness-hash sha256:abc... \
+  //     [--witness-paths src/a.ts,src/b.ts] \
+  //     [--forge-dir .forge]
+  //
+  // Exit codes: 0 on success, 2 on invalid args.
+  if (command === 'ac-met' || command === 'ac-verify' || command === 'ac-regress') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const taskId = args.find((a, i) => args[i - 1] === '--task');
+    const acId = args.find((a, i) => args[i - 1] === '--ac');
+    const witnessHash = args.find((a, i) => args[i - 1] === '--witness-hash') || null;
+    const witnessPathsRaw = args.find((a, i) => args[i - 1] === '--witness-paths') || '';
+    const witnessPaths = witnessPathsRaw
+      ? witnessPathsRaw.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
+    if (!taskId) {
+      process.stderr.write(command + ': --task is required\n');
+      process.exit(2);
+    }
+    // ac-verify may be emitted with no --ac when the whole task verifies.
+    if (command !== 'ac-verify' && !acId) {
+      process.stderr.write(command + ': --ac is required\n');
+      process.exit(2);
+    }
+    const kind = command === 'ac-met' ? 'ac_met'
+      : command === 'ac-verify' ? 'task_verified'
+      : 'ac_regression';
+    const evt = {
+      kind,
+      task_id: taskId,
+      ac_id: acId || null,
+      witness_hash: witnessHash,
+      witness_paths: witnessPaths,
+      emitted_at: new Date().toISOString()
+    };
+    try {
+      const dir = path.join(forgeDir, 'streaming');
+      fs.mkdirSync(dir, { recursive: true });
+      const eventsPath = path.join(dir, 'events.jsonl');
+      fs.appendFileSync(eventsPath, JSON.stringify(evt) + '\n');
+      process.stdout.write(JSON.stringify({ recorded: true, kind, task_id: taskId, ac_id: acId || null, path: eventsPath }) + '\n');
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write(command + ' failed: ' + e.message + '\n');
+      process.exit(1);
+    }
+  }
+
+  // streaming-mermaid (T029 / R006) — render the current AC-DAG as a
+  // Mermaid flowchart for `/forge:watch`. Reads the frontier + the event
+  // log, instantiates a scheduler, replays events, and prints mermaid.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs streaming-mermaid --frontier <path> [--forge-dir .forge]
+  if (command === 'streaming-mermaid') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const frontierPath = args.find((a, i) => args[i - 1] === '--frontier');
+    if (!frontierPath) {
+      process.stderr.write('streaming-mermaid: --frontier is required\n');
+      process.exit(2);
+    }
+    try {
+      const frontierText = fs.readFileSync(frontierPath, 'utf8');
+      const tasks = parseFrontier(frontierText);
+      const dag = require('./forge-streaming-dag.cjs');
+      const scheduler = dag.createStreamingScheduler({ frontier: tasks });
+      // Replay events.
+      const eventsPath = path.join(forgeDir, 'streaming', 'events.jsonl');
+      if (fs.existsSync(eventsPath)) {
+        const lines = fs.readFileSync(eventsPath, 'utf8').split('\n').filter(Boolean);
+        for (const line of lines) {
+          let e; try { e = JSON.parse(line); } catch (_) { continue; }
+          if (e.kind === 'ac_met') {
+            scheduler.emitAcMet({
+              taskId: e.task_id, acId: e.ac_id,
+              witnessHash: e.witness_hash, witnessPaths: e.witness_paths,
+              emittedAt: e.emitted_at
+            });
+          } else if (e.kind === 'task_verified') {
+            scheduler.emitTaskVerified({ taskId: e.task_id });
+          } else if (e.kind === 'ac_regression') {
+            scheduler.emitAcRegression({ taskId: e.task_id, acId: e.ac_id });
+          }
+        }
+      }
+      process.stdout.write(dag.toMermaid(scheduler) + '\n');
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write('streaming-mermaid failed: ' + e.message + '\n');
+      process.exit(1);
+    }
+  }
 }
 
 function padRight(str, len) {
@@ -7253,5 +7368,12 @@ module.exports = {
   // lives in forge-dev-server.cjs.
   get startDevServer() { return require('./forge-dev-server.cjs').startDevServer; },
   get stopDevServer() { return require('./forge-dev-server.cjs').stopDevServer; },
-  get probeSandbox() { return require('./forge-dev-server.cjs').probeSandbox; }
+  get probeSandbox() { return require('./forge-dev-server.cjs').probeSandbox; },
+  // T029 / R006: streaming DAG re-exports. Canonical implementation lives
+  // in forge-streaming-dag.cjs. Opt-in via config.streaming_dag.enabled.
+  get createStreamingScheduler() { return require('./forge-streaming-dag.cjs').createStreamingScheduler; },
+  get computeWitnessHash() { return require('./forge-streaming-dag.cjs').computeWitnessHash; },
+  get streamingDagToMermaid() { return require('./forge-streaming-dag.cjs').toMermaid; },
+  get isStreamingDagEnabled() { return require('./forge-streaming-dag.cjs').isStreamingEnabled; },
+  get classifyAcDeps() { return require('./forge-streaming-dag.cjs').classifyDeps; }
 };

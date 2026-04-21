@@ -392,6 +392,50 @@ require('./scripts/forge-tools.cjs').appendTranscript('.forge', cycleId, {
 
 Keep `summary` short (≤ 120 chars) and caveman-internal-friendly; it is agent-internal scratch, not user-facing prose.
 
+### 5.7 AC Event Emission (T029 / R006 — streaming DAG, opt-in)
+
+When `.forge/config.json` has `streaming_dag.enabled: true`, the scheduler dispatches downstream tasks the instant an upstream acceptance criterion they declared as a dependency is met. This requires the executor to emit a per-AC event as each criterion passes, not only at task completion.
+
+You only need to emit these events when the streaming DAG is active. Check the flag once at task start. If it is off, skip this section and use the normal task-level transcript entry described in 5.6.
+
+For every acceptance criterion (`R<num>.AC<num>`) that you pass — as soon as you pass it, not at the end:
+
+1. Identify the `witness_paths`: the file(s) whose current contents are evidence the AC is satisfied. Usually this is the file the AC required you to create or modify plus any test file that now passes because of that change. Keep the list tight (the fewer paths the better; extra paths produce noisier witness hashes that look like regressions on unrelated edits).
+
+2. Compute a witness hash over those files, or let the CLI compute it for you. The CLI reads the declared files from the current working directory and produces a SHA-256 hash.
+
+3. Emit the `ac-met` event:
+
+```bash
+node scripts/forge-tools.cjs ac-met \
+  --task T013 \
+  --ac R002.AC1 \
+  --witness-hash "$(node -e 'console.log(require(\"./scripts/forge-streaming-dag.cjs\").computeWitnessHash([\"src/auth.ts\",\"tests/auth.test.ts\"]))')" \
+  --witness-paths src/auth.ts,tests/auth.test.ts
+```
+
+Or in-process, if you are calling from another node script:
+
+```js
+const dag = require('./scripts/forge-streaming-dag.cjs');
+const witnessHash = dag.computeWitnessHash(['src/auth.ts', 'tests/auth.test.ts']);
+// then invoke the CLI with that hash, or write directly to .forge/streaming/events.jsonl
+```
+
+The CLI appends one JSONL line to `.forge/streaming/events.jsonl`; the dispatcher replays events on its next tick. Events stay recorded even when the feature flag is off, so turning streaming on later does not lose history.
+
+Also append a transcript line for the AC event (T008/R014 extension) so `/forge:review-branch` can cross-check your AC claims against reality:
+
+```bash
+node scripts/forge-tools.cjs transcript-append \
+  --forge-dir .forge --cycle "$CYCLE_ID" \
+  --entry '{"phase":"executing","agent":"forge-executor","task_id":"T013","tool_calls_count":0,"duration_ms":0,"status":"AC_MET","summary":"R002.AC1 witness=<sha-prefix>"}'
+```
+
+When your task is fully DONE and you exit the executor, the outer scheduler will emit a `task-verified` event that promotes every provisional `ac-met` event you recorded to `verified`. You do not emit that event yourself.
+
+Never emit `ac-met` speculatively. Only emit after a real check: the endpoint returns the expected status code, the test you wrote passes, the output matches the spec. An emitted `ac-met` event with a stale witness hash will cause downstream work to be re-queued as STALE when the reviewer rejects your claim; emitting conservatively keeps the streaming DAG honest.
+
 ### 6. Report Status
 
 Report your status using one of the four status codes (DONE, DONE_WITH_CONCERNS, NEEDS_CONTEXT, BLOCKED) along with a brief summary:
