@@ -1749,6 +1749,398 @@ function parseFrontier(text) {
   return tasks;
 }
 
+// === T020 (R007): Visual AC parsing + verifier orchestration ===
+//
+// Spec AC syntax extension (mock-and-visual-verify uses it, defined here):
+//   - [ ] [visual] path=/ viewport=1280x800 checks=["legible labels", "no halo overlap"]
+//
+// `path=` is mandatory; `viewport=` defaults to 1280x800; `checks=` is a JSON
+// array of free-text perceptual claims the LLM-vision step evaluates.
+//
+// Returned shape:
+//   [{ requirementId: "R001", acId: "R001.AC1", path: "/", viewport: "1280x800",
+//      checks: ["legible labels", "no halo overlap"], line: 28, raw: "- [ ] [visual] ..." }]
+//
+// acId is synthesised as "<R>.AC<n>" where n is the 1-based index of the
+// checkbox within that requirement. Agents and the completion gate use
+// this exact form (see R007 AC1 example "R003.AC2"). Both `- [ ]` (unchecked)
+// and `- [x]` / `- [X]` (checked) are recognised.
+//
+// Malformed AC lines are skipped silently — `parseVisualAcs` is defensive
+// so a partial spec does not break the verifier. Callers that want strict
+// checking should validate the return shape themselves.
+function parseVisualAcs(specPath) {
+  let text;
+  try { text = fs.readFileSync(specPath, 'utf8'); }
+  catch (_) { return []; }
+
+  const { content } = parseFrontmatter(text);
+  const lines = content.split('\n');
+  const out = [];
+
+  let currentR = null;        // e.g. "R001"
+  let acCounterForR = 0;      // 1-based within each requirement
+
+  // Requirements in Forge specs are headed by `### R<NNN>: <name>`. Track
+  // the active requirement id so every checkbox lands under the right R.
+  const rHeading = /^###\s+(R\d+)\s*:/;
+  // Checkbox row: `- [ ]` or `- [x]` / `- [X]` followed by AC body. The
+  // body must start with `[visual]` (case-insensitive) to qualify here.
+  const checkboxRow = /^-\s+\[[ xX]\]\s+(.*)$/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const h = line.match(rHeading);
+    if (h) {
+      currentR = h[1];
+      acCounterForR = 0;
+      continue;
+    }
+    if (!currentR) continue;
+
+    const m = line.match(checkboxRow);
+    if (!m) continue;
+    // Every AC increments the per-R counter (so visual and non-visual
+    // share the counter — matches R007 AC1's R003.AC2 example where AC2
+    // means "second AC under R003" regardless of its kind).
+    acCounterForR++;
+    const body = m[1].trim();
+    if (!/^\[visual\]/i.test(body)) continue;
+
+    // path= token (mandatory). Accepts path=/foo or path=/foo/bar with
+    // no spaces — whitespace in paths is not supported (would collide
+    // with viewport/checks tokenisation).
+    const pathMatch = body.match(/\bpath=(\S+)/);
+    if (!pathMatch) continue;
+    const pathVal = pathMatch[1];
+
+    // viewport=WxH (optional, default 1280x800). Loose regex: accepts
+    // digits x digits with no spaces.
+    const vpMatch = body.match(/\bviewport=(\d+x\d+)/);
+    const viewport = vpMatch ? vpMatch[1] : '1280x800';
+
+    // checks=[...] JSON-ish array. We accept standard JSON strings with
+    // either " or ' delimiters. Falls back to the empty list when
+    // unparseable; an empty checks list means "render succeeds" — a
+    // weaker but still useful assertion.
+    let checks = [];
+    const checksMatch = body.match(/\bchecks=(\[[\s\S]*?\])/);
+    if (checksMatch) {
+      const raw = checksMatch[1];
+      // Normalise single quotes to double quotes for JSON.parse; also
+      // trim trailing commas which authors sometimes leave.
+      const normalised = raw
+        .replace(/'/g, '"')
+        .replace(/,\s*\]/g, ']');
+      try {
+        const parsed = JSON.parse(normalised);
+        if (Array.isArray(parsed)) checks = parsed.map(String);
+      } catch (_) { /* keep checks = [] */ }
+    }
+
+    out.push({
+      requirementId: currentR,
+      acId: currentR + '.AC' + acCounterForR,
+      path: pathVal,
+      viewport,
+      checks,
+      line: i + 1,
+      raw: line
+    });
+  }
+
+  return out;
+}
+
+// Capability gate for the visual verifier. Returns `{ available: bool, reason?: string }`
+// so the agent can short-circuit into `blocked` instead of attempting a Playwright call.
+//
+//   - FORGE_DISABLE_PLAYWRIGHT=1 in the env     -> available:false, reason:"playwright_unavailable"
+//   - caps.sandbox.browser === false             -> available:false, reason:"browser_cap_disabled"
+//   - no `mcp__playwright` or `playwright` entry under caps.mcp_servers AND the env does
+//     not opt-out of the capability check     -> available:false, reason:"playwright_unavailable"
+//   - otherwise                                 -> available:true
+//
+// `caps` is the parsed .forge/capabilities.json object. Pass `null` or `{}`
+// to skip the capabilities check (useful in tests that only exercise the
+// env-var path).
+function checkVisualCapabilities(caps, env) {
+  env = env || process.env;
+  if (env.FORGE_DISABLE_PLAYWRIGHT === '1') {
+    return { available: false, reason: 'playwright_unavailable' };
+  }
+  if (caps && caps.sandbox && caps.sandbox.browser === false) {
+    return { available: false, reason: 'browser_cap_disabled' };
+  }
+  if (caps && caps.mcp_servers) {
+    const keys = Object.keys(caps.mcp_servers);
+    const hasPlaywright = keys.some(k => /playwright/i.test(k));
+    if (!hasPlaywright) {
+      return { available: false, reason: 'playwright_unavailable' };
+    }
+  }
+  return { available: true };
+}
+
+// Baseline path for a visual AC screenshot. Schema:
+//   .forge/baselines/<spec-id>/<requirementId>-<acId>.png
+//
+// Example: spec=001-readable-graph, ac={R001,R001.AC1}
+//   -> .forge/baselines/001-readable-graph/R001-R001.AC1.png
+//
+// Kept pure so callers can compute the path without side effects. The
+// first-successful-pass-under-record-baselines branch in the verifier
+// is the only caller that actually writes to this path.
+function baselinePath(forgeDir, specId, ac) {
+  return path.join(
+    forgeDir, 'baselines', String(specId),
+    String(ac.requirementId) + '-' + String(ac.acId) + '.png'
+  );
+}
+
+// Write `visual_acs` results to a per-task progress file under
+// .forge/progress/<taskId>.json. Called by the verifier once every AC
+// has a result (`pass` / `fail` / `blocked`). Merges with whatever
+// progress record already exists so the executor's own context_bundle
+// is preserved. Returns the final progress object.
+//
+// Shape of `visualAcResults`:
+//   [{ acId, status: 'pass'|'fail'|'blocked', detail?: string,
+//      baseline?: string, screenshot?: string }]
+//
+// checkCompletionGates (T017) reads these via _scanProgressForAcs.
+function writeVisualProgress(forgeDir, taskId, visualAcResults) {
+  const progDir = path.join(forgeDir, 'progress');
+  try { fs.mkdirSync(progDir, { recursive: true }); } catch (_) {}
+  const file = path.join(progDir, String(taskId) + '.json');
+  let obj = {};
+  try { obj = JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (_) { obj = {}; }
+  if (!obj || typeof obj !== 'object') obj = {};
+
+  obj.task_id = obj.task_id || taskId;
+  obj.last_updated = new Date().toISOString();
+  obj.visual_acs = Array.isArray(visualAcResults) ? visualAcResults.map(r => ({
+    acId: r.acId,
+    status: r.status,
+    detail: r.detail || null,
+    baseline: r.baseline || null,
+    screenshot: r.screenshot || null
+  })) : [];
+
+  fs.writeFileSync(file, JSON.stringify(obj, null, 2));
+  return obj;
+}
+
+// Orchestration entry point for the `forge-visual-verifier` agent. Pure
+// (no network, no Playwright invocation) so it can be unit-tested
+// deterministically. The agent is responsible for the actual
+// `mcp__playwright__browser_*` calls; this function prepares the AC list,
+// classifies the environment, and produces the progress record + a
+// summary the agent returns to its caller.
+//
+// opts:
+//   specPath     absolute path to the spec file (required).
+//   taskId       the task id this verification run is attributed to (default: "visual-verify").
+//   specId       the spec identifier (default: derived from specPath basename without .md).
+//   capsPath     where to read capabilities.json (default: <forgeDir>/capabilities.json).
+//   env          env var source (default: process.env). Honors FORGE_DISABLE_PLAYWRIGHT.
+//   recordBaselines   explicit override of the record-mode flag. When omitted the
+//                     function reads state.md frontmatter `record_baselines: true`
+//                     (stamped by the T016 setup-state CLI on --record-baselines runs).
+//   takeScreenshot    injected hook for the agent's Playwright bridge. Signature:
+//                     async (ac) => { pngBuffer: Buffer }. When null, the verifier
+//                     skips all screenshot work and leaves results blank — the agent
+//                     is expected to call this loop itself with a real bridge in
+//                     production. Unit tests pass a stub.
+//   visionCompare     async (screenshotPng, baselinePng, checks) => { status, detail }.
+//                     Only used when baselines exist and we're in compare-mode.
+//
+// Return shape:
+//   {
+//     specId, taskId,
+//     status: 'pass'|'fail'|'blocked'|'empty',
+//     acs: [{ acId, status, detail, baseline, screenshot }],
+//     capability: { available: bool, reason?: string },
+//     progress: <the written progress record>
+//   }
+//
+// Agents consume this function as the deterministic planning layer and
+// then execute the Playwright calls themselves.
+async function runVisualVerifier(forgeDir, opts) {
+  opts = opts || {};
+  const specPath = opts.specPath;
+  if (!specPath) throw new Error('runVisualVerifier: opts.specPath required');
+  const taskId = opts.taskId || 'visual-verify';
+  const specId = opts.specId || path.basename(specPath).replace(/\.md$/i, '');
+  const env = opts.env || process.env;
+
+  // Capability gate: if Playwright isn't available every AC returns blocked.
+  let caps = null;
+  if (opts.caps !== undefined) {
+    caps = opts.caps;
+  } else {
+    const capsPath = opts.capsPath || path.join(forgeDir, 'capabilities.json');
+    try { caps = JSON.parse(fs.readFileSync(capsPath, 'utf8')); }
+    catch (_) { caps = null; }
+  }
+  const capability = checkVisualCapabilities(caps, env);
+
+  const acs = parseVisualAcs(specPath);
+  if (acs.length === 0) {
+    const progress = writeVisualProgress(forgeDir, taskId, []);
+    return {
+      specId, taskId, status: 'empty', acs: [],
+      capability, progress
+    };
+  }
+
+  // If Playwright isn't wired every AC is `blocked` with the capability
+  // reason as detail. No screenshots are taken. No baselines are written.
+  if (!capability.available) {
+    const blocked = acs.map(ac => ({
+      acId: ac.acId,
+      status: 'blocked',
+      detail: capability.reason,
+      baseline: null,
+      screenshot: null
+    }));
+    const progress = writeVisualProgress(forgeDir, taskId, blocked);
+    return {
+      specId, taskId, status: 'blocked',
+      acs: blocked, capability, progress
+    };
+  }
+
+  // record_baselines flag: explicit opts.recordBaselines wins; otherwise
+  // read state.md frontmatter. T016's setup-state CLI stamps this field
+  // when the user invokes /forge:execute --record-baselines.
+  let recordBaselines = false;
+  if (typeof opts.recordBaselines === 'boolean') {
+    recordBaselines = opts.recordBaselines;
+  } else {
+    try {
+      const st = readState(forgeDir);
+      if (st && st.data && st.data.record_baselines === true) recordBaselines = true;
+    } catch (_) { recordBaselines = false; }
+  }
+
+  // The actual Playwright-driven screenshot + vision compare is the
+  // agent's responsibility. When the agent passes bridges, run them;
+  // otherwise return `pending` results that the agent must fill in.
+  const results = [];
+  const baselinesDir = path.join(forgeDir, 'baselines', specId);
+
+  for (const ac of acs) {
+    const bPath = baselinePath(forgeDir, specId, ac);
+    const baselineExists = fs.existsSync(bPath);
+    const result = {
+      acId: ac.acId,
+      status: 'pending',
+      detail: null,
+      baseline: baselineExists ? bPath : null,
+      screenshot: null
+    };
+
+    if (typeof opts.takeScreenshot !== 'function') {
+      // No bridge: the agent will fill in per-AC results itself. Carry
+      // the metadata (path, viewport, checks, baseline existence) so
+      // the agent can act on it without re-reading the spec.
+      result.status = 'pending';
+      result.detail = 'agent-bridge-missing; agent must populate result';
+      result.path = ac.path;
+      result.viewport = ac.viewport;
+      result.checks = ac.checks;
+      results.push(result);
+      continue;
+    }
+
+    let shot;
+    try {
+      shot = await opts.takeScreenshot(ac);
+    } catch (err) {
+      result.status = 'blocked';
+      result.detail = 'screenshot_error: ' + (err && err.message || String(err));
+      results.push(result);
+      continue;
+    }
+    if (!shot || !shot.pngBuffer) {
+      result.status = 'blocked';
+      result.detail = 'screenshot_empty';
+      results.push(result);
+      continue;
+    }
+
+    if (recordBaselines || !baselineExists) {
+      // Record-mode (or first-ever run for this AC): write the baseline
+      // and declare pass. Subsequent runs will compare against it.
+      try { fs.mkdirSync(baselinesDir, { recursive: true }); } catch (_) {}
+      try {
+        fs.writeFileSync(bPath, shot.pngBuffer);
+        result.baseline = bPath;
+        result.screenshot = bPath;
+        result.status = 'pass';
+        result.detail = baselineExists ? 'baseline-rerecorded' : 'baseline-recorded';
+      } catch (err) {
+        result.status = 'blocked';
+        result.detail = 'baseline_write_error: ' + (err && err.message || String(err));
+      }
+      results.push(result);
+      continue;
+    }
+
+    // Compare against the existing baseline via the agent's vision bridge.
+    if (typeof opts.visionCompare !== 'function') {
+      result.status = 'pending';
+      result.detail = 'vision-bridge-missing; agent must compare baseline';
+      results.push(result);
+      continue;
+    }
+    let cmp;
+    try {
+      const baselineBuf = fs.readFileSync(bPath);
+      cmp = await opts.visionCompare(shot.pngBuffer, baselineBuf, ac.checks);
+    } catch (err) {
+      result.status = 'blocked';
+      result.detail = 'vision_error: ' + (err && err.message || String(err));
+      results.push(result);
+      continue;
+    }
+    result.status = (cmp && cmp.status) || 'fail';
+    result.detail = (cmp && cmp.detail) || null;
+    results.push(result);
+  }
+
+  // Summary status: pass when every AC is pass; fail when any is fail;
+  // blocked when any is blocked and none is fail; pending when any AC
+  // remains pending (bridges missing). pending maps to blocked for the
+  // completion gate because an unresolved AC cannot clear it.
+  let overall = 'pass';
+  for (const r of results) {
+    if (r.status === 'fail') { overall = 'fail'; break; }
+    if (r.status === 'blocked') overall = 'blocked';
+    else if (r.status === 'pending' && overall !== 'blocked') overall = 'pending';
+  }
+
+  // Persist a gate-compatible form. The completion-gate scanner only
+  // accepts `pass` as clearing. Pending is surfaced as blocked with a
+  // distinct detail.
+  const gateForm = results.map(r => ({
+    acId: r.acId,
+    status: r.status === 'pending' ? 'blocked' : r.status,
+    detail: r.status === 'pending' ? (r.detail || 'pending; agent has not completed') : r.detail,
+    baseline: r.baseline,
+    screenshot: r.screenshot
+  }));
+  const progress = writeVisualProgress(forgeDir, taskId, gateForm);
+
+  return {
+    specId, taskId,
+    status: overall === 'pending' ? 'blocked' : overall,
+    acs: results, capability, progress
+  };
+}
+
 // === T015 (R005): Worktree Conflict Detection + Serialization ===
 // Parallel tasks in a tier can collide on squash merge if they touch the same
 // files. These helpers detect overlap, group conflicting tasks for sequential
@@ -5151,6 +5543,57 @@ if (require.main === module) {
     });
   }
 
+  // === T020 / R007: visual verifier CLI shell ===
+  // Two sub-actions:
+  //   visual-verify --forge-dir .forge --spec <path> [--task-id T020] [--spec-id <id>]
+  //       -> run the verifier (no bridges = all ACs land as "pending",
+  //          intended shape for agents that will fill in per-AC). Honors
+  //          FORGE_DISABLE_PLAYWRIGHT=1 via the env layer.
+  //
+  //   visual-verify parse --spec <path>
+  //       -> JSON-dump the parsed [visual] AC list without side effects.
+  //          Used by the agent to decide which ACs it needs to drive.
+  //
+  // Exit codes: 0 success; 1 usage error; 2 internal error.
+  if (command === 'visual-verify') {
+    const sub = args[1];
+    const specArg = args.find((a, i) => args[i - 1] === '--spec') || '';
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const taskId = args.find((a, i) => args[i - 1] === '--task-id') || 'visual-verify';
+    const specIdArg = args.find((a, i) => args[i - 1] === '--spec-id');
+
+    if (sub === 'parse') {
+      if (!specArg) {
+        process.stderr.write('visual-verify parse: --spec required\n');
+        process.exit(1);
+      }
+      const list = parseVisualAcs(specArg);
+      process.stdout.write(JSON.stringify(list, null, 2) + '\n');
+    } else {
+      // Default: run the verifier in metadata-only mode (no bridges).
+      if (!specArg) {
+        process.stderr.write('visual-verify: --spec required\n');
+        process.exit(1);
+      }
+      (async () => {
+        try {
+          const result = await runVisualVerifier(forgeDir, {
+            specPath: specArg,
+            taskId,
+            specId: specIdArg
+          });
+          // Strip the progress object from stdout (tests read it from the
+          // file). Keep status/capability/acs for the agent.
+          const { progress, ...pub } = result;
+          process.stdout.write(JSON.stringify(pub, null, 2) + '\n');
+        } catch (err) {
+          process.stderr.write('visual-verify error: ' + (err && err.message || err) + '\n');
+          process.exit(2);
+        }
+      })();
+    }
+  }
+
   // === Spec approval validation ===
   // Prevents /forge execute from running without approved specs and valid frontiers.
   if (command === 'validate-workflow') {
@@ -6750,6 +7193,9 @@ module.exports = {
   recordCompressionStats, readCompressionStats, compressWithGuard,
   acquireLock, releaseLock, heartbeat, detectStaleLock, readLock,
   updateTokenLedger, parseFrontier,
+  // T020 / R007: visual verifier plumbing.
+  parseVisualAcs, checkVisualCapabilities, baselinePath,
+  writeVisualProgress, runVisualVerifier,
   detectFileConflicts, serializeConflictingTasks, logConflictEvent, planTierExecution, detectParallelConflicts,
   writeParallelConstraints, readParallelConstraints, isBlockedByParallelConstraint,
   readLedger, writeLedgerAtomic, resolveTaskBudget,
