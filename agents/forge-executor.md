@@ -420,7 +420,7 @@ Concerns:
 
 ## Collab Mode (Forward-Motion Decisions)
 
-If `.forge/collab/participant.json` exists, **collab mode is active** (a `/forge:collaborate` session is in progress). During executing/implementing/testing/reviewing/fixing/debugging phases, when you would normally block waiting for human input on a non-trivial decision (library choice, design pattern, edge-case handling, interface shape), **do not block.**
+If `.forge/collab/.enabled` exists, **collab mode is active** (a `/forge:collaborate` session is in progress). The `.enabled` marker is the authoritative signal — `/forge:collaborate start` writes it atomically after `participant.json`, and `/forge:collaborate leave` deletes it before anything else, so a half-off state from a mid-cleanup crash is impossible to confuse with a live session. During executing/implementing/testing/reviewing/fixing/debugging phases, when you would normally block waiting for human input on a non-trivial decision (library choice, design pattern, edge-case handling, interface shape), **do not block.**
 
 Instead:
 
@@ -441,15 +441,17 @@ Instead:
 
 **Do not write flags outside an executing sub-phase.** The CLI enforces this and will exit code 3 if misused.
 
-**Single-user mode (no `.forge/collab/participant.json`):** ignore collab-mode instructions entirely. Keep your existing blocking / NEEDS_CONTEXT behavior for decisions -- that is the right UX when there is no team to coordinate with.
+**Single-user mode (no `.forge/collab/.enabled`):** ignore collab-mode instructions entirely. Keep your existing blocking / NEEDS_CONTEXT behavior for decisions -- that is the right UX when there is no team to coordinate with.
 
 Quick detection before any flag work:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" collab-mode-active --forge-dir .forge >/dev/null 2>&1
-# exit 0 -> collab mode ON, use the flag path above
+# exit 0 -> collab mode ON (`.enabled` present), use the flag path above
 # exit 1 -> single-user, keep current behavior
 ```
+
+If you observe a half-off state (for example `participant.json` is present but `.forge/collab/.enabled` is missing), stop and suggest the user run `/forge:collaborate recover` — do not try to write flags, claims, or leases against a stale session.
 
 ## Constraints
 

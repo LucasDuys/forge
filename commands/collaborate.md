@@ -1,6 +1,6 @@
 ---
 description: "Opt-in multiplayer mode -- brain-dump together, claim tasks across machines, flag decisions async"
-argument-hint: "[start|join|brainstorm|status|claim|flags|override|leave] [args]"
+argument-hint: "[start|join|brainstorm|status|claim|flags|override|leave|recover] [args]"
 allowed-tools: ["Bash(${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node -e *)", "Bash(git:*)", "Bash(gh:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Agent(*)"]
 ---
 
@@ -20,6 +20,7 @@ Activates hackathon-native multiplayer mode: N users on different machines brain
 | `/forge:collaborate flags` | List all forward-motion flags with status |
 | `/forge:collaborate override <flagId> <new-decision>` | Override an AI decision, mark flag overridden |
 | `/forge:collaborate leave` | Release claims and disconnect |
+| `/forge:collaborate recover` | Diagnose and repair a stale collab session (crash between start/leave steps) |
 
 ## Step 1: Pre-flight
 
@@ -81,5 +82,18 @@ After the skill returns, present a concise summary of what changed:
 - For `flags`: table of flag id, task, decision, status.
 - For `override`: confirmation + previous decision + re-run of dependent tasks.
 - For `leave`: claims released.
+- For `recover`: classification + remedy applied (or "no recovery needed").
 
 If the skill reports an error (e.g., lease held by another agent), surface it clearly and suggest what to do next.
+
+## Recovery invariants (R008)
+
+`/forge:collaborate start` writes `participant.json` first, then
+`.forge/collab/.enabled` as the final atomic action. `/forge:collaborate
+leave` deletes `.enabled` first, releases claims, disconnects, then
+deletes `participant.json` last. Those orderings guarantee that any
+crash leaves the system in a state that `/forge:collaborate recover` can
+detect and repair. If you ever find `participant.json` without
+`.enabled`, that is `stale_participant` (reset); `.enabled` without
+`participant.json` is `stale_enabled` (repair). Never mutate
+`.forge/collab/` by hand — go through the skill.

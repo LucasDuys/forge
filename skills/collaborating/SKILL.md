@@ -44,9 +44,20 @@ below. If no subcommand is given, default to `status`.
 3. Ensure `.forge/collab/` exists (`mkdir -p .forge/collab`).
 
 4. Write `.forge/collab/participant.json` with `{handle, session_id,
-   started: <iso>}`.
+   started: <iso>}`. **Write this FIRST**; it is the heavy artifact that
+   holds the session metadata.
 
-5. Resolve the transport mode. Call `selectTransportMode` with
+5. Write `.forge/collab/.enabled` as an empty marker file. **This MUST be
+   the final filesystem action**; it is the atomic signal that collab
+   mode is fully on. Use the `writeEnabledMarker` primitive:
+   ```bash
+   node -e "require('./scripts/forge-collab.cjs').writeEnabledMarker('.forge')"
+   ```
+   Invariant: if `start` crashes between step 4 and step 5, crash recovery
+   will classify the state as `stale_participant` and offer a reset. If it
+   crashes before step 4 there is nothing to recover. Do not reorder.
+
+6. Resolve the transport mode. Call `selectTransportMode` with
    `process.env` and any `--polling` flag the user passed. Report:
    - `ably`: "Realtime transport will use Ably (ABLY_KEY detected)."
    - `polling`: "Zero-setup mode via git polling on forge/collab-state
@@ -54,7 +65,7 @@ below. If no subcommand is given, default to `status`.
    - `setup-required`: print the setup guide returned by `renderSetupGuide()`
      and exit (unless `--polling` was passed).
 
-6. Report the session code (the full 12-hex session ID) and tell the user
+7. Report the session code (the full 12-hex session ID) and tell the user
    to share it out-of-band with teammates (though strictly speaking any
    teammate with the repo will derive the same code automatically).
 
@@ -187,12 +198,66 @@ Call `overrideFlag('.forge/collab', flagId, newDecision, { author: handle })`.
 ### `leave` -- release claims and disconnect
 
 1. Read `.forge/collab/participant.json` for the handle.
-2. List all active claims via `listActiveTaskClaims(transport)` and
+2. **Delete `.forge/collab/.enabled` FIRST** via `removeEnabledMarker`:
+   ```bash
+   node -e "require('./scripts/forge-collab.cjs').removeEnabledMarker('.forge')"
+   ```
+   This is the atomic "collab mode is off" flip. Any crash after this
+   point is harmless — the marker is gone, the executor guard returns
+   single-user, and `participant.json` lingering is classified as
+   `stale_participant` by `/forge:collaborate recover`.
+3. List all active claims via `listActiveTaskClaims(transport)` and
    filter for `claimant === handle`.
-3. For each such claim, call `releaseTaskClaim(transport, taskId, handle)`.
-4. If the transport has a `disconnect()` method, call it.
-5. Delete `.forge/collab/participant.json`.
-6. Report: "Released <N> claims. Disconnected from session."
+4. For each such claim, call `releaseTaskClaim(transport, taskId, handle)`.
+5. If the transport has a `disconnect()` method, call it.
+6. Delete `.forge/collab/participant.json`.
+7. Report: "Released <N> claims. Disconnected from session."
+
+Invariant: the delete order is `.enabled` -> claims -> disconnect ->
+`participant.json`. Never remove `participant.json` before `.enabled`,
+and never skip the `.enabled` removal. A partial leave that only strips
+`.enabled` still leaves the executor in single-user mode, which is the
+safe fallback.
+
+---
+
+### `recover` -- repair a stale collab session
+
+Scan `.forge/collab/` for inconsistent marker state and offer the right
+remedy for each case. This is the recovery path for crashes during
+`start` or `leave`.
+
+1. Run the classifier:
+   ```bash
+   node -e "const c=require('./scripts/forge-collab.cjs');console.log(JSON.stringify(c.classifyCollabState('.forge',{cwd:process.cwd()})))"
+   ```
+2. Interpret the `status` field:
+   - `inactive`: both markers absent. Nothing to do; report "No collab
+     session found."
+   - `healthy`: both markers present and session id matches current
+     origin. Report "Collab session is running normally; no recovery
+     needed."
+   - `stale_participant`: `participant.json` present, `.enabled` missing.
+     Diagnosis: start crashed before the marker landed, or leave aborted
+     partway through. Prompt the user: "Reset the stale session?" On
+     confirmation, call `recoverCollabState('.forge', { apply: true })`
+     which deletes `participant.json` (and any `.enabled` remnant).
+   - `stale_enabled`: `.enabled` present, `participant.json` missing.
+     Diagnosis: leave crashed after `participant.json` was deleted. Prompt
+     "Repair participant from git config?" On confirmation, call
+     `recoverCollabState('.forge', { apply: true })` which re-derives the
+     participant and writes a fresh `participant.json` with the current
+     session id.
+   - `session_mismatch`: both markers present but `participant.session_id`
+     differs from the origin-derived id (repo was re-pointed). Prompt
+     "Migrate participant to the new session?" On confirmation, call
+     `recoverCollabState('.forge', { apply: true })` which rewrites the
+     session id and records the `migrated_from` value.
+3. After any mutation, print a short summary of the `actions` array so
+   the user knows exactly what changed.
+
+Never auto-apply without prompting. Recovery is destructive to session
+state; the skill must show the diagnosis and remedy first.
 
 ---
 

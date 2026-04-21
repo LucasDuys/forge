@@ -2725,6 +2725,250 @@ function patchGitignore(opts) {
   return { patched: true, actions, detection };
 }
 
+// ======================================================================
+// Explicit `.enabled` marker for collab-mode lifecycle (T028, R008)
+// ======================================================================
+// Rationale: detecting collab mode solely by `participant.json` existence
+// leaves a half-off state whenever `leave` crashes mid-cleanup. Adding an
+// explicit marker that `start` writes atomically *after* `participant.json`
+// and `leave` deletes *before* anything else gives us a single bit that is
+// either fully on or fully off. Crash-recovery can detect mismatches and
+// offer to repair or reset. The invariants:
+//
+//   /forge:collaborate start -> participant.json FIRST, then .enabled LAST.
+//   /forge:collaborate leave -> .enabled FIRST, then everything else, then
+//                               participant.json LAST.
+//
+// Callers that need to check collab-mode should use `collabModeEnabled`
+// (which tests for `.enabled`, not `participant.json`). The CLI bridge in
+// scripts/forge-tools.cjs delegates to this helper and also performs a
+// silent forward-compat migration: when `participant.json` exists but
+// `.enabled` does not (pre-T028 session lingering after upgrade), the CLI
+// writes `.enabled` in place so the existing session keeps working.
+
+function _collabDir(forgeDir) {
+  return path.join(forgeDir || '.forge', 'collab');
+}
+
+/** Absolute path of the `.enabled` marker for a given forgeDir. */
+function enabledMarkerPath(forgeDir) {
+  return path.join(_collabDir(forgeDir), '.enabled');
+}
+
+/** Absolute path of the `participant.json` for a given forgeDir. */
+function participantJsonPath(forgeDir) {
+  return path.join(_collabDir(forgeDir), 'participant.json');
+}
+
+/**
+ * Atomically drop the `.enabled` marker. Callers must have already written
+ * `participant.json` -- this is the final step of `/forge:collaborate start`.
+ * Idempotent: writing over an existing marker is a no-op.
+ */
+function writeEnabledMarker(forgeDir) {
+  const p = enabledMarkerPath(forgeDir);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, '');
+  return p;
+}
+
+/**
+ * Remove the `.enabled` marker. MUST be called as the first step of
+ * `/forge:collaborate leave` so crash recovery between the marker delete
+ * and the participant.json delete still classifies the session as off.
+ * Returns true if a marker was deleted, false if none existed.
+ */
+function removeEnabledMarker(forgeDir) {
+  const p = enabledMarkerPath(forgeDir);
+  if (!fs.existsSync(p)) return false;
+  fs.rmSync(p, { force: true });
+  return true;
+}
+
+/**
+ * Authoritative check: is collab mode currently on? Tests for `.enabled`
+ * only. `participant.json` alone is NOT enough -- that is a half-off state
+ * and `recoverCollabState` should be invoked to clean it up.
+ */
+function collabModeEnabled(forgeDir) {
+  return fs.existsSync(enabledMarkerPath(forgeDir));
+}
+
+/**
+ * Classify the state of the two markers. Pure: no filesystem writes.
+ *
+ * Returns one of:
+ *   { status: 'inactive',            actionable: false }  // both absent -- never started, nothing to do
+ *   { status: 'healthy',             actionable: false }  // both present -- session running normally
+ *   { status: 'stale_participant',   actionable: true,  remedy: 'reset'   }  // participant.json only -- crash before .enabled landed
+ *   { status: 'stale_enabled',       actionable: true,  remedy: 'repair'  }  // .enabled only -- crash after participant.json was deleted
+ *   { status: 'session_mismatch',    actionable: true,  remedy: 'migrate' }  // both present but participant.session_id != current origin
+ *
+ * `reason` is a human-readable string for command output.
+ */
+function classifyCollabState(forgeDir, opts) {
+  opts = opts || {};
+  const enabled = collabModeEnabled(forgeDir);
+  const pPath = participantJsonPath(forgeDir);
+  const hasParticipant = fs.existsSync(pPath);
+
+  if (!enabled && !hasParticipant) {
+    return { status: 'inactive', actionable: false, reason: 'No collab session in progress.' };
+  }
+
+  if (enabled && !hasParticipant) {
+    return {
+      status: 'stale_enabled',
+      actionable: true,
+      remedy: 'repair',
+      reason: '.forge/collab/.enabled exists but participant.json is missing. Likely a crash after partial cleanup; repair re-derives the participant from git.'
+    };
+  }
+
+  if (!enabled && hasParticipant) {
+    return {
+      status: 'stale_participant',
+      actionable: true,
+      remedy: 'reset',
+      reason: '.forge/collab/participant.json exists but .enabled is missing. Likely a crash before the previous start completed; reset cleans up.'
+    };
+  }
+
+  // Both present. Check session-id vs current origin.
+  let participant;
+  try {
+    participant = JSON.parse(fs.readFileSync(pPath, 'utf8'));
+  } catch (e) {
+    return {
+      status: 'stale_participant',
+      actionable: true,
+      remedy: 'reset',
+      reason: 'participant.json is unreadable (' + e.message + '). Reset recommended.'
+    };
+  }
+
+  let currentSessionId = null;
+  try {
+    if (typeof opts.sessionIdResolver === 'function') {
+      currentSessionId = opts.sessionIdResolver();
+    } else {
+      currentSessionId = sessionIdFromOrigin({ cwd: opts.cwd });
+    }
+  } catch (_) {
+    // Cannot resolve origin in this context; skip the mismatch check.
+    currentSessionId = null;
+  }
+
+  if (currentSessionId && participant.session_id && currentSessionId !== participant.session_id) {
+    return {
+      status: 'session_mismatch',
+      actionable: true,
+      remedy: 'migrate',
+      reason: 'participant.json references session ' + String(participant.session_id).slice(0, 8) +
+              ' but current origin resolves to ' + String(currentSessionId).slice(0, 8) +
+              '. The repo was re-pointed since start; migrate rewrites the participant.',
+      current_session_id: currentSessionId,
+      participant_session_id: participant.session_id
+    };
+  }
+
+  return { status: 'healthy', actionable: false, reason: 'Collab session is running normally.' };
+}
+
+/**
+ * Scan collab state and offer the right remedy for each stale configuration.
+ * This is the programmatic surface behind `/forge:collaborate recover`; the
+ * command layer is expected to prompt the user before invoking the remedy.
+ *
+ * Remedies (pure unless opts.apply === true):
+ *   reset    -> delete participant.json (and .enabled if present)
+ *   repair   -> re-derive participant from git config + session id, then
+ *               rewrite participant.json
+ *   migrate  -> rewrite participant.session_id to the current origin-derived id
+ *
+ * When opts.apply is falsy, returns the proposed actions without touching
+ * the filesystem. When truthy, performs the action and reports the result.
+ */
+function recoverCollabState(forgeDir, opts) {
+  opts = opts || {};
+  const cls = classifyCollabState(forgeDir, opts);
+  const apply = !!opts.apply;
+
+  // Nothing to do.
+  if (!cls.actionable) {
+    return { status: cls.status, applied: false, reason: cls.reason };
+  }
+
+  // Dry-run: just describe what would happen.
+  if (!apply) {
+    return {
+      status: cls.status,
+      remedy: cls.remedy,
+      applied: false,
+      reason: cls.reason
+    };
+  }
+
+  const pPath = participantJsonPath(forgeDir);
+  const ePath = enabledMarkerPath(forgeDir);
+
+  if (cls.remedy === 'reset') {
+    const actions = [];
+    if (fs.existsSync(ePath)) { fs.rmSync(ePath, { force: true }); actions.push('removed_enabled'); }
+    if (fs.existsSync(pPath)) { fs.rmSync(pPath, { force: true }); actions.push('removed_participant'); }
+    return { status: cls.status, remedy: 'reset', applied: true, actions, reason: cls.reason };
+  }
+
+  if (cls.remedy === 'repair') {
+    // .enabled exists but participant.json is gone. Rebuild participant
+    // from git config and current session id, then leave both in place.
+    const handle = (opts.handleResolver && opts.handleResolver()) || _resolveHandleFromGit(opts) || 'unknown';
+    let sessionId = null;
+    try {
+      sessionId = (opts.sessionIdResolver && opts.sessionIdResolver()) || sessionIdFromOrigin({ cwd: opts.cwd });
+    } catch (_) {
+      // No origin available; recovery cannot reconstruct the session id.
+      return {
+        status: cls.status,
+        remedy: 'repair',
+        applied: false,
+        reason: 'Cannot derive session id from origin; configure a git remote and retry.'
+      };
+    }
+    const participant = { handle, session_id: sessionId, started: new Date().toISOString(), recovered: true };
+    fs.mkdirSync(path.dirname(pPath), { recursive: true });
+    fs.writeFileSync(pPath, JSON.stringify(participant, null, 2));
+    return { status: cls.status, remedy: 'repair', applied: true, actions: ['wrote_participant'], participant, reason: cls.reason };
+  }
+
+  if (cls.remedy === 'migrate') {
+    const raw = JSON.parse(fs.readFileSync(pPath, 'utf8'));
+    raw.session_id = cls.current_session_id;
+    raw.migrated_from = cls.participant_session_id;
+    raw.migrated_at = new Date().toISOString();
+    fs.writeFileSync(pPath, JSON.stringify(raw, null, 2));
+    return { status: cls.status, remedy: 'migrate', applied: true, actions: ['rewrote_session_id'], participant: raw, reason: cls.reason };
+  }
+
+  return { status: cls.status, applied: false, reason: 'unknown remedy: ' + cls.remedy };
+}
+
+/** Best-effort handle derivation for recovery; falls back to $USER. */
+function _resolveHandleFromGit(opts) {
+  opts = opts || {};
+  try {
+    const { execFileSync } = require('node:child_process');
+    const out = execFileSync('git', ['config', 'user.email'], {
+      cwd: opts.cwd,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+      timeout: 3000
+    }).trim();
+    if (out) return out.split('@')[0];
+  } catch (_) { /* fall through */ }
+  return process.env.USER || process.env.USERNAME || null;
+}
+
 module.exports = {
   sessionIdFromOrigin,
   scoreParticipant,
@@ -2789,6 +3033,13 @@ module.exports = {
   GITIGNORE_CARVE_OUT_MARKER,
   GITIGNORE_CARVE_OUT_BLOCK,
   COLLAB_NESTED_GITIGNORE,
+  enabledMarkerPath,
+  participantJsonPath,
+  writeEnabledMarker,
+  removeEnabledMarker,
+  collabModeEnabled,
+  classifyCollabState,
+  recoverCollabState,
   // Exposed for tests and future-task extension points:
   _internal: {
     readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,

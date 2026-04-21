@@ -6013,15 +6013,32 @@ if (require.main === module) {
   }
 
   // === Collab CLI bridges (T013 integration follow-up) =====================
-  // Executor agent shells out to these subcommands when `.forge/collab/
-  // participant.json` is present. They wrap primitives in scripts/forge-collab.cjs
-  // so the agent never has to JSON-encode payloads by hand.
+  // Executor agent shells out to these subcommands when collab mode is on.
+  // They wrap primitives in scripts/forge-collab.cjs so the agent never has
+  // to JSON-encode payloads by hand.
 
+  // T028/R008: collab-mode detection now checks the explicit `.enabled`
+  // marker, not `participant.json`. Forward-compat for existing sessions:
+  // if `participant.json` is present but `.enabled` is not (pre-T028 session
+  // carried across the upgrade), we silently write `.enabled` so the CLI
+  // keeps working without forcing the user to /forge:collaborate leave first.
   if (command === 'collab-mode-active') {
     const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
-    const flag = fs.existsSync(path.join(forgeDir, 'collab', 'participant.json'));
-    process.stdout.write(flag ? 'true\n' : 'false\n');
-    process.exit(flag ? 0 : 1);
+    const enabledPath = path.join(forgeDir, 'collab', '.enabled');
+    const participantPath = path.join(forgeDir, 'collab', 'participant.json');
+    let enabled = fs.existsSync(enabledPath);
+    if (!enabled && fs.existsSync(participantPath)) {
+      // Silent forward-compat migration: upgrade a pre-T028 session by
+      // dropping the marker now. Keeps `/forge:collaborate` usable without
+      // requiring the user to leave + restart.
+      try {
+        fs.mkdirSync(path.dirname(enabledPath), { recursive: true });
+        fs.writeFileSync(enabledPath, '');
+        enabled = true;
+      } catch (_) { /* best-effort; treat as off if we cannot write */ }
+    }
+    process.stdout.write(enabled ? 'true\n' : 'false\n');
+    process.exit(enabled ? 0 : 1);
   }
 
   if (command === 'collab-flag-decision') {
