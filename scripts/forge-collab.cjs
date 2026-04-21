@@ -572,6 +572,13 @@ function createAblyTransport(opts) {
   }
   const channelName = opts.channel || 'forge-collab';
   const clientId = opts.clientId || 'unknown';
+  // T024 (spec-collab-fix R005): tunables for the CAS publish-ack handshake.
+  // `casTimeoutMs` is the wall-clock budget for a single cas() call; the spec
+  // pins this at 500 ms. `casElectionMs` is how long each node waits after
+  // seeing a cas_propose before evaluating the winner rule, so contemporaneous
+  // proposals under simulated latency can all arrive before the echoer decides.
+  const casTimeoutMs = Number.isFinite(opts.casTimeoutMs) ? opts.casTimeoutMs : 500;
+  const casElectionMs = Number.isFinite(opts.casElectionMs) ? opts.casElectionMs : 150;
   let client = null;
   let channel = null;
   let connected = false;
@@ -585,6 +592,14 @@ function createAblyTransport(opts) {
     });
     channel = client.channels.get(channelName);
     connected = true;
+    // T024 (R005): every client subscribes to the three authoritative CAS
+    // channel events on connect. This is backbone plumbing, not a userland
+    // subscription, so it bypasses subscribe() and the R004 target filter —
+    // cas_propose / cas_won / lease-update are always broadcast and always
+    // consumed by every participant.
+    channel.subscribe('cas_propose', _onCasPropose);
+    channel.subscribe('cas_won', _onCasWon);
+    channel.subscribe('lease-update', _onLeaseUpdate);
   }
 
   async function disconnect() {
@@ -620,27 +635,206 @@ function createAblyTransport(opts) {
     await publish(event, Object.assign({ target: handle }, data || {}));
   }
 
-  // Lease store interface (read/cas/del/list). For Ably we use channel
-  // state as a logical key-value store: a lease is represented as a
-  // persisted message on a per-lease subchannel. The in-memory map below
-  // acts as a local cache refreshed by subscribing to the lease event.
+  // ====================================================================
+  // T024 (spec-collab-fix R005): authoritative CAS via publish-ack.
+  //
+  // The old cas() mutated a local Map and fire-and-forgot a lease-update
+  // broadcast, so two Ably clients racing null -> lease each saw their own
+  // check against an empty local cache and both returned true. The fix
+  // moves the "who won?" decision onto the wire:
+  //
+  //   1. Proposer publishes   cas_propose { name, expected, next, reqId,
+  //                                         from, ts }
+  //   2. Every receiver records the proposal in a per-lease queue.
+  //   3. After a brief election window (casElectionMs), the authoritative
+  //      echoer evaluates the queue and publishes exactly one cas_won
+  //      { reqId, winner } with the winning proposer's clientId.
+  //      - If someone currently holds the lease, the HOLDER is the echoer.
+  //        The holder admits only proposals whose `expected` matches the
+  //        current lease state, ordered by (ts asc, from asc); first wins.
+  //      - If nobody holds the lease, the participant with the lowest
+  //        known clientId is the echoer, using the same ordering rule on
+  //        null-expected proposals.
+  //   4. Every proposer resolves its pending promise when it sees the
+  //      matching cas_won (true if winner === own clientId, else false).
+  //      A 500 ms timeout returns false with reason "cas_timeout" so a
+  //      dropped echo cannot stall the caller.
+  //
+  // Local lease state is kept authoritative through the cas_won path: the
+  // winning echoer applies the mutation locally AND publishes a
+  // lease-update so late joiners converge via _onLeaseUpdate. Losing
+  // proposers never mutate local state -- they simply observe the winner.
+  // ====================================================================
+
   const localLeases = new Map();
-  function read(name) {
-    return localLeases.has(name) ? Object.assign({}, localLeases.get(name)) : null;
-  }
+  // reqId -> { resolve, timer, next, name, expected, from, ts }
+  const pendingProposals = new Map();
+  // name -> Array<{ reqId, expected, next, from, ts }>
+  const proposalQueue = new Map();
+  // reqIds this node has already echoed a cas_won for (prevents duplicates
+  // when an election window fires more than once for the same request).
+  const echoedReqs = new Set();
+  // reqIds this node has already resolved from a cas_won observation.
+  const resolvedReqs = new Set();
+  // Known participant clientIds, seeded with our own; learned from every
+  // cas_propose `from` field. Used for the no-holder lowest-id tiebreak.
+  const participants = new Set([clientId]);
+  // Debug hook: the most recent cas() result on this transport. Exposed via
+  // _internal so tests can assert on `reason: "cas_timeout"` without forcing
+  // a richer object return type than the spec contract (Promise<boolean>).
+  let lastCasResult = null;
+
   function _same(a, b) {
     if (a === b) return true; if (!a || !b) return false;
     return a.claimant === b.claimant && a.acquiredAt === b.acquiredAt;
   }
+  function _matchesExpected(expected, current) {
+    if (expected === null || expected === undefined) return current === null || current === undefined;
+    return _same(expected, current);
+  }
+
+  // Compare two proposals for the "first valid" rule: lower ts wins; if tied,
+  // lower clientId wins. Strings compare lexicographically which is the
+  // deterministic behavior R005 requires for the no-holder tiebreak.
+  function _proposalOrder(a, b) {
+    if (a.ts !== b.ts) return a.ts - b.ts;
+    if (a.from < b.from) return -1;
+    if (a.from > b.from) return 1;
+    return 0;
+  }
+
+  // Run the winner-election for a given lease name. This is idempotent and
+  // safe to call multiple times: _publishCasWon guards on echoedReqs.
+  function _electAndEcho(name) {
+    const queue = proposalQueue.get(name) || [];
+    if (queue.length === 0) return;
+    const current = localLeases.has(name) ? localLeases.get(name) : null;
+    // Determine who is authorized to echo for this lease.
+    // Holder-of-record path: the current lease holder echoes. Their identity
+    // is the lease `claimant` (which must equal some participant's clientId).
+    let authorizedEchoer;
+    if (current && current.claimant) {
+      authorizedEchoer = current.claimant;
+    } else {
+      // No holder: pick the lowest clientId among known participants.
+      const sorted = Array.from(participants).sort();
+      authorizedEchoer = sorted[0];
+    }
+    if (authorizedEchoer !== clientId) return;
+    // We are the echoer. Evaluate proposals whose `expected` matches the
+    // current lease state, ordered by ts asc then clientId asc.
+    const valid = queue
+      .filter(p => _matchesExpected(p.expected, current))
+      .sort(_proposalOrder);
+    if (valid.length === 0) return;
+    const winner = valid[0];
+    if (echoedReqs.has(winner.reqId)) return;
+    echoedReqs.add(winner.reqId);
+    // Apply the mutation locally before broadcasting the ack, so subsequent
+    // elections in this process see the updated holder.
+    if (winner.next === null || winner.next === undefined) {
+      localLeases.delete(name);
+    } else {
+      localLeases.set(name, Object.assign({}, winner.next));
+    }
+    // Publish cas_won and a companion lease-update. Fire-and-forget: the
+    // proposer also owns its own timeout so a dropped message is safe.
+    if (connected) {
+      channel.publish('cas_won', { reqId: winner.reqId, winner: winner.from, name, next: winner.next });
+      channel.publish('lease-update', { name, next: winner.next });
+    }
+  }
+
+  function _onCasPropose(msg) {
+    const d = msg && msg.data;
+    if (!d || typeof d.reqId !== 'string' || typeof d.name !== 'string') return;
+    if (typeof d.from === 'string') participants.add(d.from);
+    const queue = proposalQueue.get(d.name) || [];
+    // Idempotency: if we've already enqueued this reqId, skip. Prevents
+    // double-counting if the channel redelivers (ably does not normally do
+    // that, but the mock might under custom delays).
+    if (queue.some(p => p.reqId === d.reqId)) return;
+    queue.push({
+      reqId: d.reqId,
+      name: d.name,
+      expected: d.expected === undefined ? null : d.expected,
+      next: d.next === undefined ? null : d.next,
+      from: d.from,
+      ts: Number(d.ts) || Date.now()
+    });
+    proposalQueue.set(d.name, queue);
+    // Defer the election until casElectionMs has passed so contemporaneous
+    // proposals from other nodes can also arrive. This timer is NOT unref'd:
+    // a proposer awaiting on cas() is blocked on the eventual cas_won, and
+    // the cas_won can only be produced after this election fires. Unref
+    // would allow node to exit before resolving the outer promise.
+    setTimeout(() => _electAndEcho(d.name), casElectionMs);
+  }
+
+  function _onCasWon(msg) {
+    const d = msg && msg.data;
+    if (!d || typeof d.reqId !== 'string') return;
+    if (resolvedReqs.has(d.reqId)) return;
+    const pending = pendingProposals.get(d.reqId);
+    if (!pending) {
+      // Not our proposal; still mark resolved so late duplicate echoes are
+      // ignored by this node's bookkeeping.
+      resolvedReqs.add(d.reqId);
+      return;
+    }
+    resolvedReqs.add(d.reqId);
+    pendingProposals.delete(d.reqId);
+    if (pending.timer) clearTimeout(pending.timer);
+    const won = d.winner === clientId;
+    lastCasResult = { ok: won, reason: won ? 'cas_ack' : 'cas_lost', reqId: d.reqId };
+    pending.resolve(won);
+  }
+
+  function _onLeaseUpdate(msg) {
+    const d = msg && msg.data;
+    if (!d || typeof d.name !== 'string') return;
+    if (d.next === null || d.next === undefined) {
+      localLeases.delete(d.name);
+    } else {
+      localLeases.set(d.name, Object.assign({}, d.next));
+    }
+  }
+
+  function read(name) {
+    return localLeases.has(name) ? Object.assign({}, localLeases.get(name)) : null;
+  }
+
   function cas(name, expected, next) {
-    const cur = localLeases.has(name) ? localLeases.get(name) : null;
-    if (expected === null && cur !== null) return false;
-    if (expected !== null && !_same(cur, expected)) return false;
-    if (next === null) localLeases.delete(name);
-    else localLeases.set(name, Object.assign({}, next));
-    // Fire-and-forget broadcast so peers converge.
-    if (connected) publish('lease-update', { name, next }).catch(() => {});
-    return true;
+    if (!connected) {
+      // Cannot publish-ack without a connection; mirror the old behavior's
+      // error surface by resolving false with an explanatory reason.
+      lastCasResult = { ok: false, reason: 'cas_disconnected' };
+      return Promise.resolve(false);
+    }
+    const reqId = crypto.randomUUID();
+    const ts = Date.now();
+    return new Promise((resolve) => {
+      // Register pending BEFORE publishing so an instantaneous echo (same
+      // process, zero-latency mock) is not dropped on the floor.
+      //
+      // The timeout timer is NOT unref'd: the caller is awaiting this
+      // promise and the event loop must stay alive until the timer fires
+      // or a cas_won arrives. If every timer on the loop were unref'd the
+      // process could exit before resolving. Backpressure is bounded by
+      // casTimeoutMs regardless.
+      const timer = setTimeout(() => {
+        if (!pendingProposals.has(reqId)) return;
+        pendingProposals.delete(reqId);
+        resolvedReqs.add(reqId);
+        lastCasResult = { ok: false, reason: 'cas_timeout', reqId };
+        resolve(false);
+      }, casTimeoutMs);
+      pendingProposals.set(reqId, { resolve, timer, name, expected, next, from: clientId, ts });
+      // Fire the proposal. A publish failure does not short-circuit the
+      // pending promise: the timeout path will still resolve eventually so
+      // the caller never hangs.
+      channel.publish('cas_propose', { name, expected, next, reqId, from: clientId, ts });
+    });
   }
   function del(name, expected) { return cas(name, expected, null); }
   function list() { return Array.from(localLeases.values()).map(v => Object.assign({}, v)); }
@@ -650,7 +844,13 @@ function createAblyTransport(opts) {
     connect, disconnect,
     publish, subscribe, sendTargeted,
     read, cas, del, list,
-    _internal: { get client() { return client; }, get channel() { return channel; } }
+    _internal: {
+      get client() { return client; },
+      get channel() { return channel; },
+      get lastCasResult() { return lastCasResult; },
+      get participants() { return new Set(participants); },
+      get proposalQueue() { return proposalQueue; }
+    }
   };
 }
 
