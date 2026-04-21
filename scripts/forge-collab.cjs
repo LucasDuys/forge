@@ -29,6 +29,63 @@ const DEFAULT_HEARTBEAT_SECONDS = 30;
 const DEFAULT_CONSOLIDATION_TTL_SECONDS = 30;
 const CLAIM_PREFIX = 'claim:';
 
+// T019 (spec-collab-fix R003): bounded append queue cap on state.json.
+// Writers evict oldest-first once messages.length exceeds the cap and emit
+// a console.warn so an operator sees the ceiling being hit.
+const MESSAGE_QUEUE_CAP = 500;
+const SCHEMA_PATH = path.join(__dirname, 'forge-collab-schema.json');
+
+/**
+ * Minimal validator for the collab state document. Zero-dep by design: we
+ * do not want to add ajv to Forge's dependency surface for a 2-key schema.
+ * The JSON-schema file at scripts/forge-collab-schema.json is the canonical
+ * description; this function enforces the load-bearing subset (shape + the
+ * few required keys per message/lease) and returns a list of human-readable
+ * error strings. Callers log warnings on malformed payloads but accept them
+ * for forward compat -- later state-document versions must never brick an
+ * older client.
+ *
+ * Returns: { valid: boolean, errors: string[] }
+ */
+function _validateStateShape(state) {
+  const errors = [];
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    return { valid: false, errors: ['state is not an object'] };
+  }
+  if (!state.leases || typeof state.leases !== 'object' || Array.isArray(state.leases)) {
+    errors.push('leases is not an object');
+  } else {
+    for (const [name, lease] of Object.entries(state.leases)) {
+      if (!lease || typeof lease !== 'object' || Array.isArray(lease)) {
+        errors.push('leases.' + name + ' is not an object');
+        continue;
+      }
+      if (typeof lease.claimant !== 'string') {
+        errors.push('leases.' + name + '.claimant is not a string');
+      }
+      if (typeof lease.acquiredAt !== 'string') {
+        errors.push('leases.' + name + '.acquiredAt is not a string');
+      }
+    }
+  }
+  if (!Array.isArray(state.messages)) {
+    errors.push('messages is not an array');
+  } else {
+    for (let i = 0; i < state.messages.length; i++) {
+      const m = state.messages[i];
+      if (!m || typeof m !== 'object' || Array.isArray(m)) {
+        errors.push('messages[' + i + '] is not an object');
+        continue;
+      }
+      if (typeof m.id !== 'string') errors.push('messages[' + i + '].id is not a string');
+      if (typeof m.event !== 'string') errors.push('messages[' + i + '].event is not a string');
+      if (typeof m.from !== 'string') errors.push('messages[' + i + '].from is not a string');
+      if (typeof m.ts !== 'string') errors.push('messages[' + i + '].ts is not a string');
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}
+
 /**
  * Return the origin remote URL for the repo at `cwd`, or throw if none exists.
  */
@@ -569,6 +626,10 @@ function createPollingTransport(opts) {
   const localLeases = new Map();
   const pendingMessages = [];
   const subscribers = new Map(); // event -> [cb...]
+  // T019 (R003): per-process seen-ids set. Messages previously delivered to
+  // any subscriber of this transport instance are never fanned out twice,
+  // even when _refresh() re-reads the same state.json across polls.
+  const seenIds = new Set();
 
   async function connect() {
     if (connected) return;
@@ -593,7 +654,12 @@ function createPollingTransport(opts) {
     }
     const messages = snapshot && Array.isArray(snapshot.messages) ? snapshot.messages : [];
     for (const m of messages) {
-      if (pendingMessages.find(pm => pm.id === m.id)) continue;
+      if (!m || !m.id) continue;
+      // T019 (R003): seenIds is the per-process dedup contract. pendingMessages
+      // is retained for _internal inspection in tests but no longer drives dedup
+      // (it previously grew unbounded across polls).
+      if (seenIds.has(m.id)) continue;
+      seenIds.add(m.id);
       pendingMessages.push(m);
       const subs = subscribers.get(m.event) || [];
       for (const cb of subs) {
@@ -653,6 +719,7 @@ function createPollingTransport(opts) {
     _internal: {
       _refresh,
       get pendingMessages() { return pendingMessages.slice(); },
+      get seenIds() { return new Set(seenIds); },
       get io() { return io; },
       get branch() { return branch; }
     }
@@ -766,6 +833,18 @@ function _defaultPollingIo(opts) {
     if (!state || typeof state !== 'object') state = { leases: {}, messages: [] };
     if (!state.leases || typeof state.leases !== 'object') state.leases = {};
     if (!Array.isArray(state.messages)) state.messages = [];
+    // T019 (R003): schema validate on read. Log a warning on any violation
+    // and return the (coerced) state anyway -- older readers must keep
+    // working when a newer writer adds unknown keys.
+    const check = _validateStateShape(state);
+    if (!check.valid) {
+      try {
+        // eslint-disable-next-line no-console
+        console.warn(
+          'forge:collab state.json schema violation on read: ' + check.errors.join('; ')
+        );
+      } catch (_) { /* best effort */ }
+    }
     return { sha: remoteSha, state };
   }
 
@@ -831,6 +910,18 @@ function _defaultPollingIo(opts) {
       catch (e) { return { ok: false, reason: 'mutator_threw', error: e.message }; }
       if (mutated && mutated.abort) return mutated.abort;
       const nextState = mutated && mutated.state ? mutated.state : read.state;
+      // T019 (R003): schema validate on write. Warn but never throw -- we
+      // still land the commit because the shape checks are load-bearing for
+      // the current schema version, not for forward-compat additions.
+      const writeCheck = _validateStateShape(nextState);
+      if (!writeCheck.valid) {
+        try {
+          // eslint-disable-next-line no-console
+          console.warn(
+            'forge:collab state.json schema violation on write: ' + writeCheck.errors.join('; ')
+          );
+        } catch (_) { /* best effort */ }
+      }
       const commitSha = _buildCommit(nextState);
       let pushResult;
       try {
@@ -942,11 +1033,26 @@ function _defaultPollingIo(opts) {
 
     async appendMessage(branch, msg) {
       return _mutate(branch, (state) => {
+        // T019 (R003): ordering is load-bearing. TTL pruning first removes
+        // stale entries; the 500-cap then evicts the oldest *non-stale*
+        // messages if the queue is still over the ceiling after append.
         state.messages = _pruneMessages(state.messages, opts.now);
         const withTs = Object.assign({ ts: new Date().toISOString() }, msg || {});
         // Dedupe by id when the caller already assigned one.
         if (!withTs.id || !state.messages.find(m => m.id === withTs.id)) {
           state.messages.push(withTs);
+        }
+        if (state.messages.length > MESSAGE_QUEUE_CAP) {
+          const evictCount = state.messages.length - MESSAGE_QUEUE_CAP;
+          // Oldest-first eviction: state.messages is append-ordered, so
+          // the earliest entries are the oldest.
+          state.messages = state.messages.slice(evictCount);
+          try {
+            // eslint-disable-next-line no-console
+            console.warn(
+              'forge:collab message queue at cap, evicting ' + evictCount + ' oldest'
+            );
+          } catch (_) { /* best effort */ }
         }
         return { state };
       });
@@ -959,7 +1065,8 @@ function _defaultPollingIo(opts) {
       _pruneMessages,
       get ttlSeconds() { return ttlSeconds; },
       get retries() { return retries; },
-      get backoffMs() { return backoffMs; }
+      get backoffMs() { return backoffMs; },
+      get messageQueueCap() { return MESSAGE_QUEUE_CAP; }
     }
   };
 }
@@ -2264,6 +2371,9 @@ module.exports = {
     _isExpired, _claimName, _safeHandle, _safeKind,
     _parseFrontmatter, _extractSections, _defaultClassifier, _defaultContradictionDetector,
     _inputsPath, _consolidatedPath, _categoriesPath, _questionsDir,
-    _defaultPollingIo
+    _defaultPollingIo,
+    _validateStateShape,
+    MESSAGE_QUEUE_CAP,
+    SCHEMA_PATH
   }
 };
