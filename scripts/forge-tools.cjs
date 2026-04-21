@@ -4786,6 +4786,281 @@ function readTranscript(forgeDir, cycleId) {
   return out;
 }
 
+// ======================================================================
+// T017 / R009 — Completion promise gates
+//
+// `<promise>FORGE_COMPLETE</promise>` must gate on four independent
+// conditions before firing. If any gate fails, the loop must emit
+// `<promise>FORGE_BLOCKED</promise>` with a structured `reasons:` JSON
+// payload inline so downstream consumers (collab participants, the
+// review-branch command, the TUI dashboard) can discriminate rather than
+// treat all non-COMPLETE exits as identical.
+//
+// The four gates:
+//   tasks    — every task id in the frontier/registry is DONE or
+//              DONE_WITH_CONCERNS (the guard from R008 already enforces
+//              this on state.md writes, but the completion promise check
+//              is belt-and-braces and also runs when the agent bypasses
+//              writeState).
+//   visual   — every [visual] AC has status `pass`. Visual AC status is
+//              sourced from `.forge/completion-gates.json` first (the
+//              authoritative file written by T020's visual verifier once
+//              that lands), falling back to per-task progress files at
+//              `.forge/progress/<task-id>.json` where an agent can record
+//              `{visual_acs: [{id, status, detail}]}` inline.
+//   nonvisual — every non-visual AC that the agent has reported. Absence
+//              of data here is not a failure (structural tests are the
+//              traditional non-visual signal and they already gate at the
+//              task level). This gate only fails when the agent or a
+//              verifier has explicitly recorded `fail`/`blocked` for a
+//              non-visual AC.
+//   flags    — zero open collab flags in `.forge/collab/flags/*.md`. A
+//              flag with `status: open` means a forward-motion decision
+//              is still awaiting human review; shipping COMPLETE on top
+//              of an open flag would be the same class of silent-pass
+//              bug as the blurry-graph case R009 exists to fix.
+//
+// Return shape is stable for both contract tests and the JSON payload
+// inlined in FORGE_BLOCKED:
+//   {
+//     complete: boolean,
+//     gates: { tasks, visual, nonvisual, flags },  // each true | false
+//     reasons: [{ gate, ac?, task?, detail }]
+//   }
+// `reasons` is empty iff `complete === true`.
+// ======================================================================
+
+// Statuses that count as "task done" per R008 (both the internal
+// lowercase registry form and the status-report UPPERCASE form the
+// forge-executor agent emits are accepted).
+const _COMPLETION_TASK_DONE_STATUSES = new Set([
+  'complete', 'complete_with_concerns',
+  'DONE', 'DONE_WITH_CONCERNS'
+]);
+
+// AC pass statuses. Accepts both cases so the visual verifier and the
+// agent self-reports can use whatever convention they prefer.
+const _COMPLETION_AC_PASS_STATUSES = new Set(['pass', 'PASS']);
+
+// Walk every frontier file in .forge/plans/ and collect task ids. The
+// registry may grow beyond the frontier (sub-tasks from redecomposition,
+// legacy entries), so the authoritative "tasks we must check" set is
+// frontier ∪ registry. That way a frontier-declared task missing from
+// the registry is still flagged.
+function _completionGatesCollectTaskIds(forgeDir) {
+  const ids = new Set();
+  const plansDir = path.join(forgeDir, 'plans');
+  try {
+    const files = fs.readdirSync(plansDir).filter(f => f.endsWith('-frontier.md'));
+    for (const f of files) {
+      let text;
+      try { text = fs.readFileSync(path.join(plansDir, f), 'utf8'); }
+      catch (_) { continue; }
+      const tasks = parseFrontier(text);
+      for (const t of tasks) if (t && t.id) ids.add(t.id);
+    }
+  } catch (_) { /* no plans dir -> fall back to registry only */ }
+  return ids;
+}
+
+// Read the authoritative completion-gates JSON if present. Shape:
+//   {
+//     visual:    [{ id, task_id?, path?, status, detail? }, ...],
+//     nonvisual: [{ id, task_id?, status, detail? }, ...]
+//   }
+// Missing file is not an error; returns null and the caller falls back
+// to progress/*.json scanning.
+function _readCompletionGatesFile(forgeDir) {
+  const p = path.join(forgeDir, 'completion-gates.json');
+  try {
+    const obj = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!obj || typeof obj !== 'object') return null;
+    return {
+      visual: Array.isArray(obj.visual) ? obj.visual : [],
+      nonvisual: Array.isArray(obj.nonvisual) ? obj.nonvisual : []
+    };
+  } catch (_) { return null; }
+}
+
+// Scan progress/*.json for embedded AC records. Agents may record an
+// inline `visual_acs` or `nonvisual_acs` array on their progress file so
+// completion gates can see per-task self-reports even before T020's
+// dedicated file lands. Return value mirrors the completion-gates.json
+// shape.
+function _scanProgressForAcs(forgeDir) {
+  const out = { visual: [], nonvisual: [] };
+  const dir = path.join(forgeDir, 'progress');
+  let files;
+  try { files = fs.readdirSync(dir).filter(f => f.endsWith('.json')); }
+  catch (_) { return out; }
+  for (const f of files) {
+    let obj;
+    try { obj = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); }
+    catch (_) { continue; }
+    if (!obj || typeof obj !== 'object') continue;
+    const taskId = obj.task_id || f.replace(/\.json$/, '');
+    if (Array.isArray(obj.visual_acs)) {
+      for (const ac of obj.visual_acs) {
+        if (ac && typeof ac === 'object') {
+          out.visual.push(Object.assign({ task_id: taskId }, ac));
+        }
+      }
+    }
+    if (Array.isArray(obj.nonvisual_acs)) {
+      for (const ac of obj.nonvisual_acs) {
+        if (ac && typeof ac === 'object') {
+          out.nonvisual.push(Object.assign({ task_id: taskId }, ac));
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Count open collab flags. Opts.collabDir override supports tests that
+// seed fixtures outside the default `<forgeDir>/collab` location.
+function _countOpenCollabFlags(forgeDir, opts) {
+  const collabDir = (opts && opts.collabDir) || path.join(forgeDir, 'collab');
+  const flagsDir = path.join(collabDir, 'flags');
+  let files;
+  try { files = fs.readdirSync(flagsDir).filter(f => f.endsWith('.md')); }
+  catch (_) { return { open: 0, openFlags: [] }; }
+  const openFlags = [];
+  for (const f of files) {
+    let text;
+    try { text = fs.readFileSync(path.join(flagsDir, f), 'utf8'); }
+    catch (_) { continue; }
+    // Match the flag frontmatter emitted by forge-collab.cjs: a
+    // `status: open` line inside the leading `---` block.
+    const m = text.match(/^---\n([\s\S]*?)\n---/);
+    if (!m) continue;
+    const statusLine = m[1].split('\n').find(l => /^status:\s*/.test(l));
+    if (!statusLine) continue;
+    const status = statusLine.replace(/^status:\s*/, '').trim();
+    if (status === 'open') {
+      // Extract id and task_id for the reasons payload so humans can
+      // jump straight to the flag without grepping.
+      const idMatch = m[1].match(/^id:\s*(.+)$/m);
+      const taskMatch = m[1].match(/^task_id:\s*(.+)$/m);
+      openFlags.push({
+        id: idMatch ? idMatch[1].trim() : f.replace(/\.md$/, ''),
+        task_id: taskMatch ? taskMatch[1].trim() : null,
+        path: path.join(flagsDir, f)
+      });
+    }
+  }
+  return { open: openFlags.length, openFlags };
+}
+
+/**
+ * Evaluate the four completion gates. Pure read-only — safe to call
+ * anywhere, including inside the stop hook before deciding whether to
+ * let a FORGE_COMPLETE emission through.
+ *
+ * opts:
+ *   collabDir           override `<forgeDir>/collab` (tests).
+ *   gatesFile           override `<forgeDir>/completion-gates.json` (tests).
+ *   requireTaskRegistry when true (default), an empty registry fails the
+ *                       tasks gate with reason "no_tasks_registered". When
+ *                       false (used by the setup-state path) an empty
+ *                       registry passes — we do not want to block a fresh
+ *                       project from ever firing a completion event.
+ */
+function checkCompletionGates(forgeDir, opts) {
+  opts = opts || {};
+  const reasons = [];
+  const gates = { tasks: true, visual: true, nonvisual: true, flags: true };
+
+  // --- Gate: tasks --------------------------------------------------------
+  const registry = readTaskRegistry(forgeDir);
+  const frontierIds = _completionGatesCollectTaskIds(forgeDir);
+  const registryIds = new Set(Object.keys(registry.tasks || {}));
+  const allIds = new Set([...frontierIds, ...registryIds]);
+
+  if (allIds.size === 0 && opts.requireTaskRegistry !== false) {
+    gates.tasks = false;
+    reasons.push({ gate: 'tasks', detail: 'no tasks registered; frontier and task-status.json both empty' });
+  } else {
+    for (const id of allIds) {
+      const entry = registry.tasks[id];
+      if (!entry) {
+        gates.tasks = false;
+        reasons.push({
+          gate: 'tasks', task: id,
+          detail: `task ${id} is in the frontier but has no registry entry`
+        });
+        continue;
+      }
+      if (!_COMPLETION_TASK_DONE_STATUSES.has(entry.status)) {
+        gates.tasks = false;
+        reasons.push({
+          gate: 'tasks', task: id,
+          detail: `task ${id} status=${entry.status} (expected DONE or DONE_WITH_CONCERNS)`
+        });
+      }
+    }
+  }
+
+  // --- Gates: visual + nonvisual ------------------------------------------
+  // Prefer the authoritative completion-gates.json when present; fall
+  // back to scanning per-task progress files. When both are present the
+  // authoritative file wins (tests assert this).
+  let acSource = null;
+  if (opts.gatesFile) {
+    try { acSource = JSON.parse(fs.readFileSync(opts.gatesFile, 'utf8')); }
+    catch (_) { acSource = null; }
+  }
+  if (!acSource) acSource = _readCompletionGatesFile(forgeDir);
+  if (!acSource) acSource = _scanProgressForAcs(forgeDir);
+  const visualAcs = Array.isArray(acSource.visual) ? acSource.visual : [];
+  const nonvisualAcs = Array.isArray(acSource.nonvisual) ? acSource.nonvisual : [];
+
+  for (const ac of visualAcs) {
+    if (!ac || !_COMPLETION_AC_PASS_STATUSES.has(ac.status)) {
+      gates.visual = false;
+      reasons.push({
+        gate: 'visual',
+        ac: ac && ac.id ? ac.id : '(unknown)',
+        task: ac && ac.task_id ? ac.task_id : undefined,
+        detail: ac && ac.detail
+          ? String(ac.detail)
+          : `visual AC ${ac && ac.id ? ac.id : '(unknown)'} status=${ac ? ac.status : 'missing'}`
+      });
+    }
+  }
+
+  for (const ac of nonvisualAcs) {
+    if (!ac || !_COMPLETION_AC_PASS_STATUSES.has(ac.status)) {
+      gates.nonvisual = false;
+      reasons.push({
+        gate: 'nonvisual',
+        ac: ac && ac.id ? ac.id : '(unknown)',
+        task: ac && ac.task_id ? ac.task_id : undefined,
+        detail: ac && ac.detail
+          ? String(ac.detail)
+          : `non-visual AC ${ac && ac.id ? ac.id : '(unknown)'} status=${ac ? ac.status : 'missing'}`
+      });
+    }
+  }
+
+  // --- Gate: flags --------------------------------------------------------
+  const flagResult = _countOpenCollabFlags(forgeDir, opts);
+  if (flagResult.open > 0) {
+    gates.flags = false;
+    for (const flag of flagResult.openFlags) {
+      reasons.push({
+        gate: 'flags',
+        flag: flag.id,
+        task: flag.task_id || undefined,
+        detail: `collab flag ${flag.id} is still open (${flag.path})`
+      });
+    }
+  }
+
+  const complete = gates.tasks && gates.visual && gates.nonvisual && gates.flags;
+  return { complete, gates, reasons };
+}
+
 // === CLI Entry Point ===
 
 if (require.main === module) {
@@ -5415,6 +5690,29 @@ if (require.main === module) {
     } catch (e) {
       process.stderr.write('research-append failed: ' + e.message + '\n');
       process.exit(1);
+    }
+  }
+
+  // === T017 / R009 — completion-check ===
+  // Emits the JSON result of checkCompletionGates so callers (stop hook,
+  // review-branch, TUI, humans) can decide whether FORGE_COMPLETE is
+  // legitimate. Exit code: 0 when complete === true, 1 when false.
+  // Errors parsing the forge dir exit with code 2 so callers can
+  // discriminate "gates failed" from "check itself failed".
+  if (command === 'completion-check') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const collabDir = args.find((a, i) => args[i - 1] === '--collab-dir') || null;
+    const gatesFile = args.find((a, i) => args[i - 1] === '--gates-file') || null;
+    const requireTaskRegistry = !args.includes('--allow-empty-registry');
+    try {
+      const result = checkCompletionGates(forgeDir, {
+        collabDir, gatesFile, requireTaskRegistry
+      });
+      process.stdout.write(JSON.stringify(result) + '\n');
+      process.exit(result.complete ? 0 : 1);
+    } catch (e) {
+      process.stderr.write('completion-check failed: ' + e.message + '\n');
+      process.exit(2);
     }
   }
 }
@@ -6427,6 +6725,8 @@ module.exports = {
   captureTrajectory, trajectoryStats, tokenReport, promoteToGlobalLearning,
   compressContext, shouldCompress, getCompressionThreshold,
   appendTranscript, readTranscript,
+  // T017 / R009: completion-promise gates (tasks + visual + non-visual + flags).
+  checkCompletionGates,
   // T014 / R005: research aggregator re-exports for convenience.
   // The canonical implementation lives in forge-research-aggregator.cjs.
   get appendResearchSection() { return require('./forge-research-aggregator.cjs').appendResearchSection; },
