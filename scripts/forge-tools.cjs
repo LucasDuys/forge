@@ -7,12 +7,39 @@ const { execFileSync, execSync } = require('child_process');
 
 // === YAML Frontmatter Parser (minimal, no dependencies) ===
 
+// Parse the leading YAML frontmatter from a text blob. If multiple frontmatter
+// blocks are stacked at the top of the file (an artifact of older writeState
+// behavior pre forge-self-fixes R007), recursively merge all of them with
+// LATER values winning, and return `content` as everything after the last
+// frontmatter block. This lets setup-state be idempotent: any pre-existing
+// stacked blocks collapse into a single canonical frontmatter on the next
+// write, and writeState never prepends a duplicate block.
 function parseFrontmatter(text) {
   const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!match) return { data: {}, content: text };
 
+  const data = _parseYamlLines(match[1]);
+  let remainder = match[2];
+
+  // Strip leading blank lines and recursively consume any additional stacked
+  // frontmatter blocks. Later values shadow earlier ones (representing the
+  // most recent write).
+  while (true) {
+    const lstripped = remainder.replace(/^\s*\n+/, '');
+    if (!lstripped.startsWith('---\n')) break;
+    const next = lstripped.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+    if (!next) break;
+    const moreData = _parseYamlLines(next[1]);
+    Object.assign(data, moreData);
+    remainder = next[2];
+  }
+
+  return { data, content: remainder };
+}
+
+function _parseYamlLines(block) {
   const data = {};
-  for (const line of match[1].split('\n')) {
+  for (const line of block.split('\n')) {
     const sep = line.indexOf(':');
     if (sep === -1) continue;
     const key = line.slice(0, sep).trim();
@@ -29,7 +56,7 @@ function parseFrontmatter(text) {
     else if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
     data[key] = val;
   }
-  return { data, content: match[2] };
+  return data;
 }
 
 function serializeFrontmatter(data, content) {
