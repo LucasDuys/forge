@@ -151,11 +151,25 @@ Stop at or before 7. If you still feel blocked on design decisions, that is a si
 **For projects with UI components, add a design system question:**
 > Does this project have a design system or brand guidelines?
 > A) Yes, I have a DESIGN.md file (specify path)
-> B) I want to base it on an existing brand (e.g., Stripe, Linear, Claude)
+> B) I want to base it on an existing brand (e.g., Stripe, Linear, Anthropic, Vercel, Raycast)
 > C) No specific design requirements -- use sensible defaults
 > D) I'll provide design specs later
 
-If option B, generate a DESIGN.md using the template from `skills/design-system/SKILL.md` and write it to the project root. Reference the awesome-design-md catalog (github.com/VoltAgent/awesome-design-md) for established brand design systems.
+**DESIGN.md gate (forge-self-fixes R002).** If the user selects option B or names any brand in a free-form answer to this question, you MUST NOT advance to Phase 4 proposal emission until a DESIGN.md exists at the repo root. This gate is enforced by the brainstorm-check-design subcommand:
+
+```bash
+node scripts/forge-tools.cjs brainstorm-check-design --repo-root <repo> --brand-name <brand>
+```
+
+Exit 0 means the file exists and you may proceed. Exit 3 means it is missing — take one of these paths depending on the brand:
+
+1. If the brand is Anthropic: invoke the `brand-guidelines` Skill to retrieve the official tokens, write them into DESIGN.md at the repo root using the template at `skills/design-system/SKILL.md`, then re-run the check.
+2. For any other named brand (Linear, Stripe, Vercel, Raycast, etc.): invoke `frontend-design` and reference the awesome-design-md catalog at https://github.com/VoltAgent/awesome-design-md; write a DESIGN.md derived from whatever reference you can locate.
+3. If no brand guide is locatable: ASK the user for a design token source (Figma link, screenshot, or a one-paragraph brand brief) and write DESIGN.md from that before proceeding.
+
+This closes the gap from the 2026-04-21 forge-landing run where the user picked Anthropic aesthetic at Q5 and the brainstorm progressed to Phase 4 without writing any DESIGN.md, causing the executor to approximate brand tokens from memory. The gate is BOTH a documentation rule (bold "MUST NOT" above) AND a programmatic check — if the CLI returns exit 3 and you advance anyway, subsequent Forge audits will catch the violation in state.md decisions.
+
+If option C or D: no DESIGN.md needed, proceed normally. Mark the spec's frontmatter `design:` key as `none` (option C) or `deferred` (option D) so the executor's UI-task routing logic (forge-self-fixes R003) can decide whether to invoke `frontend-design` anyway.
 
 ### Phase 3.4: Parallel research dispatch
 

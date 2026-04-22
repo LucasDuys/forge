@@ -6298,6 +6298,44 @@ if (require.main === module) {
     process.exit(0);
   }
 
+  // brainstorm-check-design (forge-self-fixes R002)
+  //
+  // Phase-4 gate: when the brainstorming skill has identified a brand-based
+  // aesthetic choice (user picked "Linear-style dark", "Anthropic brand",
+  // etc.), it must confirm a DESIGN.md exists at the repo root BEFORE
+  // proceeding to approach proposals. Without this gate the executor will
+  // write UI code using approximated brand tokens, as observed on
+  // 2026-04-21.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs brainstorm-check-design --repo-root . --brand-name anthropic
+  //
+  // Exit codes:
+  //   0  design.md present -> stdout { ok:true, path:"DESIGN.md" }
+  //   3  design.md missing -> stdout { ok:false, reason:"missing_design_md", brand:"..." }
+  //   2  bad args
+  if (command === 'brainstorm-check-design') {
+    const repoRoot = args.find((a, i) => args[i - 1] === '--repo-root') || process.cwd();
+    const brandName = args.find((a, i) => args[i - 1] === '--brand-name') || null;
+    const candidates = ['DESIGN.md', 'design.md', path.join('docs', 'DESIGN.md')];
+    let found = null;
+    for (const rel of candidates) {
+      const abs = path.resolve(repoRoot, rel);
+      if (fs.existsSync(abs)) { found = rel; break; }
+    }
+    if (found) {
+      process.stdout.write(JSON.stringify({ ok: true, path: found }) + '\n');
+      process.exit(0);
+    }
+    process.stdout.write(JSON.stringify({
+      ok: false,
+      reason: 'missing_design_md',
+      brand: brandName,
+      searched: candidates
+    }) + '\n');
+    process.exit(3);
+  }
+
   // research-append (T014 / R005) -- shell bridge into forge-research-aggregator.
   // Called from skill runtime after a background forge-researcher dispatch
   // returns so the output lands in .forge/specs/<spec>.research.md.
