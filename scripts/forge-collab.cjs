@@ -761,8 +761,28 @@ function createAblyTransport(opts) {
 
   async function disconnect() {
     if (!client) return;
-    await client.close();
     connected = false;
+    // forge-self-fixes-2 R012: brief grace period so queued publishes
+    // have a chance to flush before the connection closes. Without this,
+    // parallel disconnect() calls on two transports hit Ably's
+    // ConnectionManager.failQueuedMessages path and throw err 80017.
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      await client.close();
+    } catch (e) {
+      // Swallow the well-known "Connection closed" race that surfaces when
+      // two transports tear down in quick succession. The connection is
+      // going away either way; any state we cared about was already
+      // flushed by the grace period above. Anything else bubbles up.
+      const msg = (e && e.message) || '';
+      const code = e && e.code;
+      if (code === 80017 || /Connection closed/i.test(msg)) {
+        // no-op
+      } else {
+        throw e;
+      }
+    }
+    client = null;
   }
 
   async function publish(event, data) {
