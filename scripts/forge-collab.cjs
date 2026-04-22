@@ -2378,7 +2378,9 @@ async function squashMergeAndPush(opts) {
     : (ms) => new Promise(r => setTimeout(r, ms));
   const retries = typeof opts.retries === 'number' ? opts.retries : DEFAULT_MERGE_RETRIES;
   const backoffMs = typeof opts.backoffMs === 'number' ? opts.backoffMs : DEFAULT_MERGE_BACKOFF_MS;
-  const main = opts.mainBranch || 'main';
+  // forge-self-fixes-2 R011: resolve the repo's actual default branch when
+  // caller didn't pin opts.mainBranch. Falls back to 'main' on any failure.
+  const main = opts.mainBranch || _resolvePollingBranch({ cwd: opts.cwd, runner });
   const remote = opts.remote || 'origin';
   const branch = taskBranchName(opts.taskId);
   const msg = opts.commitMessage || ('forge(collab): squash ' + opts.taskId);
@@ -2526,12 +2528,47 @@ function filterClaimableForLateJoin(transport, unblockedTaskIds, opts) {
  *   branch            default "main".
  *   skipGitPull       when true, skip the pull step (for tests).
  */
+// forge-self-fixes-2 R011: resolve the repo's actual upstream branch so
+// lateJoinBootstrap / squashMergeAndPush don't hardcode `main`. Order of
+// preference:
+//   1. explicit opts.branch (caller override)
+//   2. git symbolic-ref refs/remotes/origin/HEAD -> origin/<branch>
+//   3. git rev-parse --abbrev-ref HEAD@{upstream} -> <remote>/<branch>
+//   4. git rev-parse --abbrev-ref HEAD -> <branch>
+//   5. fallback literal 'main'
+// A custom runner is accepted so tests can stub git without shelling out.
+function _resolvePollingBranch(opts) {
+  if (opts && opts.branch) return opts.branch;
+  const runner = (opts && typeof opts.runner === 'function')
+    ? opts.runner
+    : _defaultGitRunner();
+  const cwd = opts && opts.cwd;
+  const tries = [
+    ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'],
+    ['rev-parse', '--abbrev-ref', 'HEAD@{upstream}'],
+    ['rev-parse', '--abbrev-ref', 'HEAD']
+  ];
+  for (const args of tries) {
+    try {
+      const out = runner(args, { cwd });
+      if (!out) continue;
+      const name = String(out).trim();
+      if (!name) continue;
+      // Strip 'origin/' prefix from the symbolic-ref and upstream forms so
+      // callers can use the value directly in `git push origin <branch>`.
+      return name.replace(/^origin\//, '');
+    } catch (_) { /* try next */ }
+  }
+  return 'main';
+}
+
 async function lateJoinBootstrap(opts) {
   opts = opts || {};
   const runner = typeof opts.runner === 'function' ? opts.runner : _defaultGitRunner();
   if (!opts.skipGitPull) {
+    const branch = _resolvePollingBranch({ cwd: opts.cwd, branch: opts.branch, runner });
     try {
-      runner(['pull', opts.remote || 'origin', opts.branch || 'main'], { cwd: opts.cwd });
+      runner(['pull', opts.remote || 'origin', branch], { cwd: opts.cwd });
     } catch (e) {
       return { joined: false, reason: 'git_pull_failed', error: (e && e.message) || String(e) };
     }
@@ -3004,6 +3041,7 @@ module.exports = {
   createTransport,
   createAblyTransport,
   createPollingTransport,
+  _resolvePollingBranch,
   POLLING_BRANCH_DEFAULT,
   POLLING_INTERVAL_MS_DEFAULT,
   brainstormDump,
