@@ -6145,26 +6145,54 @@ if (require.main === module) {
   //
   // Exit codes: 0 on success, 2 on invalid arguments, 1 on write error.
   if (command === 'transcript-append') {
+    // forge-self-fixes R008: manual-walkthrough and CI callers need to write
+    // phase-boundary events without the stop hook. --cycle is now optional;
+    // absent, we look up the active cycle from state.md frontmatter, and if
+    // that's also absent we synthesize a fresh one so every caller can leave
+    // an audit trail. --event is the preferred flag; --entry retained for
+    // back-compat with earlier callers.
     const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
-    const cycle = args.find((a, i) => args[i - 1] === '--cycle');
-    const entryRaw = args.find((a, i) => args[i - 1] === '--entry');
-    if (!cycle) {
-      process.stderr.write('transcript-append: --cycle is required\n');
-      process.exit(2);
-    }
-    if (!entryRaw) {
-      process.stderr.write('transcript-append: --entry is required\n');
+    let cycle = args.find((a, i) => args[i - 1] === '--cycle');
+    const raw = args.find((a, i) => args[i - 1] === '--event')
+             || args.find((a, i) => args[i - 1] === '--entry');
+    if (!raw) {
+      process.stderr.write('transcript-append: --event (or --entry) is required\n');
       process.exit(2);
     }
     let entry;
-    try { entry = JSON.parse(entryRaw); }
+    try { entry = JSON.parse(raw); }
     catch (e) {
-      process.stderr.write('transcript-append: --entry is not valid JSON: ' + e.message + '\n');
+      process.stderr.write('transcript-append: --event is not valid JSON: ' + e.message + '\n');
       process.exit(2);
+    }
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      process.stderr.write('transcript-append: --event must parse to a JSON object\n');
+      process.exit(2);
+    }
+    if (!entry.phase || typeof entry.phase !== 'string') {
+      process.stderr.write('transcript-append: event JSON must include a string "phase" key\n');
+      process.exit(2);
+    }
+    if (!entry.ts) {
+      entry.ts = new Date().toISOString();
+    }
+    if (!cycle) {
+      // Prefer the active cycle recorded in state.md; fall back to a fresh
+      // compact UTC stamp so the tool can be used from a clean tree.
+      try {
+        const st = parseFrontmatter(fs.readFileSync(path.join(forgeDir, 'state.md'), 'utf8'));
+        if (st.data && typeof st.data.cycle === 'string' && st.data.cycle) {
+          cycle = st.data.cycle;
+        }
+      } catch (_) { /* state.md may not exist */ }
+      if (!cycle) {
+        const now = new Date().toISOString();
+        cycle = now.slice(0, 16).replace(/[-:]/g, '').replace(/\.\d+$/, '') + 'Z';
+      }
     }
     try {
       const r = appendTranscript(forgeDir, cycle, entry);
-      process.stdout.write(JSON.stringify(r) + '\n');
+      process.stdout.write(JSON.stringify(Object.assign({ cycle }, r)) + '\n');
       process.exit(0);
     } catch (e) {
       process.stderr.write('transcript-append failed: ' + e.message + '\n');
