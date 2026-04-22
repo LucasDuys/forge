@@ -14,6 +14,109 @@ const { execFileSync, execSync } = require('child_process');
 // frontmatter block. This lets setup-state be idempotent: any pre-existing
 // stacked blocks collapse into a single canonical frontmatter on the next
 // write, and writeState never prepends a duplicate block.
+// _verifyStructuralAcs (forge-self-fixes R006)
+//
+// Walks a spec line by line, pulls out every `- [ ]` AC line, tries to
+// parse it into one of three structural-claim shapes, and asserts each
+// claim against the provided HTML body. Returns { pass, fail, skipped,
+// failures, results } where `results` preserves per-AC outcomes and
+// `failures` is just the subset with status === 'fail'.
+function _verifyStructuralAcs(specText, html) {
+  const bodyText = html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+
+  const lines = specText.split(/\r?\n/);
+  const results = [];
+  const failures = [];
+  let pass = 0, fail = 0, skipped = 0;
+
+  // Regexes keyed by INTENT, not phrase structure. We first detect the
+  // verb ("exists", "contains", "N elements ... match") then pull parameters.
+  // This tolerates markdown noise between the attribute and the verb
+  // (backticks, italics, parenthetical asides).
+  const TESTID_ATTR = /data-testid\s*=\s*["']([^"']+)["']/i;
+  const QUOTED_STR = /["']([^"']+)["']/;
+  const COUNT_PREFIX = /(?:exactly\s+)?(\d+)\s+elements?\s+(?:match|with|tagged|carrying)\b/i;
+  const EXISTS_VERB = /\b(exists?|present|renders?|in\s+the\s+DOM|is\s+(?:an?\s+)?(?:element|descendant))\b/i;
+  const CONTAINS_VERB = /\b(contains?|includes?)\b/i;
+  const TEXT_SUBJECT = /\b(textContent|text\s+content|page\s+(?:text|content)|body\s+(?:text|content)|copy|prose|page|renders\s+text)\b/i;
+  const LITERAL_CUE = /\bliteral\s+(?:substring|string|text)\b/i;
+
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const trimmed = raw.trim();
+    if (/^```/.test(trimmed)) { inFence = !inFence; continue; }
+    if (inFence) continue;
+    if (!/^- \[[ xX]\]/.test(trimmed)) continue;
+
+    const acText = trimmed.replace(/^- \[[ xX]\]\s*/, '');
+
+    // Priority order matters. Count assertions include "elements match" which
+    // also triggers EXISTS_VERB, so count comes first.
+    const countMatch = acText.match(COUNT_PREFIX);
+    const testidMatch = acText.match(TESTID_ATTR);
+
+    if (countMatch && testidMatch) {
+      const want = parseInt(countMatch[1], 10);
+      const testid = testidMatch[1];
+      const re = new RegExp(`data-testid\\s*=\\s*["']${_reEscape(testid)}["']`, 'g');
+      const got = (html.match(re) || []).length;
+      if (got === want) { results.push({ line: i + 1, status: 'pass', ac: acText, rule: 'testid-count', target: testid, want, got }); pass++; }
+      else {
+        const rec = { line: i + 1, status: 'fail', ac: acText, rule: 'testid-count', target: testid, want, got, reason: `expected ${want} elements with data-testid="${testid}", found ${got}` };
+        results.push(rec); failures.push(rec); fail++;
+      }
+      continue;
+    }
+
+    if (testidMatch && EXISTS_VERB.test(acText) && !CONTAINS_VERB.test(acText)) {
+      const testid = testidMatch[1];
+      const has = html.includes(`data-testid="${testid}"`) || html.includes(`data-testid='${testid}'`);
+      if (has) { results.push({ line: i + 1, status: 'pass', ac: acText, rule: 'testid-exists', target: testid }); pass++; }
+      else {
+        const rec = { line: i + 1, status: 'fail', ac: acText, rule: 'testid-exists', target: testid, reason: `data-testid="${testid}" not found in artifact` };
+        results.push(rec); failures.push(rec); fail++;
+      }
+      continue;
+    }
+
+    // Text-contains: (a) mentions a text-subject keyword, OR (b) uses the
+    // "literal substring" cue — either way we pull the first quoted string.
+    if ((TEXT_SUBJECT.test(acText) || LITERAL_CUE.test(acText)) && CONTAINS_VERB.test(acText)) {
+      const qm = acText.match(QUOTED_STR);
+      if (qm) {
+        const needle = qm[1];
+        const has = bodyText.includes(needle);
+        if (has) { results.push({ line: i + 1, status: 'pass', ac: acText, rule: 'text-contains', target: needle }); pass++; }
+        else {
+          const rec = { line: i + 1, status: 'fail', ac: acText, rule: 'text-contains', target: needle, reason: `text "${needle}" not found in rendered body` };
+          results.push(rec); failures.push(rec); fail++;
+        }
+        continue;
+      }
+    }
+
+    // Non-parseable → skipped with reason.
+    results.push({ line: i + 1, status: 'skipped', ac: acText, reason: 'AC shape not recognised by minimal parser; needs headless DOM or Playwright' });
+    skipped++;
+  }
+
+  return { pass, fail, skipped, failures, results };
+}
+
+function _reEscape(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function parseFrontmatter(text) {
   const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!match) return { data: {}, content: text };
@@ -6296,6 +6399,58 @@ if (require.main === module) {
     }
     process.stdout.write(JSON.stringify(externalRefs, null, 2) + '\n');
     process.exit(0);
+  }
+
+  // verify-structural-acs (forge-self-fixes R006)
+  //
+  // Executes parseable structural acceptance criteria against a built HTML
+  // artifact. Supports three patterns today (spec AC text must mention the
+  // phrase so the parser can recognise it):
+  //
+  //   1. "data-testid="X" exists"           — substring match on the attribute
+  //   2. "textContent contains \"X\""       — substring on the HTML body text
+  //      ("text content includes", "contains the literal 'X'", "contains \"X\"" all accepted)
+  //   3. "exactly N elements match data-testid="X"" — count of the attribute
+  //      ("N elements with", "exactly N ... match" accepted)
+  //
+  // Anything else is reported as `skipped` with a short reason. This is
+  // deliberately narrow: a 20-line regex parser is more reliable on the
+  // specific AC phrasings Forge specs tend to use than a full CSS engine
+  // bolted onto a headless DOM. When a spec needs richer verification,
+  // the [visual] AC family + Playwright MCP path already exists.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs verify-structural-acs \
+  //     --spec .forge/specs/spec-x.md \
+  //     --artifact dist/index.html
+  //
+  // Output: {pass: N, fail: N, skipped: N, failures: [{ac, reason}], results: [{ac, status, reason?}]}
+  //
+  // Exit codes:
+  //   0  all non-skipped ACs passed
+  //   2  bad args
+  //   3  one or more ACs failed
+  if (command === 'verify-structural-acs') {
+    const specPath = args.find((a, i) => args[i - 1] === '--spec');
+    const artifactPath = args.find((a, i) => args[i - 1] === '--artifact');
+    if (!specPath || !artifactPath) {
+      process.stderr.write('verify-structural-acs: --spec and --artifact are required\n');
+      process.exit(2);
+    }
+    let specText, html;
+    try { specText = fs.readFileSync(specPath, 'utf8'); }
+    catch (e) {
+      process.stderr.write('verify-structural-acs: cannot read spec: ' + e.message + '\n');
+      process.exit(2);
+    }
+    try { html = fs.readFileSync(artifactPath, 'utf8'); }
+    catch (e) {
+      process.stderr.write('verify-structural-acs: cannot read artifact: ' + e.message + '\n');
+      process.exit(2);
+    }
+    const result = _verifyStructuralAcs(specText, html);
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    process.exit(result.fail === 0 ? 0 : 3);
   }
 
   // detect-contention (forge-self-fixes R005)

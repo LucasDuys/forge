@@ -60,7 +60,14 @@ const CREATE_TOKEN_RE = /\{create:([^}]+)\}/gi;
 // PATH_RE and not containing `://`.
 // =============================================================================
 
+// Back-compat: extractPathTokens returns a flat array of plain hits, as it
+// did before forge-self-fixes R001. The new create-token split is exposed
+// via extractAllPathTokens, which returns { plainHits, createHits }.
 function extractPathTokens(specText) {
+  return extractAllPathTokens(specText).plainHits;
+}
+
+function extractAllPathTokens(specText) {
   const lines = specText.split(/\r?\n/);
   const plainHits = []; // { line, path, context }
   const createHits = []; // { line, path, context }
@@ -143,7 +150,7 @@ function validateSpecPaths(specPath, repoRoot) {
   }
 
   const specText = fs.readFileSync(specPath, 'utf8');
-  const { plainHits, createHits } = extractPathTokens(specText);
+  const { plainHits, createHits } = extractAllPathTokens(specText);
 
   // Creation targets shadow plain hits — a path appearing in a {create:} span
   // is ALWAYS treated as a creation target, even if the same path also
@@ -275,6 +282,7 @@ module.exports = {
   validateSpecPaths,
   findNearestPath,
   extractPathTokens,
+  extractAllPathTokens,
   PATH_RE,
   CREATE_TOKEN_RE
 };

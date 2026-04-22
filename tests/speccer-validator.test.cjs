@@ -15,6 +15,7 @@ const assert = require('node:assert');
 const {
   validateSpecPaths,
   extractPathTokens,
+  extractAllPathTokens,
   CREATE_TOKEN_RE
 } = require('../scripts/forge-speccer-validator.cjs');
 
@@ -129,7 +130,7 @@ function testCreateTokenExtraction() {
     'malformed `{create:}` empty should be ignored.',
     ''
   ].join('\n');
-  const { plainHits, createHits } = extractPathTokens(text);
+  const { plainHits, createHits } = extractAllPathTokens(text);
   const createPaths = createHits.map(h => h.path).sort();
   assert.deepStrictEqual(createPaths, ['a/b.ts', 'e/f.md']);
   const plainPaths = plainHits.map(h => h.path).sort();
