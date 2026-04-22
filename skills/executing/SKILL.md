@@ -24,6 +24,13 @@ You will receive:
 2. **Read the frontier** from `.forge/plans/{spec}-frontier.md` — find your current task, understand its dependencies, and what comes after.
 3. **Read the spec** from `.forge/specs/spec-{domain}.md` — find the R-numbered requirements and acceptance criteria that this task must satisfy. Identify the exact checkboxes you need to check off.
 4. **Read capabilities** from `.forge/capabilities.json` if it exists — check for available MCP servers (Context7 for docs, Playwright for E2E, MongoDB for data inspection) and skills (TDD, systematic debugging, code review).
+5. **Cited-docs pass (forge-self-fixes R009).** Before moving to Step 2, list every external document the spec references and read each one. Run:
+
+   ```bash
+   node scripts/forge-tools.cjs list-cited-docs --spec .forge/specs/spec-{domain}.md --repo-root .
+   ```
+
+   The CLI returns a JSON array of `{ line, path }` for absolute, home-relative, and sibling-repo paths. For each returned path, use `Read` to open the document before writing any implementation code. If a path does not resolve, log a warning to state.md decisions and continue — do NOT fabricate values that were supposed to come from the cited doc. This closes the gap from the 2026-04-21 forge-landing run where the executor fabricated benchmark numbers instead of reading the source doc the spec had cited.
 
 ### Step 2: Prepare the Workspace
 

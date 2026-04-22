@@ -6200,6 +6200,104 @@ if (require.main === module) {
     }
   }
 
+  // list-cited-docs (forge-self-fixes R009)
+  //
+  // Scans a spec file for path references that point OUTSIDE the current
+  // repo (absolute paths, Windows drive-letter paths, MSYS /c/ paths, ~/
+  // home paths, and any repo-rooted path whose leading segment names a
+  // DIFFERENT repo than the one containing the spec). Emits a JSON array
+  // of { line, path } so the executor can mandatory-read each one before
+  // writing code. Internal paths (plain relative, resolving inside the
+  // current repo) are excluded — they are already tracked by
+  // forge-speccer-validator.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs list-cited-docs --spec .forge/specs/spec-x.md [--repo-root .]
+  //
+  // Exit codes:
+  //   0  ok (even if zero external refs found; empty array printed)
+  //   1  fatal (spec not readable)
+  //   2  bad args
+  if (command === 'list-cited-docs') {
+    const specPath = args.find((a, i) => args[i - 1] === '--spec');
+    const repoRoot = args.find((a, i) => args[i - 1] === '--repo-root') || process.cwd();
+    if (!specPath) {
+      process.stderr.write('list-cited-docs: --spec is required\n');
+      process.exit(2);
+    }
+    let specText;
+    try { specText = fs.readFileSync(specPath, 'utf8'); }
+    catch (e) {
+      process.stderr.write('list-cited-docs: cannot read spec: ' + e.message + '\n');
+      process.exit(1);
+    }
+    // Rules for "external":
+    //   - Absolute windows path: ^[A-Z]:[\\\/]
+    //   - Absolute POSIX path: ^/ but only when the second segment is not
+    //     relative-to-repo (we accept all absolute /-paths as external; on
+    //     Windows Git Bash MSYS paths /c/... should also match)
+    //   - Home-relative: ^~/
+    //   - Any other path whose leading segment is a known sibling-repo name.
+    //     Heuristic: if repoRoot's basename is FOO and the path starts with
+    //     BAR/... where BAR is a directory at the PARENT of repoRoot, treat
+    //     as external.
+    const lines = specText.split(/\r?\n/);
+    const externalRefs = [];
+    const seen = new Set();
+    const repoName = path.basename(path.resolve(repoRoot));
+    const parentDir = path.dirname(path.resolve(repoRoot));
+    let siblings = new Set();
+    try {
+      for (const ent of fs.readdirSync(parentDir, { withFileTypes: true })) {
+        if (ent.isDirectory() && ent.name !== repoName) siblings.add(ent.name);
+      }
+    } catch (_) { /* no access, skip sibling heuristic */ }
+
+    const ABS_WIN = /^[A-Za-z]:[\\\/]/;
+    const ABS_POSIX = /^\//;
+    const HOME_REL = /^~\//;
+
+    let inFence = false;
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i];
+      const trimmed = raw.trim();
+      if (/^```/.test(trimmed)) { inFence = !inFence; continue; }
+      // Only harvest from backtick spans outside fences and full lines
+      // inside fences. Prose-outside-backticks is ignored by design —
+      // same convention as forge-speccer-validator.
+      const sources = [];
+      if (inFence) {
+        sources.push(raw);
+      } else {
+        const spanRe = /`([^`]+)`/g;
+        let m;
+        while ((m = spanRe.exec(raw)) !== null) sources.push(m[1]);
+      }
+      for (const src of sources) {
+        // Split on whitespace/punct, keep leading characters that matter
+        // for absolute-path detection.
+        const candidates = src.split(/[\s,()[\]<>"']+/).filter(Boolean);
+        for (let tok of candidates) {
+          tok = tok.replace(/[.,:;!?]+$/, '');
+          if (!tok) continue;
+          if (tok.includes('://')) continue; // URLs
+          const isAbs = ABS_WIN.test(tok) || ABS_POSIX.test(tok) || HOME_REL.test(tok);
+          let isSiblingRepo = false;
+          if (!isAbs) {
+            const seg = tok.split(/[\\\/]/)[0];
+            if (seg && siblings.has(seg)) isSiblingRepo = true;
+          }
+          if (!isAbs && !isSiblingRepo) continue;
+          if (seen.has(tok)) continue;
+          seen.add(tok);
+          externalRefs.push({ line: i + 1, path: tok });
+        }
+      }
+    }
+    process.stdout.write(JSON.stringify(externalRefs, null, 2) + '\n');
+    process.exit(0);
+  }
+
   // research-append (T014 / R005) -- shell bridge into forge-research-aggregator.
   // Called from skill runtime after a background forge-researcher dispatch
   // returns so the output lands in .forge/specs/<spec>.research.md.
