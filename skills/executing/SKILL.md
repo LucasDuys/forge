@@ -37,6 +37,22 @@ You will receive:
 1. **Multi-repo**: If the task has a `repo:` tag, `cd` into the correct repo directory (from `.forge/config.json` repos). Read that repo's CLAUDE.md or coding conventions file first.
 2. **Single-repo**: Stay in the current directory. Read CLAUDE.md if it exists.
 3. **Conventions**: Note the project's coding style, naming conventions, import patterns, test framework, and commit message format. Follow them exactly.
+4. **UI-task detection (forge-self-fixes R003).** Run the classifier to decide whether this task needs the design-skill routing:
+
+   ```bash
+   node scripts/forge-tools.cjs task-classify \
+     --task-id T00N \
+     --spec .forge/specs/spec-{domain}.md \
+     --capabilities .forge/capabilities.json
+   ```
+
+   The output shape is `{ ui:boolean, brand:string|null, reasons:[...] }`. If `ui` is true you MUST, before writing any component code in Step 3:
+
+   - Invoke `Skill("frontend-design")` once for general design-quality guidance, AND
+   - If `brand` is non-null, also invoke the brand-specific skill: `Skill("brand-guidelines")` for Anthropic, or reference the awesome-design-md catalog for other named brands.
+   - If a `DESIGN.md` exists at repo root, read it first and cite specific tokens in your component code rather than picking tokens from memory.
+
+   This is the execution-side counterpart to the R002 DESIGN.md gate in the brainstorming skill. The brainstorm skill wrote the tokens; the executor reads them. The 2026-04-21 forge-landing regression was an executor that wrote an "Anthropic-aesthetic" landing page without either step, so the tokens shipped as approximations. This block closes that loop.
 
 ### Step 3: Implement the Task
 

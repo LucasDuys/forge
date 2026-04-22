@@ -6298,6 +6298,99 @@ if (require.main === module) {
     process.exit(0);
   }
 
+  // task-classify (forge-self-fixes R003)
+  //
+  // Deterministic UI-task detection. Returns { ui:boolean, brand:string|null,
+  // reasons:[...] } for a given task id. The executing skill uses this to
+  // decide whether to invoke frontend-design + brand-guidelines BEFORE
+  // writing any component code.
+  //
+  // Detection rules (ui:true when ANY triggers):
+  //   - Task's R-numbered AC text references any of:
+  //       src/**, components/**, pages/**, app/**,
+  //       *.tsx, *.jsx, *.vue, *.svelte, *.astro
+  //   - .forge/capabilities.json (mcp_servers + cli_tools + skills) or
+  //     package.json (detected via capabilities.json having Vite/React/etc.)
+  //     indicates a frontend stack
+  //
+  // Brand detection: if the spec text contains any of a small closed list
+  // of known brand names (case-insensitive), report it in `brand`. Future
+  // iterations can swap this for an LLM-based classifier.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs task-classify \
+  //     --task-id T001 \
+  //     --spec .forge/specs/spec-foo.md \
+  //     [--capabilities .forge/capabilities.json]
+  //
+  // Exit codes:
+  //   0  ok (prints JSON to stdout)
+  //   2  bad args
+  if (command === 'task-classify') {
+    const taskId = args.find((a, i) => args[i - 1] === '--task-id');
+    const specPath = args.find((a, i) => args[i - 1] === '--spec');
+    const capsPath = args.find((a, i) => args[i - 1] === '--capabilities');
+    if (!taskId || !specPath) {
+      process.stderr.write('task-classify: --task-id and --spec are required\n');
+      process.exit(2);
+    }
+    let specText = '';
+    try { specText = fs.readFileSync(specPath, 'utf8'); }
+    catch (e) {
+      process.stderr.write('task-classify: cannot read spec: ' + e.message + '\n');
+      process.exit(2);
+    }
+    const reasons = [];
+    const lower = specText.toLowerCase();
+    const uiPatterns = [
+      /\bsrc\//i, /\bcomponents\//i, /\bpages\//i, /\bapp\//i,
+      /\.tsx\b/i, /\.jsx\b/i, /\.vue\b/i, /\.svelte\b/i, /\.astro\b/i
+    ];
+    for (const re of uiPatterns) {
+      if (re.test(specText)) {
+        reasons.push('spec-matches ' + re.source);
+      }
+    }
+    // Capabilities signal: look for any frontend framework in the discovered
+    // cli_tools, skills, or mcp_servers maps.
+    let uiFromCaps = false;
+    if (capsPath) {
+      try {
+        const caps = JSON.parse(fs.readFileSync(capsPath, 'utf8'));
+        const frontendHints = ['vite', 'react', 'vue', 'svelte', 'next', 'astro', 'tailwindcss', 'tailwind'];
+        const hay = JSON.stringify(caps).toLowerCase();
+        for (const h of frontendHints) {
+          if (hay.includes(h)) {
+            uiFromCaps = true;
+            reasons.push('capabilities-has ' + h);
+            break;
+          }
+        }
+      } catch (_) { /* capabilities absent is fine */ }
+    }
+    const BRANDS = [
+      'anthropic', 'claude', 'linear', 'stripe', 'vercel', 'raycast',
+      'supabase', 'shopify', 'notion', 'figma', 'github'
+    ];
+    let brand = null;
+    for (const b of BRANDS) {
+      const re = new RegExp('\\b' + b + '\\b', 'i');
+      if (re.test(specText)) {
+        brand = b;
+        reasons.push('brand-mentioned ' + b);
+        break;
+      }
+    }
+    const ui = reasons.length > 0;
+    process.stdout.write(JSON.stringify({
+      ui,
+      brand,
+      task_id: taskId,
+      reasons
+    }) + '\n');
+    process.exit(0);
+  }
+
   // brainstorm-check-design (forge-self-fixes R002)
   //
   // Phase-4 gate: when the brainstorming skill has identified a brand-based
