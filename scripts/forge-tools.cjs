@@ -6298,6 +6298,63 @@ if (require.main === module) {
     process.exit(0);
   }
 
+  // detect-contention (forge-self-fixes R005)
+  //
+  // Scans a frontier file for same-tier tasks that declare overlapping
+  // filesTouched paths. Overlaps mean two parallel-dispatched tasks would
+  // both modify the same file, guaranteeing a squash-merge conflict when
+  // worktrees are reconciled. The planner is supposed to either move one
+  // task to a later tier OR split the shared file into its own integration
+  // task; this CLI is the verification gate.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs detect-contention --frontier .forge/plans/spec-x-frontier.md
+  //
+  // Output: JSON { conflicts: [{ tier, file, tasks: [ids] }] }
+  //
+  // Exit codes:
+  //   0  no conflicts
+  //   2  bad args
+  //   3  one or more conflicts detected
+  if (command === 'detect-contention') {
+    const frontierPath = args.find((a, i) => args[i - 1] === '--frontier');
+    if (!frontierPath) {
+      process.stderr.write('detect-contention: --frontier is required\n');
+      process.exit(2);
+    }
+    let text;
+    try { text = fs.readFileSync(frontierPath, 'utf8'); }
+    catch (e) {
+      process.stderr.write('detect-contention: cannot read frontier: ' + e.message + '\n');
+      process.exit(2);
+    }
+    const tasks = parseFrontier(text);
+    // Group tasks by tier, then by each filesTouched path per tier. Any path
+    // claimed by >1 task in the same tier is a contention.
+    const byTier = new Map();
+    for (const t of tasks) {
+      if (!byTier.has(t.tier)) byTier.set(t.tier, []);
+      byTier.get(t.tier).push(t);
+    }
+    const conflicts = [];
+    for (const [tier, tierTasks] of byTier.entries()) {
+      const fileMap = new Map(); // file -> [task ids]
+      for (const t of tierTasks) {
+        for (const f of t.filesTouched || []) {
+          if (!fileMap.has(f)) fileMap.set(f, []);
+          fileMap.get(f).push(t.id);
+        }
+      }
+      for (const [file, ids] of fileMap.entries()) {
+        if (ids.length > 1) {
+          conflicts.push({ tier, file, tasks: ids });
+        }
+      }
+    }
+    process.stdout.write(JSON.stringify({ conflicts }, null, 2) + '\n');
+    process.exit(conflicts.length === 0 ? 0 : 3);
+  }
+
   // task-classify (forge-self-fixes R003)
   //
   // Deterministic UI-task detection. Returns { ui:boolean, brand:string|null,
