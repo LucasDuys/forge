@@ -8,6 +8,17 @@ allowed-tools: ["Bash(${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh:*)", "Bash(node ${C
 
 Activates hackathon-native multiplayer mode: N users on different machines brain-dump ideas, AI consolidates into categorized tasks, tasks dispatch across machines via a distributed claim queue, each agent squash-merges its own completed task. Forward-motion during execute: AI picks + flags decisions, humans override async.
 
+## Prerequisites
+
+Two transport modes are supported. Pick one BEFORE running `/forge:collaborate start`:
+
+- **Realtime (Ably)** — sub-second cross-machine latency via WebSockets. Requires:
+  1. The `ably` npm package installed: `npm install ably` in your project (or globally). It's declared an OPTIONAL peerDependency in the plugin's `package.json`, so `/forge:collaborate start` hard-fails with "forge:collab realtime mode requires the `ably` peer dependency" until you install it.
+  2. An Ably API key in your environment: `export ABLY_KEY="<your-key>"`. Free tier at https://ably.com/sign-up covers typical hackathon teams (6M messages/month, 200 peak connections).
+- **Polling (zero-setup)** — coordination via a dedicated `forge/collab-state` git branch, ~2.5s latency. No extra dependencies, no API keys. Pass `--polling` to `/forge:collaborate start` to opt into this path even when `ABLY_KEY` is in env.
+
+If neither is configured and `--polling` is not passed, `start` prints a setup guide and exits.
+
 ## Subcommands
 
 | Command | What it does |

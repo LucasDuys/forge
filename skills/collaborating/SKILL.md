@@ -60,8 +60,22 @@ below. If no subcommand is given, default to `status`.
 6. Resolve the transport mode. Call `selectTransportMode` with
    `process.env` and any `--polling` flag the user passed. Report:
    - `ably`: "Realtime transport will use Ably (ABLY_KEY detected)."
+     **Prerequisite (forge-self-fixes-2 R013):** the `ably` npm package
+     is declared an OPTIONAL peerDependency in the plugin `package.json`
+     and must be installed before `createAblyTransport` will succeed.
+     If it isn't, `start` throws "forge:collab realtime mode requires
+     the `ably` peer dependency." Surface this check BEFORE calling
+     `createTransport('ably', ...)`:
+     ```bash
+     node -e "require.resolve('ably')" 2>/dev/null \
+       || echo 'Run: npm install ably  (or pass --polling to skip realtime)'
+     ```
+     If the probe fails, print the install command and stop with a
+     non-zero exit unless the user also passed `--polling`.
    - `polling`: "Zero-setup mode via git polling on forge/collab-state
-     branch every ~2.5s."
+     branch every ~2.5s." No install needed. The pull target branch is
+     auto-resolved per R011 (origin/HEAD → upstream → current branch →
+     `main` fallback); no hardcoded `main` assumption.
    - `setup-required`: print the setup guide returned by `renderSetupGuide()`
      and exit (unless `--polling` was passed).
 
