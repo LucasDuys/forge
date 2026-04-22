@@ -156,7 +156,7 @@ function out(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
     await transport.connect();
     // Give the write-through time to settle: claimTask -> transport.cas()
     // which writes locally and fires io.writeLease() asynchronously.
-    const claimed = collab.claimTask(transport, 'T001', handle, { ttlSeconds: 120 });
+    const claimed = await collab.claimTask(transport, 'T001', handle, { ttlSeconds: 120 });
     // Wait for the async writeLease to finish before proceeding so bob
     // sees alice's lease on his fetch. 300ms is a generous upper bound
     // for the fetch+hash-object+mktree+commit-tree+push cycle locally.
@@ -300,7 +300,7 @@ function out(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
     await transport.connect(); // ensureBranch fetches forge/collab-state + _refresh
 
     // 5. Try to claim T001 -- alice should already hold it.
-    const claimAttempt = collab.claimTask(transport, 'T001', handle, { ttlSeconds: 120 });
+    const claimAttempt = await collab.claimTask(transport, 'T001', handle, { ttlSeconds: 120 });
 
     // 6. If connect()'s _refresh already delivered the ping we're done;
     //    otherwise retry a few times in case alice's appendMessage push
@@ -377,7 +377,7 @@ function spawnChild(scriptPath, cwd, handle) {
 
 suite('cross-process wire test, real adapters (T026, R006)', () => {
   if (!gitAvailable()) {
-    test('git not on PATH -- wire test skipped', () => {
+    test('git not on PATH -- wire test skipped', async () => {
       assert.ok(true, 'skipping; git missing');
     });
     return;

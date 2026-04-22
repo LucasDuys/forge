@@ -533,7 +533,13 @@ function _isExpired(lease, now) {
  *               to 30s for consolidation or other short-lived leases)
  *   now         optional override for deterministic tests (ms since epoch)
  */
-function tryAcquireLease(transport, name, claimant, opts) {
+// forge-self-fixes-2 R010: await cas/del so the Ably publish-ack CAS
+// result propagates to the caller. The memory transport returns a sync
+// boolean from cas/del; `await` on a non-Promise resolves to the value
+// itself, so memory-transport callers are byte-for-byte unchanged.
+// Before this fix, `const ok = transport.cas(...)` bound `ok` to a
+// Promise in Ably mode and every claim returned acquired:true.
+async function tryAcquireLease(transport, name, claimant, opts) {
   opts = opts || {};
   if (!transport || typeof transport.read !== 'function') {
     throw new Error('tryAcquireLease requires a transport object');
@@ -556,7 +562,7 @@ function tryAcquireLease(transport, name, claimant, opts) {
   }
 
   // Either fresh, stale, or already ours -> take/refresh.
-  const ok = transport.cas(name, current, next);
+  const ok = await transport.cas(name, current, next);
   if (!ok) {
     const nowHolder = transport.read(name);
     return {
@@ -571,7 +577,7 @@ function tryAcquireLease(transport, name, claimant, opts) {
 /**
  * Refresh the lease `name`. Succeeds only if `claimant` currently holds it.
  */
-function refreshLease(transport, name, claimant, opts) {
+async function refreshLease(transport, name, claimant, opts) {
   opts = opts || {};
   const ttl = typeof opts.ttlSeconds === 'number' ? opts.ttlSeconds : DEFAULT_CLAIM_TTL_SECONDS;
   const now = _nowMs(opts);
@@ -583,7 +589,7 @@ function refreshLease(transport, name, claimant, opts) {
   const next = Object.assign({}, current, {
     expiresAt: new Date(now + ttl * 1000).toISOString()
   });
-  const ok = transport.cas(name, current, next);
+  const ok = await transport.cas(name, current, next);
   if (!ok) return { refreshed: false, reason: 'lost_race' };
   return { refreshed: true, lease: next };
 }
@@ -593,13 +599,13 @@ function refreshLease(transport, name, claimant, opts) {
  * on a lease you do not hold returns { released: true, noop: true } rather
  * than throwing -- this matches the existing Forge lock semantics.
  */
-function releaseLease(transport, name, claimant) {
+async function releaseLease(transport, name, claimant) {
   const current = transport.read(name);
   if (!current) return { released: true, noop: true };
   if (current.claimant !== claimant) {
     return { released: false, reason: 'held_by_other', holder: current };
   }
-  const ok = transport.del(name, current);
+  const ok = await transport.del(name, current);
   if (!ok) return { released: false, reason: 'lost_race' };
   return { released: true };
 }
@@ -618,13 +624,13 @@ function readLease(transport, name, opts) {
  */
 async function withLease(transport, name, claimant, opts, fn) {
   if (typeof fn !== 'function') throw new Error('withLease requires a function as last arg');
-  const acq = tryAcquireLease(transport, name, claimant, opts);
+  const acq = await tryAcquireLease(transport, name, claimant, opts);
   if (!acq.acquired) return { held: false, reason: acq.reason, holder: acq.holder };
   try {
     const result = await fn(acq.lease);
     return { held: true, result, lease: acq.lease };
   } finally {
-    releaseLease(transport, name, claimant);
+    await releaseLease(transport, name, claimant);
   }
 }
 
