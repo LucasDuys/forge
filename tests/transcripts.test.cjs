@@ -263,15 +263,21 @@ suite('transcript-append CLI', () => {
     assert.ok(!('at' in written));
   });
 
-  test('errors with exit code 2 when --cycle is missing', () => {
+  test('succeeds without --cycle by auto-resolving one (forge-self-fixes R008)', () => {
     const { forgeDir } = makeTempForgeDir();
     const res = spawnSync(process.execPath, [
       TOOLS_CJS, 'transcript-append',
       '--forge-dir', forgeDir,
-      '--entry', '{"phase":"executing"}'
+      '--event', '{"phase":"executing","event":"demo"}'
     ], { encoding: 'utf8' });
-    assert.strictEqual(res.status, 2);
-    assert.ok(/--cycle is required/.test(res.stderr));
+    // R008 flipped the contract: --cycle is optional; the CLI now looks
+    // up the active cycle from state.md or synthesises a compact UTC
+    // stamp so manual callers can leave an audit trail identical to
+    // stop-hook-driven runs.
+    assert.strictEqual(res.status, 0, 'exit 0 on auto-resolved cycle; stderr=' + res.stderr);
+    const out = JSON.parse(res.stdout);
+    assert.ok(out.cycle, 'auto-resolved cycle id is in stdout');
+    assert.ok(/Z$/.test(out.cycle) || out.cycle.length > 0);
   });
 
   test('errors with exit code 2 when --entry is not valid JSON', () => {

@@ -12,7 +12,7 @@
   <a href="https://github.com/LucasDuys/forge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
   <a href="https://github.com/LucasDuys/forge/stargazers"><img src="https://img.shields.io/github/stars/LucasDuys/forge?style=flat" alt="Stars"></a>
   <a href="https://github.com/LucasDuys/forge/releases"><img src="https://img.shields.io/badge/version-0.2.0-green" alt="Version"></a>
-  <a href="https://github.com/LucasDuys/forge/tree/main/docs"><img src="https://img.shields.io/badge/tests-206%20passing-brightgreen" alt="Tests"></a>
+  <a href="https://github.com/LucasDuys/forge/tree/main/docs"><img src="https://img.shields.io/badge/tests-691%20passing-brightgreen" alt="Tests"></a>
   <a href="https://lucasduys.github.io/forge/"><img src="https://img.shields.io/badge/docs-architecture_video-orange" alt="Docs"></a>
 </p>
 
@@ -32,14 +32,32 @@ You are the project manager. You are the state machine. You are the glue.
 
 ## Install
 
-Two minutes. Requires Claude Code v1.0.33+. Zero npm install, zero build step, zero dependencies.
+Two minutes. Requires Claude Code v1.0.33+. Zero npm install, zero build step, zero dependencies for the solo path.
 
 ```bash
 claude plugin marketplace add LucasDuys/forge
 claude plugin install forge@forge-marketplace
 ```
 
+That's all you need for single-user autonomous runs. For multiplayer (`/forge:collaborate`) there's a short additional step — see [Setup from scratch](#setup-from-scratch) below.
+
+### Setup from scratch
+
+Fresh machine, no prior Claude Code install? The whole path, top to bottom:
+
+1. **Install Claude Code.** Follow the [official install guide](https://docs.claude.com/claude-code/overview). Confirm `claude --version` is v1.0.33 or newer.
+2. **Install Forge.** The two commands above. Confirm with `claude plugin list` — you should see `forge` in the marketplace cache.
+3. **Land in a project with a git origin.** `cd` into a repo whose `git remote get-url origin` returns a real URL. Forge uses that URL for session IDs when collab mode is enabled, and for worktree isolation always.
+4. **(Optional) Pick a transport for multiplayer work.** Skip this if you're only using solo mode.
+   - **Zero-setup path:** nothing to install. `/forge:collaborate start --polling` uses a dedicated `forge/collab-state` git branch as the coordination substrate, ~2.5s cross-machine latency.
+   - **Realtime path (Ably):** `npm install ably` in your project, grab a free API key from [ably.com/sign-up](https://ably.com/sign-up), then `export ABLY_KEY="<your-key>"`. Sub-second latency, 6M messages/month on the free tier. The `ably` package is declared an OPTIONAL peerDependency, so Forge only requires it when you actually pick realtime.
+5. **Run your first spec.** See [Quickstart — solo](#quickstart) below. The solo path works without any of the optional bits above.
+
+No state is written anywhere outside `.forge/` in your project, so uninstalling is `rm -rf .forge` and `claude plugin uninstall forge`.
+
 ## Quickstart
+
+### Solo mode
 
 Three commands. One autonomous loop. One squash-merge to main.
 
@@ -103,6 +121,67 @@ session budget: 47200 / 500000 used. lock released.
 You read the diffs. You merge the branch. You move on.
 
 The pipeline is strictly sequential, enforced programmatically: `brainstorm` → `plan` → `execute`. You cannot skip brainstorming, skip planning, or bypass the approval gate. The spec is the contract. Every acceptance criterion has an R-number; every task maps to at least one R-number; the verifier checks R-numbers, not checklists.
+
+### Team mode (two or more participants)
+
+Same pipeline, with a shared brainstorm and a distributed claim queue so two people on two machines can drive separate tasks in parallel without stepping on each other.
+
+```bash
+# Machine 1 (host)
+/forge:collaborate start              # derives session ID from the origin URL
+/forge:collaborate brainstorm         # chat-mode dump, writes inputs-<you>.md
+git push                              # share your input
+
+# Machine 2 (teammate, same repo cloned)
+git pull
+/forge:collaborate join               # same origin URL = same session id, automatic
+/forge:collaborate brainstorm         # their own input file, no merge conflict
+
+# Either machine
+/forge:collaborate consolidate        # merges all inputs into a single spec under lease
+/forge:plan                           # deterministic; both machines produce the same frontier
+/forge:execute --autonomy full        # each machine claims a different task via the claim queue
+```
+
+No invite link, no OAuth, no secret to share — **the session ID is derived from `git remote get-url origin`, so anyone who can pull the repo is automatically in the same session.** All shared coordination state (brainstorm inputs, consolidated spec, claim queue, forward-motion flags) is files under `.forge/collab/`, committed to git on every change. A late joiner catches up with `git pull`; an offline teammate catches up when their laptop comes back online.
+
+## Solo vs Team — when to use `/forge:collaborate`
+
+**Use solo mode** (`/forge:brainstorm` → `/forge:plan` → `/forge:execute`) when:
+- You are the only contributor on this feature
+- You want the tightest feedback loop — no consolidation step, no claim queue overhead
+- You don't need other humans to see or override AI decisions in flight
+
+**Use team mode** (`/forge:collaborate`) when:
+- Two or more people are building the same feature at the same time
+- You want AI decisions that would normally pause for your input to become **forward-motion flags** that your teammate can review and override async, so execute never blocks
+- You want a durable audit trail of who did what — every claim, flag, and override is a git commit with a timestamp and a handle
+
+**Hybrid tip.** You can brainstorm collaboratively (a consolidated spec captures everyone's requirements) and then execute solo. Or vice-versa: one person writes the spec, two people execute it in parallel. `/forge:collaborate` is opt-in per-phase, not all-or-nothing.
+
+## Collaborative mode in depth
+
+The mechanics are worth knowing because they shape how the day goes.
+
+**Session identity.** `sessionIdFromOrigin()` hashes your repo's origin URL into a 12-hex code. All participants with the same clone derive the same code without any shared secret. Re-pointing origin to a different URL creates a new session; `/forge:collaborate recover` detects this as `session_mismatch` and offers a migration.
+
+**Transports.** Two backends satisfy the same interface:
+- **Polling (zero-setup, default):** coordination via the `forge/collab-state` git branch, updated every ~2.5s. No API keys, no npm installs.
+- **Ably (realtime, opt-in):** sub-second latency via WebSockets. Requires `npm install ably` and `export ABLY_KEY=...`. Forge picks this automatically when `ABLY_KEY` is in env; `--polling` forces the git path even when a key is present.
+
+**What's shared, what's local.** The `.forge/collab/` directory is carved out of the default `.forge/` gitignore so its contents propagate via git. Inside that directory:
+- `brainstorm/inputs-<handle>.md` — **shared** (one per participant, no merge conflicts because each file is user-scoped)
+- `consolidated.md`, `categories.json` — **shared**, written under a consolidation lease so two people can't overwrite each other
+- `flags/F<id>.md` — **shared** (forward-motion flags committed on write)
+- `participant.json`, `.enabled`, `flag-emit-log-<handle>.jsonl` — **local per-machine** (re-ignored by a nested `.forge/collab/.gitignore`)
+
+**Claim queue.** `claimTask(transport, taskId, handle)` acquires a lease with a 120-second TTL and automatic heartbeat refresh. Parallel claims on the same task resolve via a publish-ack election (realtime) or a git-CAS (polling) — **exactly one wins**, the other gets `{acquired:false, reason:'lost_race', holder:<winner>}`. Lease expires if the claimant's session dies; the task returns to the claimable pool.
+
+**Forward-motion flags.** During `/forge:execute`, any time the AI would pause for human input (an ambiguous decision, a library choice, an architectural tiebreaker), it picks a default, writes `flags/F<id>.md` with the decision + alternatives + rationale, commits + pushes, and keeps going. Your teammate on the other machine can review open flags with `/forge:collaborate flags`, override with `/forge:collaborate override F<id> "<new decision>"`, and the dependent task re-triggers on the next iteration. Execute is never blocked waiting for you to wake up.
+
+**Crash recovery.** `participant.json` writes first, `.enabled` writes last as the atomic "collab on" marker. `leave` reverses that order. Any crash between the two flips leaves a partial state that `/forge:collaborate recover` classifies (`stale_participant` / `stale_enabled` / `session_mismatch`) and repairs with one command.
+
+Full subcommand reference: [docs/collaborate.md](docs/collaborate.md).
 
 ## How Forge Actually Works
 
@@ -253,6 +332,7 @@ flowchart LR
     Loop -.->|read-only| Watch["/forge watch<br/>live TUI dashboard"]
     Loop -.->|read-only| Headless["/forge status --json<br/>headless query"]
     Crash[crash / context reset] -.->|/forge resume| Loop
+    TeamUser([Teammate<br/>on another machine]) -.->|same origin = same session| Exec
 
     classDef cmd fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
     classDef state fill:#fff3e0,stroke:#e65100,color:#bf360c
@@ -262,11 +342,11 @@ flowchart LR
     class Bs,Plan,Exec,Loop cmd
     class Spec,Frontier state
     class Watch,Headless ui
-    class Done,User done
+    class Done,User,TeamUser done
     class Crash state
 ```
 
-Four deeper diagrams cover the execute loop, hooks pipeline, backpropagation, and recovery layer. Click any to expand. The full one-piece view sits at the bottom.
+Five deeper diagrams cover the execute loop, hooks pipeline, backpropagation, recovery layer, and collaborative mode. Click any to expand. The full one-piece view sits at the bottom.
 
 <details>
 <summary><strong>Execute loop (state machine + DAG dispatch)</strong></summary>
@@ -361,6 +441,61 @@ flowchart LR
 </details>
 
 <details>
+<summary><strong>Collaborative mode (multiplayer execution)</strong></summary>
+
+How `/forge:collaborate` lets two or more machines drive different tasks on the same spec without stepping on each other. The coordination substrate is files in `.forge/collab/` plus a transport that resolves claim races and forward-motion flag deliveries.
+
+```mermaid
+flowchart TB
+    subgraph Clients["Participant machines (N >= 2)"]
+        L["Lucas<br/>CLI session"]
+        D["Daisy<br/>CLI session"]
+    end
+    subgraph Shared["Shared state (committed to git)"]
+        BD[".forge/collab/brainstorm/<br/>inputs-lucas.md<br/>inputs-daisy.md"]
+        CD[".forge/collab/consolidated.md<br/>categories.json"]
+        FG[".forge/collab/flags/F<id>.md"]
+    end
+    subgraph Local["Per-machine (re-ignored)"]
+        PJ["participant.json<br/>.enabled<br/>flag-emit-log-<handle>.jsonl"]
+    end
+    subgraph Transport["Transport (pick one)"]
+        A["Ably realtime<br/>(WebSocket pub/sub,<br/>cas_propose → cas_won)"]
+        P["Polling<br/>(forge/collab-state branch,<br/>~2.5s git CAS)"]
+    end
+
+    L -->|brainstormDump| BD
+    D -->|brainstormDump| BD
+    BD -->|consolidate under lease| CD
+    CD --> Plan["/forge:plan<br/>(same frontier on both)"]
+    Plan --> Claim{claimTask<br/>publish-ack election}
+    L <-->|lease state| Claim
+    D <-->|lease state| Claim
+    Claim -->|exactly one winner| Exec["/forge:execute<br/>on the winning machine"]
+    Exec -->|ambiguous decision| Flag[writeForwardMotionFlag]
+    Flag --> FG
+    FG -->|teammate reviews| Override[/forge:collaborate override]
+    Override -->|re-triggers task| Exec
+    Transport --- Claim
+    Transport --- Flag
+
+    L -.->|partial start/leave| PJ
+    D -.->|partial start/leave| PJ
+    PJ -.->|crash| Recover{"/forge:collaborate recover<br/>stale_participant |<br/>stale_enabled |<br/>session_mismatch"}
+```
+
+Key invariants:
+- **Session = origin hash.** `sessionIdFromOrigin()` derives a 12-hex code from `git remote get-url origin`. Identical clones auto-join.
+- **Start order: participant.json FIRST, `.enabled` LAST.** Any crash between the two is recoverable.
+- **Leave order: `.enabled` FIRST, claims released, disconnect, `participant.json` LAST.** Guarantees a partial leave lands in a safe single-user fallback.
+- **Consolidation lease (30s TTL).** Prevents two participants from overwriting `consolidated.md`. Holder keeps the lease until write completes.
+- **Claim lease (120s TTL, auto-heartbeat).** A dropped laptop's claim expires; the task returns to the claimable pool without manual cleanup.
+- **Forward-motion never blocks humans.** Flags are fire-and-forget: write to `flags/F<id>.md`, commit + push, execute continues with the AI's chosen default. Override async.
+- **Realtime mode requires `npm install ably`.** Optional peerDependency. Polling mode has zero extra deps.
+
+</details>
+
+<details>
 <summary><strong>Full one-piece architecture diagram</strong></summary>
 
 All subsystems in one flow. The four focused diagrams above are easier to read individually; this is the holistic view. GitHub's "click to expand" button renders it at full size.
@@ -391,20 +526,23 @@ Eight subsystems (state machine, DAG dispatch, model routing, budget tracking, a
 
 ## Receipts
 
-- **206 tests, 0 dependencies.** Full suite runs in 2.6 seconds. Pure `node:assert`, zero npm install.
+- **691 tests across 54 suites, 0 runtime dependencies.** Full suite runs in ~40 seconds. Pure `node:assert`, zero npm install for the solo path. (`ably` is an optional peerDependency, only needed for realtime collab mode.)
 - **Headless state query: ~2ms.** Zero LLM calls, 17-field versioned JSON schema.
 - **Caveman compression: 12% measured** on the 10-scenario agent-output benchmark at full intensity, rising to 18% at ultra and up to 65% on dense prose. [benchmark](docs/benchmarks/caveman-integration.md)
 - **Seven hooks fire on every tool call.** Tool cache, token monitor, test filter, progress tracker, auto-backprop, cache store, stop. See [architecture](docs/architecture.md).
 - **Seven circuit breakers.** Test failures, debug exhaustion, Codex rescue, re-decomposition, review iterations, no-progress detection, max iterations. Nothing runs forever. [verification](docs/verification.md)
 - **Lock heartbeat survives** crashes, reboots, OOMs, and context resets. Five-minute stale threshold, never auto-deletes user work.
 - **Seven specialized agents**, each routed to the cheapest model that can handle the job. [agents](docs/agents.md)
+- **Streaming-DAG scheduler with publish-ack CAS.** Claim mutex resolves parallel races via election, not optimistic retries. Lease TTL 120s with auto-heartbeat. Worst-case rollback = 12 min per task; net streaming speedup 43% on a 5-task chain. [benchmark](docs/benchmarks/streaming-dag-vs-task-dag.md)
+- **Origin-derived session IDs.** `/forge:collaborate` requires no invite links, no OAuth, no shared secrets — anyone who can `git pull` the repo is automatically in the same session.
 
-Three cross-cutting skills shipped in v0.2.0 also influence every agent: **Karpathy Guardrails** (four behavioral principles, flagged by the reviewer), **Graphify Integration** (optional knowledge-graph context), and **DESIGN.md Support** (design-system compliance pass). Details in [docs/superpowers/](docs/superpowers/).
+Cross-cutting skills influencing every agent: **Karpathy Guardrails** (four behavioral principles, flagged by the reviewer), **Graphify Integration** (optional knowledge-graph context), **DESIGN.md Support** (design-system compliance pass enforced at brainstorm-time when a brand-based aesthetic is chosen), and **Caveman internal-artifact compression**. Details in [docs/superpowers/](docs/superpowers/).
 
 ## Documentation
 
-- [Architecture](docs/architecture.md): three-tiered loop, self-prompting engine, execution flow
+- [Architecture](docs/architecture.md): three-tiered loop, self-prompting engine, collaborative mode
 - [Commands](docs/commands.md): every slash command and flag
+- [Collaborate](docs/collaborate.md): multiplayer mode — session identity, transports, claim queue, flag override
 - [Configuration](docs/configuration.md): `.forge/config.json` reference
 - [Token budgets](docs/budgets.md): per-task and session ceilings
 - [Caveman optimization](docs/caveman.md): internal token compression modes
