@@ -30,6 +30,16 @@ You are the project manager. You are the state machine. You are the glue.
 
 **Forge replaces you as the glue.** You describe what you want in one line. Forge writes the spec, plans the tasks, runs them in parallel git worktrees with TDD, reviews the code, verifies it against the acceptance criteria, and commits atomically. You read the diffs in the morning.
 
+**Building with a teammate?** The coordination problem is the same class of work as being-the-glue, just distributed: whose spec wins, who picks up which task, whose laptop is claiming what right now, who has to wait for whom to wake up and approve an ambiguous library choice. `/forge:collaborate` extends the same pipeline to N>=2 machines: everyone brain-dumps into one consolidated spec (under lease, no overwrites), the same plan lands deterministically on every clone, tasks are claimed across machines via a lease queue where exactly one machine wins per task, and AI decisions that would normally pause for approval become **forward-motion flags** — written + committed + pushed, executed with the AI's defended default, reviewable and overridable async by your teammate. Execute never blocks. No server, no invite link, no shared secret: session identity is a hash of `git remote get-url origin`, so anyone who can pull the repo is automatically in the session.
+
+## What Forge is, in one minute
+
+- **A native Claude Code plugin** you install with two commands. Lives in your existing session, no separate harness, no API keys beyond Claude itself.
+- **A spec-driven autonomous loop.** `brainstorm` turns an idea into an R-numbered spec with testable acceptance criteria. `plan` decomposes the spec into a task DAG with token estimates. `execute` runs each task in its own git worktree with TDD, reviews it against the R-numbers, verifies it four ways (existence > substantive > wired > runtime), and squash-merges on pass.
+- **A state machine, not a while-loop.** The Stop hook fires `routeDecision()` after every Claude turn and picks the next phase based on `.forge/state.md`. Crashes, context resets, and OOMs are recoverable because state lives on disk, not in a conversation window.
+- **A distributed claim queue for teams.** `/forge:collaborate` turns the same state machine into a coordination substrate for 2+ machines: shared brainstorm, shared spec, shared task queue, shared forward-motion flags — all in `.forge/collab/` committed to git, coordinated via either polling (zero-setup, ~2.5s) or Ably (realtime, sub-second, opt-in).
+- **The problem it solves.** Solo: you stop being the project manager between Claude turns. Team: you stop blocking on each other for AI-decision approvals, because every blocking decision becomes a committed flag with a default, not a paused prompt.
+
 ## Install
 
 Two minutes. Requires Claude Code v1.0.33+. Zero npm install, zero build step, zero dependencies for the solo path.
@@ -187,6 +197,8 @@ Full subcommand reference: [docs/collaborate.md](docs/collaborate.md).
 
 Forge runs five phases in a loop. Four of them always run in order. The fifth, `backprop`, fires whenever a later phase catches a bug the spec did not anticipate, and its output feeds back into the first phase.
 
+### Solo mode — phase loop
+
 ```mermaid
 flowchart LR
     Brainstorm["brainstorm<br/>idea to spec"] --> Plan["plan<br/>spec to task DAG"]
@@ -203,6 +215,39 @@ flowchart LR
 ```
 
 Each phase has one owner agent, one input artifact, and one output artifact. The state file `.forge/state.md` records which phase is active; the Stop hook fires `routeDecision()` after every Claude turn and picks the next phase based on that state.
+
+### Team mode — the same phases, distributed
+
+`/forge:collaborate` keeps the phases identical but distributes ownership across machines. Every shared artifact is a file in `.forge/collab/` committed to git, and every concurrent operation (consolidation, claim, flag emit) is gated by a lease the transport resolves with **exactly one winner**.
+
+```mermaid
+flowchart LR
+    subgraph BS["brainstorm (parallel, per participant)"]
+        BL["Lucas<br/>inputs-lucas.md"]
+        BD["Daisy<br/>inputs-daisy.md"]
+    end
+    BS -->|consolidate<br/>30s lease| Spec["consolidated.md<br/>categories.json"]
+    Spec --> PlanT["plan<br/>deterministic on every clone"]
+    PlanT --> Claim{"claim queue<br/>120s lease, heartbeat 30s<br/>exactly-one winner"}
+    Claim -->|L wins T001| ExecL["Lucas executes T001<br/>own worktree"]
+    Claim -->|D wins T002| ExecD["Daisy executes T002<br/>own worktree"]
+    ExecL -->|ambiguous decision| Flag["flags/F<id>.md<br/>commit + push"]
+    ExecD -->|ambiguous decision| Flag
+    Flag -->|teammate review| Over["/forge:collaborate override<br/>re-triggers dependent task"]
+    ExecL --> Review["review + verify<br/>(per task, local)"]
+    ExecD --> Review
+    Review -->|all ACs pass| DoneT([FORGE_COMPLETE<br/>squash-merged to main])
+    Over -.-> Claim
+
+    classDef phase fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef shared fill:#fff3e0,stroke:#e65100,color:#bf360c
+    classDef done fill:#c8e6c9,stroke:#1b5e20,color:#0d2818
+    class BL,BD,ExecL,ExecD,Review,PlanT phase
+    class Spec,Flag,Claim shared
+    class DoneT done
+```
+
+The two-paragraph read: **(1)** brainstorm is parallel and non-conflicting because each participant writes to a user-scoped filename (`inputs-<handle>.md`) — no merge conflict by construction; consolidation into `consolidated.md` is serialized behind a 30-second lease. **(2)** Plan is a pure function of the spec so both machines produce the same frontier independently; execute then races for task claims via a 120-second lease (auto-heartbeated every 30s), and every AI pause-point becomes a committed forward-motion flag that your teammate can override without blocking execute.
 
 ### Worked example: add a logout button
 
@@ -316,7 +361,7 @@ Full honest comparison with all trade-offs: [docs/comparison.md](docs/comparison
 
 Forge is a state machine that lives inside your Claude Code session. A spec becomes a tier-ordered task DAG; an autonomous loop dispatches parallel executors in git worktrees; each task is gated by review and verification; successful tasks squash-merge atomically. Seven hooks fire on every tool call to cap tokens, condense test output, cache repeat reads, track progress, and trigger auto-backprop when tests hit a spec gap. State files under `.forge/` are the single source of truth; the TUI and headless query both read them without writing.
 
-### The big picture
+### The big picture — solo
 
 End-to-end. Three commands, one autonomous loop, one merge.
 
@@ -332,7 +377,6 @@ flowchart LR
     Loop -.->|read-only| Watch["/forge watch<br/>live TUI dashboard"]
     Loop -.->|read-only| Headless["/forge status --json<br/>headless query"]
     Crash[crash / context reset] -.->|/forge resume| Loop
-    TeamUser([Teammate<br/>on another machine]) -.->|same origin = same session| Exec
 
     classDef cmd fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
     classDef state fill:#fff3e0,stroke:#e65100,color:#bf360c
@@ -342,11 +386,67 @@ flowchart LR
     class Bs,Plan,Exec,Loop cmd
     class Spec,Frontier state
     class Watch,Headless ui
-    class Done,User,TeamUser done
+    class Done,User done
     class Crash state
 ```
 
-Five deeper diagrams cover the execute loop, hooks pipeline, backpropagation, recovery layer, and collaborative mode. Click any to expand. The full one-piece view sits at the bottom.
+### The big picture — team (`/forge:collaborate`)
+
+Same three phases, distributed across N>=2 machines. Shared state is files in `.forge/collab/` committed to git; concurrency is resolved by leases the transport (polling or Ably) adjudicates with exactly one winner per contested operation. No server, no invite link — session identity is `sessionIdFromOrigin()`, a 12-hex hash of `git remote get-url origin`.
+
+```mermaid
+flowchart LR
+    subgraph M1["Machine 1 (Lucas)"]
+        L1["/forge:collaborate start"]
+        L2["/forge:collaborate brainstorm"]
+        L3["/forge:execute --autonomy full"]
+    end
+    subgraph M2["Machine 2 (Daisy)"]
+        D1["git pull<br/>/forge:collaborate join"]
+        D2["/forge:collaborate brainstorm"]
+        D3["/forge:execute --autonomy full"]
+    end
+    L2 --> IL[".forge/collab/brainstorm/<br/>inputs-lucas.md"]
+    D2 --> ID[".forge/collab/brainstorm/<br/>inputs-daisy.md"]
+    IL --> Con["consolidate under<br/>30s lease"]
+    ID --> Con
+    Con --> CS[".forge/collab/consolidated.md<br/>categories.json"]
+    CS --> Pln["/forge:plan<br/>deterministic on both clones"]
+    Pln --> Fr[".forge/plans/<br/>{spec}-frontier.md"]
+    Fr --> Q{"claim queue<br/>120s lease + heartbeat<br/>exactly-one winner per task"}
+    L3 <-->|lease state| Q
+    D3 <-->|lease state| Q
+    Q -->|Lucas wins T001| EL["worktree T001<br/>TDD, review, verify"]
+    Q -->|Daisy wins T002| ED["worktree T002<br/>TDD, review, verify"]
+    EL -->|AI pause-point| F[".forge/collab/flags/F<id>.md<br/>commit + push"]
+    ED -->|AI pause-point| F
+    F -->|teammate reviews| Ov["/forge:collaborate override<br/>re-triggers task"]
+    Ov -.-> Q
+    EL --> Sq["squash-merge<br/>to main"]
+    ED --> Sq
+    Sq --> DoneT([FORGE_COMPLETE<br/>both machines see final state])
+
+    subgraph T["Transport (pick one)"]
+        TA["Ably realtime<br/>sub-second<br/>npm install ably + ABLY_KEY"]
+        TP["Polling (default)<br/>~2.5s, zero-setup<br/>forge/collab-state branch"]
+    end
+    Q -.->|CAS| T
+    F -.->|publish + git push| T
+
+    classDef cmd fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef shared fill:#fff3e0,stroke:#e65100,color:#bf360c
+    classDef transport fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
+    classDef done fill:#c8e6c9,stroke:#1b5e20,color:#0d2818
+
+    class L1,L2,L3,D1,D2,D3,Pln,EL,ED,Sq cmd
+    class IL,ID,CS,Fr,F,Con,Q,Ov shared
+    class TA,TP transport
+    class DoneT done
+```
+
+How to read it in order: **(1)** both machines join the session by deriving the same ID from the same origin — no invite, no OAuth. **(2)** Brainstorm is per-participant with user-scoped filenames, so two people writing at once never conflict; consolidation is serialized behind a 30-second lease. **(3)** Plan is pure over the spec, so each machine produces the same frontier independently. **(4)** Execute races for claims through a lease the transport adjudicates (Ably: publish-ack election; polling: commit-rebase CAS) — the loser gets `{acquired:false, reason:'lost_race'}` and picks a different task. **(5)** Any AI decision that would normally pause for human approval is instead committed as a flag with the AI's defended default; your teammate can override it later and the dependent task re-triggers on the next iteration. **(6)** Every merged task is a normal squash-merge to main; the collab state evaporates on `/forge:collaborate leave`.
+
+Four deeper diagrams cover the execute loop, hooks pipeline, backpropagation, and recovery layer. A fifth block lists the collaborative mode's lifecycle invariants and recovery classes. Click any to expand. The full one-piece view sits at the bottom.
 
 <details>
 <summary><strong>Execute loop (state machine + DAG dispatch)</strong></summary>
@@ -441,57 +541,34 @@ flowchart LR
 </details>
 
 <details>
-<summary><strong>Collaborative mode (multiplayer execution)</strong></summary>
+<summary><strong>Collaborative mode — lifecycle invariants and crash classes</strong></summary>
 
-How `/forge:collaborate` lets two or more machines drive different tasks on the same spec without stepping on each other. The coordination substrate is files in `.forge/collab/` plus a transport that resolves claim races and forward-motion flag deliveries.
+The big-picture team diagram above shows the happy path. These are the non-obvious invariants that make the mode crash-safe, plus the five classes `/forge:collaborate recover` diagnoses.
 
-```mermaid
-flowchart TB
-    subgraph Clients["Participant machines (N >= 2)"]
-        L["Lucas<br/>CLI session"]
-        D["Daisy<br/>CLI session"]
-    end
-    subgraph Shared["Shared state (committed to git)"]
-        BD[".forge/collab/brainstorm/<br/>inputs-lucas.md<br/>inputs-daisy.md"]
-        CD[".forge/collab/consolidated.md<br/>categories.json"]
-        FG[".forge/collab/flags/F<id>.md"]
-    end
-    subgraph Local["Per-machine (re-ignored)"]
-        PJ["participant.json<br/>.enabled<br/>flag-emit-log-<handle>.jsonl"]
-    end
-    subgraph Transport["Transport (pick one)"]
-        A["Ably realtime<br/>(WebSocket pub/sub,<br/>cas_propose → cas_won)"]
-        P["Polling<br/>(forge/collab-state branch,<br/>~2.5s git CAS)"]
-    end
+**Atomicity through filesystem ordering.** Collab-on and collab-off are each a two-write sequence with the user-visible marker flipped atomically last (on entry) or first (on exit). A crash between writes is always recoverable.
 
-    L -->|brainstormDump| BD
-    D -->|brainstormDump| BD
-    BD -->|consolidate under lease| CD
-    CD --> Plan["/forge:plan<br/>(same frontier on both)"]
-    Plan --> Claim{claimTask<br/>publish-ack election}
-    L <-->|lease state| Claim
-    D <-->|lease state| Claim
-    Claim -->|exactly one winner| Exec["/forge:execute<br/>on the winning machine"]
-    Exec -->|ambiguous decision| Flag[writeForwardMotionFlag]
-    Flag --> FG
-    FG -->|teammate reviews| Override[/forge:collaborate override]
-    Override -->|re-triggers task| Exec
-    Transport --- Claim
-    Transport --- Flag
+- **Start order:** `participant.json` FIRST (handle, session ID, start time), then `.enabled` LAST as the atomic "collab on" flip. A crash between them leaves `stale_participant`.
+- **Leave order:** `.enabled` FIRST (atomic "collab off"), then release active claims, then transport disconnect, then `participant.json` LAST. A crash between them leaves `stale_enabled` but the executor guard has already stopped treating the machine as a participant.
 
-    L -.->|partial start/leave| PJ
-    D -.->|partial start/leave| PJ
-    PJ -.->|crash| Recover{"/forge:collaborate recover<br/>stale_participant |<br/>stale_enabled |<br/>session_mismatch"}
-```
+**Lease hierarchy.** Three disjoint leases, each with a distinct TTL.
 
-Key invariants:
-- **Session = origin hash.** `sessionIdFromOrigin()` derives a 12-hex code from `git remote get-url origin`. Identical clones auto-join.
-- **Start order: participant.json FIRST, `.enabled` LAST.** Any crash between the two is recoverable.
-- **Leave order: `.enabled` FIRST, claims released, disconnect, `participant.json` LAST.** Guarantees a partial leave lands in a safe single-user fallback.
-- **Consolidation lease (30s TTL).** Prevents two participants from overwriting `consolidated.md`. Holder keeps the lease until write completes.
-- **Claim lease (120s TTL, auto-heartbeat).** A dropped laptop's claim expires; the task returns to the claimable pool without manual cleanup.
-- **Forward-motion never blocks humans.** Flags are fire-and-forget: write to `flags/F<id>.md`, commit + push, execute continues with the AI's chosen default. Override async.
-- **Realtime mode requires `npm install ably`.** Optional peerDependency. Polling mode has zero extra deps.
+- **Consolidation lease — 30s TTL.** Prevents two machines from overwriting `consolidated.md` during the merge step. Holder keeps the lease until write completes.
+- **Claim lease — 120s TTL, auto-heartbeat every 30s.** One winner per task; a dropped laptop's claim expires and the task returns to the claimable pool. `tryAcquireLease` is async and awaits the transport CAS (fixed in R010 — see `tests/collab-claim-race.test.cjs`).
+- **Flag emit — no lease.** Flags are fire-and-forget: write, commit, push, keep executing. Overrides are just another commit on top.
+
+**Recovery classes.** `/forge:collaborate recover` (dry-run by default, `apply:true` to commit) classifies the on-disk state and proposes a remedy.
+
+| Class | State | Remedy |
+|---|---|---|
+| `inactive` | Neither marker present | No action |
+| `healthy` | Both markers, session matches origin | No action |
+| `stale_participant` | `participant.json` present, `.enabled` missing | Reset partial start |
+| `stale_enabled` | `.enabled` present, `participant.json` missing | Repair from git config |
+| `session_mismatch` | Both present, participant's session_id differs from current origin hash | Migrate participant to new session |
+
+**Transport requirements.** Polling has zero extra deps; Ably realtime requires `npm install ably` + `export ABLY_KEY=...`. `ably` is declared an OPTIONAL peerDependency, so the plugin only pulls it when `ABLY_KEY` is in env and `--polling` is not forced.
+
+**Shared vs local files.** `.forge/collab/` is carved out of the default `.forge/` gitignore so its contents propagate via git; a nested `.forge/collab/.gitignore` re-ignores per-machine markers (`participant.json`, `.enabled`, `flag-emit-log-<handle>.jsonl`). `detectLegacyGitignore` + `patchGitignore` migrate old checkouts.
 
 </details>
 
