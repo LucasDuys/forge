@@ -56,14 +56,14 @@ suite('T013 integration -- full brainstorm -> consolidate -> claim -> execute lo
     // but he acquires the lease, does work, releases. The key assertion is
     // that no overwrite happens DURING daniel's write. Simulate that by
     // pre-acquiring on a third claimant:
-    const pre = collab.tryAcquireLease(transport, 'consolidation', 'third', { ttlSeconds: 30, now: 2_000_000 });
+    const pre = await collab.tryAcquireLease(transport, 'consolidation', 'third', { ttlSeconds: 30, now: 2_000_000 });
     assert.strictEqual(pre.acquired, true);
     const blocked = await collab.writeConsolidatedUnderLease(
       transport, collabDir, 'sarah', inputs, { ttlSeconds: 30, now: 2_000_000 + 100 }
     );
     assert.strictEqual(blocked.held, false);
     assert.match(blocked.reason, /held_by_third/);
-    collab.releaseLease(transport, 'consolidation', 'third');
+    await collab.releaseLease(transport, 'consolidation', 'third');
 
     // --- 4. Participant shapes for routing ---
     const participants = inputs.map(i => ({
@@ -80,14 +80,15 @@ suite('T013 integration -- full brainstorm -> consolidate -> claim -> execute lo
     };
     const q = await collab.routeClarifyingQuestion(
       realtimeTransport, collabDir, participants,
-      { text: 'which cache eviction policy?', topic: 'cache', source_section: 'redis topic' }
+      { text: 'which cache eviction policy?', topic: 'cache', source_section: 'redis topic' },
+      { fallback_jaccard: true } // spec-collab-fix R007: Jaccard is opt-in
     );
     assert.strictEqual(q.routed_to, 'daniel', 'cache question should route to daniel');
     assert.strictEqual(sent.filter(s => s.handle === 'lucas').length, 0, 'lucas must not receive a non-target ping (R015)');
 
     // --- 6. Claim-queue race across two agents (R006) ---
-    const rA = collab.claimTask(transport, 'C001', 'daniel', { ttlSeconds: 120, now: 3_000_000 });
-    const rB = collab.claimTask(transport, 'C001', 'lucas',  { ttlSeconds: 120, now: 3_000_000 });
+    const rA = await collab.claimTask(transport, 'C001', 'daniel', { ttlSeconds: 120, now: 3_000_000 });
+    const rB = await collab.claimTask(transport, 'C001', 'lucas',  { ttlSeconds: 120, now: 3_000_000 });
     assert.strictEqual([rA.acquired, rB.acquired].filter(Boolean).length, 1,
       'exactly one winner on claim race');
 
@@ -106,7 +107,8 @@ suite('T013 integration -- full brainstorm -> consolidate -> claim -> execute lo
       phase: 'executing', collabDir, task_id: 'C001', author: 'daniel',
       decision: 'use redis pubsub', alternatives: ['nats'],
       rationale: 'already in stack', source_contributors: ['daniel'],
-      participants, transport: realtimeTransport
+      participants, transport: realtimeTransport,
+      fallback_jaccard: true // spec-collab-fix R007: Jaccard is opt-in
     });
     assert.strictEqual(flag.written, true);
     assert.strictEqual(flag.notified.mode, 'targeted');
@@ -209,7 +211,7 @@ suite('T013 integration -- full brainstorm -> consolidate -> claim -> execute lo
 // ---------------------------------------------------------------------
 
 suite('T013 integration -- transport mode selection (R013)', () => {
-  test('matrix: ABLY_KEY | polling opt-in | neither -> correct mode', () => {
+  test('matrix: ABLY_KEY | polling opt-in | neither -> correct mode', async () => {
     assert.strictEqual(collab.selectTransportMode({ env: { ABLY_KEY: 'x' } }), 'ably');
     assert.strictEqual(collab.selectTransportMode({ env: {}, polling: true }), 'polling');
     assert.strictEqual(collab.selectTransportMode({ env: {} }), 'setup-required');
@@ -240,7 +242,8 @@ suite('T013 integration -- R015 scoped routing never leaks to non-targets', () =
     await collab.writeForwardMotionFlag({
       phase: 'executing', collabDir, task_id: 'T1', author: 'bot',
       decision: 'redis pubsub', alternatives: [], rationale: 'cache',
-      source_contributors: ['daniel'], participants, transport
+      source_contributors: ['daniel'], participants, transport,
+      fallback_jaccard: true // spec-collab-fix R007: Jaccard is opt-in
     });
     assert.strictEqual(received.daniel, 1);
     assert.strictEqual(received.lucas, 0);

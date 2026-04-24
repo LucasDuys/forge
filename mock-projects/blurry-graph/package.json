@@ -1,0 +1,25 @@
+{
+  "name": "blurry-graph",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Intentionally broken force-directed graph used by Forge visual-verifier fixture tests. Ships three deliberate regressions toggled by src/config.ts flags.",
+  "scripts": {
+    "dev": "vite --port 5174",
+    "build": "vite build",
+    "preview": "vite preview --port 5174"
+  },
+  "dependencies": {
+    "d3": "7.9.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/d3": "7.4.3",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "@vitejs/plugin-react": "4.3.4",
+    "typescript": "5.6.3",
+    "vite": "5.4.10"
+  }
+}

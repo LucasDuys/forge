@@ -85,5 +85,14 @@
       "debug_attempts_before_rescue": 2,
       "model": null
     }
+  },
+  "collab": {
+    "scorer": "node scripts/forge-collab-scorer.cjs",
+    "fallback_jaccard": false
+  },
+  "streaming_dag": {
+    "enabled": true,
+    "max_provisional": 3,
+    "max_failures_before_fallback": 2
   }
 }

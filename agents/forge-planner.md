@@ -53,16 +53,65 @@ depth: {quick|standard|thorough}
 
 Each task line follows this pattern:
 ```
-- [T{NNN}] {Task name} | est: ~{N}k tokens | repo: {REPO} | depends: {T001, T002} | provides: {artifact-name} | consumes: {artifact-name}
+- [T{NNN}] {Task name} | est: ~{N}k tokens | repo: {REPO} | depends: {T001, T002} | provides: {artifact-name} | consumes: {artifact-name} | files: {path/a.ts, path/b.ts}
 ```
 
 - **ID**: Sequential, zero-padded to 3 digits (T001, T002, ... T999). Re-decomposed sub-tasks use decimal IDs (T003.1, T003.2)
 - **Name**: Short, descriptive. Verb-first. Example: "User model + migration", "Registration endpoint + tests"
 - **Estimate**: Token estimate in thousands, prefixed with `~`. Based on depth level (see below)
 - **Repo**: Which repo this task targets. Omit if single-repo project
-- **Depends**: Comma-separated list of task IDs this task depends on. Omit if no dependencies (Tier 1)
-- **Provides**: Comma-separated list of artifact names this task produces. Use lowercase with hyphens (e.g., `user-model`, `auth-routes`). These become keys in the artifact JSON that downstream tasks can reference.
+- **Depends**: Comma-separated list of task IDs this task depends on. Omit if no dependencies (Tier 1). Accepts both task-level (`T001`) and AC-level (`T001.R001.AC2`) forms — see "AC-level dependency guidance" below.
+- **Provides**: Comma-separated list of artifact names this task produces. Use lowercase with hyphens (e.g., `user-model`, `auth-routes`). Or AC-level tokens like `R001.AC1`, `R001.AC2` when the artifact maps cleanly to a spec checkbox.
 - **Consumes**: Comma-separated list of artifact names from dependency tasks that this task needs. Must match a `provides` value from a dependency task.
+- **Files** (forge-self-fixes R005): Comma-separated list of files this task will modify. MANDATORY. Used by `detect-contention` to flag same-tier tasks that would fight over a shared integration file (App.tsx, index.ts barrel, router config, etc.).
+
+## AC-level dependency guidance (forge-self-fixes R004)
+
+The default `depends: T001` edge waits for the upstream task's full DONE state (tests green, review passed). That is often too conservative. When a downstream task needs only an EARLY artifact from its upstream — a function signature, a type definition, an exported constant, a scaffolded config file — emit an AC-level edge of the form `depends: T001.R001.AC2` so the streaming-DAG scheduler can dispatch the downstream provisionally as soon as that specific AC ticks.
+
+**When to emit AC-level edges.** Scan each proposed downstream task's spec text for phrases like:
+- "consumes type X from T00N"
+- "imports from T00N"
+- "reads tokens defined in T00N"
+- "uses the scaffolded router in T00N"
+
+In those cases, identify the AC on the upstream task that produces the needed artifact (usually AC1 or AC2 — the earliest checkbox that makes the artifact visible to importers) and emit `depends: T00N.R00M.AC{index}` where `index` is the 1-based position of that AC.
+
+**Worked examples.**
+
+1. Downstream needs a type:
+   ```
+   - [T002] Hero component | est: ~4k | depends: T001.R001.AC1 | files: src/components/Hero.tsx
+   ```
+   (T001.R001.AC1 is "TypeScript types exported from tokens.ts". Once types exist, T002 can import them even while T001's own tests are still compiling.)
+
+2. Downstream needs a function signature:
+   ```
+   - [T004] Hook that calls useToken | est: ~5k | depends: T002.R002.AC1 | files: src/hooks/useToken.ts
+   ```
+
+3. Downstream needs NOTHING until upstream is fully done — use plain task-level edge:
+   ```
+   - [T005] Full integration test | est: ~6k | depends: T002, T003, T004 | files: tests/e2e.test.ts
+   ```
+
+**When task-level is correct.** Full DONE dependency is right when the downstream semantically needs the upstream to be verified (integration tests, migration verification, anything that sits downstream of a review-required task). Do not invent AC-level edges just to trigger streaming-DAG behavior — the scheduler is safe to use only when the downstream genuinely only needs the early artifact.
+
+**Back-compat.** A frontier file with ONLY `depends: T001` edges still works — the streaming-DAG scheduler treats a bare task id as "wait for final AC" and dispatches tier-by-tier as before.
+
+## Shared-file contention detection (forge-self-fixes R005)
+
+Before emitting your frontier, simulate same-tier parallel dispatch: for each tier, collect every task's `files:` list and check for overlaps.
+
+**If two or more same-tier tasks list the same file**, you MUST choose one of these resolutions:
+
+1. **Move one task to a later tier**: make it depend on the other. This serializes the two writes to the shared file. Right when the second task's work genuinely depends on the first.
+
+2. **Split the integration concern into a new task in a later tier**: both upstream tasks scope themselves to new files only (e.g. `src/components/Hero.tsx`, `src/components/BeforeChapter.tsx`) and a new `T00N` in the next tier owns the shared file (`src/App.tsx` — wires imports). Right when the two upstream tasks are genuinely parallel but merge into a common surface.
+
+**Why this matters.** In the 2026-04-21 forge-landing run, the planner put three Tier-2 tasks (T002/T003/T004) all touching `src/App.tsx`. The executor fell back to sequential dispatch manually because parallel worktree merge would have failed on three conflicting App.tsx diffs. The planner could have prevented this by detecting the overlap and applying resolution #2.
+
+Run `node scripts/forge-tools.cjs detect-contention --frontier <your-frontier-path>` as a self-check before emitting the final frontier. Exit 3 means there is a conflict you must resolve; exit 0 means the frontier is safe for parallel same-tier dispatch.
 
 ## Token Estimation by Depth
 

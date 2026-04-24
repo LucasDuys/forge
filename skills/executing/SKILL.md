@@ -24,12 +24,35 @@ You will receive:
 2. **Read the frontier** from `.forge/plans/{spec}-frontier.md` — find your current task, understand its dependencies, and what comes after.
 3. **Read the spec** from `.forge/specs/spec-{domain}.md` — find the R-numbered requirements and acceptance criteria that this task must satisfy. Identify the exact checkboxes you need to check off.
 4. **Read capabilities** from `.forge/capabilities.json` if it exists — check for available MCP servers (Context7 for docs, Playwright for E2E, MongoDB for data inspection) and skills (TDD, systematic debugging, code review).
+5. **Cited-docs pass (forge-self-fixes R009).** Before moving to Step 2, list every external document the spec references and read each one. Run:
+
+   ```bash
+   node scripts/forge-tools.cjs list-cited-docs --spec .forge/specs/spec-{domain}.md --repo-root .
+   ```
+
+   The CLI returns a JSON array of `{ line, path }` for absolute, home-relative, and sibling-repo paths. For each returned path, use `Read` to open the document before writing any implementation code. If a path does not resolve, log a warning to state.md decisions and continue — do NOT fabricate values that were supposed to come from the cited doc. This closes the gap from the 2026-04-21 forge-landing run where the executor fabricated benchmark numbers instead of reading the source doc the spec had cited.
 
 ### Step 2: Prepare the Workspace
 
 1. **Multi-repo**: If the task has a `repo:` tag, `cd` into the correct repo directory (from `.forge/config.json` repos). Read that repo's CLAUDE.md or coding conventions file first.
 2. **Single-repo**: Stay in the current directory. Read CLAUDE.md if it exists.
 3. **Conventions**: Note the project's coding style, naming conventions, import patterns, test framework, and commit message format. Follow them exactly.
+4. **UI-task detection (forge-self-fixes R003).** Run the classifier to decide whether this task needs the design-skill routing:
+
+   ```bash
+   node scripts/forge-tools.cjs task-classify \
+     --task-id T00N \
+     --spec .forge/specs/spec-{domain}.md \
+     --capabilities .forge/capabilities.json
+   ```
+
+   The output shape is `{ ui:boolean, brand:string|null, reasons:[...] }`. If `ui` is true you MUST, before writing any component code in Step 3:
+
+   - Invoke `Skill("frontend-design")` once for general design-quality guidance, AND
+   - If `brand` is non-null, also invoke the brand-specific skill: `Skill("brand-guidelines")` for Anthropic, or reference the awesome-design-md catalog for other named brands.
+   - If a `DESIGN.md` exists at repo root, read it first and cite specific tokens in your component code rather than picking tokens from memory.
+
+   This is the execution-side counterpart to the R002 DESIGN.md gate in the brainstorming skill. The brainstorm skill wrote the tokens; the executor reads them. The 2026-04-21 forge-landing regression was an executor that wrote an "Anthropic-aesthetic" landing page without either step, so the tokens shipped as approximations. This block closes that loop.
 
 ### Step 3: Implement the Task
 

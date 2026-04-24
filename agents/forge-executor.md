@@ -365,6 +365,77 @@ The `artifacts` map keys should match the `provides:` names from the frontier. V
 
 If a context bundle file exists at `.forge/context-bundles/{task-id}.md`, read it first for curated context from your dependencies.
 
+### 5.6 Transcripts (T008/R014)
+
+Every agent invocation inside `/forge:execute` appends a single JSONL line to `.forge/history/cycles/<cycle-id>/transcript.jsonl` so `/forge:review-branch` can cross-check agent claims against commits. The stop-hook records a line for every iteration automatically; you should record one more when you finish your task so the transcript reflects the executor's own activity, not just the router's.
+
+Append your own entry via the CLI:
+
+```bash
+node scripts/forge-tools.cjs transcript-append \
+  --forge-dir .forge \
+  --cycle "$CYCLE_ID" \
+  --entry '{"phase":"executing","agent":"forge-executor","task_id":"T003","tool_calls_count":42,"duration_ms":180000,"status":"DONE","summary":"Registration endpoint + bcrypt hashing + JWT; 4/4 ACs met"}'
+```
+
+The cycle id is the `current_cycle` value from `.forge/state.md` frontmatter. If you cannot resolve it (fresh cycle, missing state), skip the transcript append — the stop-hook will still capture the route-level entry. Do NOT include an `at` timestamp on per-entry lines; the appender injects a phase-boundary line with a timestamp exactly once per phase transition so the rest of the file diffs cleanly across runs.
+
+Alternatively, call it in-process:
+
+```js
+require('./scripts/forge-tools.cjs').appendTranscript('.forge', cycleId, {
+  phase: 'executing', agent: 'forge-executor', task_id: 'T003',
+  tool_calls_count: 42, duration_ms: 180000,
+  status: 'DONE', summary: 'Registration endpoint + bcrypt hashing + JWT'
+});
+```
+
+Keep `summary` short (≤ 120 chars) and caveman-internal-friendly; it is agent-internal scratch, not user-facing prose.
+
+### 5.7 AC Event Emission (T029 / R006 — streaming DAG, opt-in)
+
+When `.forge/config.json` has `streaming_dag.enabled: true`, the scheduler dispatches downstream tasks the instant an upstream acceptance criterion they declared as a dependency is met. This requires the executor to emit a per-AC event as each criterion passes, not only at task completion.
+
+You only need to emit these events when the streaming DAG is active. Check the flag once at task start. If it is off, skip this section and use the normal task-level transcript entry described in 5.6.
+
+For every acceptance criterion (`R<num>.AC<num>`) that you pass — as soon as you pass it, not at the end:
+
+1. Identify the `witness_paths`: the file(s) whose current contents are evidence the AC is satisfied. Usually this is the file the AC required you to create or modify plus any test file that now passes because of that change. Keep the list tight (the fewer paths the better; extra paths produce noisier witness hashes that look like regressions on unrelated edits).
+
+2. Compute a witness hash over those files, or let the CLI compute it for you. The CLI reads the declared files from the current working directory and produces a SHA-256 hash.
+
+3. Emit the `ac-met` event:
+
+```bash
+node scripts/forge-tools.cjs ac-met \
+  --task T013 \
+  --ac R002.AC1 \
+  --witness-hash "$(node -e 'console.log(require(\"./scripts/forge-streaming-dag.cjs\").computeWitnessHash([\"src/auth.ts\",\"tests/auth.test.ts\"]))')" \
+  --witness-paths src/auth.ts,tests/auth.test.ts
+```
+
+Or in-process, if you are calling from another node script:
+
+```js
+const dag = require('./scripts/forge-streaming-dag.cjs');
+const witnessHash = dag.computeWitnessHash(['src/auth.ts', 'tests/auth.test.ts']);
+// then invoke the CLI with that hash, or write directly to .forge/streaming/events.jsonl
+```
+
+The CLI appends one JSONL line to `.forge/streaming/events.jsonl`; the dispatcher replays events on its next tick. Events stay recorded even when the feature flag is off, so turning streaming on later does not lose history.
+
+Also append a transcript line for the AC event (T008/R014 extension) so `/forge:review-branch` can cross-check your AC claims against reality:
+
+```bash
+node scripts/forge-tools.cjs transcript-append \
+  --forge-dir .forge --cycle "$CYCLE_ID" \
+  --entry '{"phase":"executing","agent":"forge-executor","task_id":"T013","tool_calls_count":0,"duration_ms":0,"status":"AC_MET","summary":"R002.AC1 witness=<sha-prefix>"}'
+```
+
+When your task is fully DONE and you exit the executor, the outer scheduler will emit a `task-verified` event that promotes every provisional `ac-met` event you recorded to `verified`. You do not emit that event yourself.
+
+Never emit `ac-met` speculatively. Only emit after a real check: the endpoint returns the expected status code, the test you wrote passes, the output matches the spec. An emitted `ac-met` event with a stale witness hash will cause downstream work to be re-queued as STALE when the reviewer rejects your claim; emitting conservatively keeps the streaming DAG honest.
+
 ### 6. Report Status
 
 Report your status using one of the four status codes (DONE, DONE_WITH_CONCERNS, NEEDS_CONTEXT, BLOCKED) along with a brief summary:
@@ -393,7 +464,7 @@ Concerns:
 
 ## Collab Mode (Forward-Motion Decisions)
 
-If `.forge/collab/participant.json` exists, **collab mode is active** (a `/forge:collaborate` session is in progress). During executing/implementing/testing/reviewing/fixing/debugging phases, when you would normally block waiting for human input on a non-trivial decision (library choice, design pattern, edge-case handling, interface shape), **do not block.**
+If `.forge/collab/.enabled` exists, **collab mode is active** (a `/forge:collaborate` session is in progress). The `.enabled` marker is the authoritative signal — `/forge:collaborate start` writes it atomically after `participant.json`, and `/forge:collaborate leave` deletes it before anything else, so a half-off state from a mid-cleanup crash is impossible to confuse with a live session. During executing/implementing/testing/reviewing/fixing/debugging phases, when you would normally block waiting for human input on a non-trivial decision (library choice, design pattern, edge-case handling, interface shape), **do not block.**
 
 Instead:
 
@@ -414,15 +485,17 @@ Instead:
 
 **Do not write flags outside an executing sub-phase.** The CLI enforces this and will exit code 3 if misused.
 
-**Single-user mode (no `.forge/collab/participant.json`):** ignore collab-mode instructions entirely. Keep your existing blocking / NEEDS_CONTEXT behavior for decisions -- that is the right UX when there is no team to coordinate with.
+**Single-user mode (no `.forge/collab/.enabled`):** ignore collab-mode instructions entirely. Keep your existing blocking / NEEDS_CONTEXT behavior for decisions -- that is the right UX when there is no team to coordinate with.
 
 Quick detection before any flag work:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs" collab-mode-active --forge-dir .forge >/dev/null 2>&1
-# exit 0 -> collab mode ON, use the flag path above
+# exit 0 -> collab mode ON (`.enabled` present), use the flag path above
 # exit 1 -> single-user, keep current behavior
 ```
+
+If you observe a half-off state (for example `participant.json` is present but `.forge/collab/.enabled` is missing), stop and suggest the user run `/forge:collaborate recover` — do not try to write flags, claims, or leases against a stale session.
 
 ## Constraints
 

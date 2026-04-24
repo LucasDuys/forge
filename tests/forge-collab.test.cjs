@@ -152,12 +152,21 @@ function keywordScorer(keyword) {
 
 suite('scoreParticipant -- shape', () => {
   test('returns a number in [0, 1]', () => {
-    const s = scoreParticipant('hello world', { handle: 'a', contributions: 'hello there world' });
+    // Jaccard is now explicit opt-in (spec-collab-fix R007); legacy test
+    // migrated to pass fallback_jaccard:true to keep asserting the
+    // heuristic's shape contract.
+    const s = scoreParticipant(
+      'hello world',
+      { handle: 'a', contributions: 'hello there world' },
+      { fallback_jaccard: true }
+    );
     assert.ok(typeof s === 'number');
     assert.ok(s >= 0 && s <= 1, `expected [0,1], got ${s}`);
   });
 
   test('zero contribution participant scores exactly 0', () => {
+    // Contribution shortcut fires before scorer resolution, so these
+    // continue to return 0 without a scorer wired.
     const s = scoreParticipant('anything', { handle: 'a', contributions: '' });
     assert.strictEqual(s, 0);
     const s2 = scoreParticipant('anything', { handle: 'a', contributions: '   ' });
@@ -178,12 +187,18 @@ suite('scoreParticipant -- shape', () => {
 
 suite('routeToParticipant -- similarity', () => {
   test('three mock participants -- clearly relevant one wins', () => {
+    // Legacy test: spec-collab-fix R007 flipped Jaccard to opt-in, so
+    // pass fallback_jaccard:true to keep this as a Jaccard shape check.
     const participants = [
       { handle: 'alice', contributions: 'redis cache invalidation ttl pub sub', active_tasks: 0 },
       { handle: 'bob',   contributions: 'react frontend css tailwind design', active_tasks: 0 },
       { handle: 'carol', contributions: 'payments stripe webhook retries', active_tasks: 0 }
     ];
-    const winner = routeToParticipant('cache invalidation strategy for redis', participants);
+    const winner = routeToParticipant(
+      'cache invalidation strategy for redis',
+      participants,
+      { fallback_jaccard: true }
+    );
     assert.strictEqual(winner, 'alice');
   });
 });
@@ -285,11 +300,11 @@ suite('routeToParticipant -- tie / broadcast', () => {
 });
 
 suite('routeToParticipant -- epsilon source', () => {
-  test('default epsilon exposed as DEFAULT_EPSILON and equals 0.05', () => {
+  test('default epsilon exposed as DEFAULT_EPSILON and equals 0.05', async () => {
     assert.strictEqual(DEFAULT_EPSILON, 0.05);
   });
 
-  test('opts.epsilon overrides default', () => {
+  test('opts.epsilon overrides default', async () => {
     // With a larger epsilon (0.3), a previously-winning 0.9 vs 0.7 gap collapses to broadcast.
     const scorer = (t, c, p) => p.handle === 'a' ? 0.9 : 0.7;
     const participants = [
@@ -302,7 +317,7 @@ suite('routeToParticipant -- epsilon source', () => {
     assert.strictEqual(withWideEps, 'broadcast');
   });
 
-  test('opts.forgeDir reads collab.route.epsilon from config.json', () => {
+  test('opts.forgeDir reads collab.route.epsilon from config.json', async () => {
     const { forgeDir } = makeTempForgeDir({ config: { collab: { route: { epsilon: 0.5 } } } });
     const scorer = (t, c, p) => p.handle === 'a' ? 0.6 : 0.2;
     const participants = [
@@ -314,7 +329,7 @@ suite('routeToParticipant -- epsilon source', () => {
     assert.strictEqual(r, 'broadcast');
   });
 
-  test('opts.epsilon wins over opts.forgeDir config value', () => {
+  test('opts.epsilon wins over opts.forgeDir config value', async () => {
     const { forgeDir } = makeTempForgeDir({ config: { collab: { route: { epsilon: 0.5 } } } });
     const scorer = (t, c, p) => p.handle === 'a' ? 0.6 : 0.2;
     const participants = [
@@ -328,7 +343,7 @@ suite('routeToParticipant -- epsilon source', () => {
 });
 
 suite('routeToParticipant -- deterministic tiebreak on handle', () => {
-  test('exact ties break deterministically on handle string order, not insertion order', () => {
+  test('exact ties break deterministically on handle string order, not insertion order', async () => {
     const scorer = constantScorer(0.5);
     const inputA = [
       { handle: 'zeta',  contributions: 'x', active_tasks: 0 },
@@ -350,19 +365,19 @@ suite('routeToParticipant -- deterministic tiebreak on handle', () => {
 // =====================================================================
 
 suite('memory transport', () => {
-  test('read returns null for missing key', () => {
+  test('read returns null for missing key', async () => {
     const t = createMemoryTransport();
     assert.strictEqual(t.read('x'), null);
   });
 
-  test('cas with null expected fails if entry exists', () => {
+  test('cas with null expected fails if entry exists', async () => {
     const t = createMemoryTransport();
     t.cas('x', null, { name: 'x', claimant: 'a', acquiredAt: 'T', expiresAt: 'T' });
     const ok = t.cas('x', null, { name: 'x', claimant: 'b', acquiredAt: 'T', expiresAt: 'T' });
     assert.strictEqual(ok, false);
   });
 
-  test('list returns copy of values', () => {
+  test('list returns copy of values', async () => {
     const t = createMemoryTransport();
     t.cas('x', null, { name: 'x', claimant: 'a', acquiredAt: 'T', expiresAt: 'T' });
     t.cas('y', null, { name: 'y', claimant: 'b', acquiredAt: 'T', expiresAt: 'T' });
@@ -371,115 +386,115 @@ suite('memory transport', () => {
 });
 
 suite('tryAcquireLease -- basic', () => {
-  test('fresh lease -- acquired', () => {
+  test('fresh lease -- acquired', async () => {
     const t = createMemoryTransport();
-    const r = tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
+    const r = await tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
     assert.strictEqual(r.acquired, true);
     assert.strictEqual(r.lease.claimant, 'daniel');
     assert.strictEqual(r.lease.name, 'consolidation');
     assert.ok(Date.parse(r.lease.expiresAt) > Date.parse(r.lease.acquiredAt));
   });
 
-  test('second distinct claimant while live -- rejected with holder', () => {
+  test('second distinct claimant while live -- rejected with holder', async () => {
     const t = createMemoryTransport();
-    tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
-    const r = tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1001 });
+    await tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
+    const r = await tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1001 });
     assert.strictEqual(r.acquired, false);
     assert.match(r.reason, /held_by_daniel/);
     assert.strictEqual(r.holder.claimant, 'daniel');
   });
 
-  test('same claimant re-acquires (treated as refresh)', () => {
+  test('same claimant re-acquires (treated as refresh)', async () => {
     const t = createMemoryTransport();
-    const a = tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
-    const b = tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 2000 });
+    const a = await tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
+    const b = await tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 2000 });
     assert.strictEqual(a.acquired, true);
     assert.strictEqual(b.acquired, true);
     assert.ok(Date.parse(b.lease.expiresAt) > Date.parse(a.lease.expiresAt));
   });
 
-  test('takes over a stale lease after TTL elapsed', () => {
+  test('takes over a stale lease after TTL elapsed', async () => {
     const t = createMemoryTransport();
-    tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
+    await tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
     // Jump forward > 30s
-    const r = tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1000 + 60_000 });
+    const r = await tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1000 + 60_000 });
     assert.strictEqual(r.acquired, true);
     assert.strictEqual(r.tookOverStale, true);
     assert.strictEqual(r.lease.claimant, 'lucas');
   });
 
-  test('two-agent race -- exactly one wins on fresh lease', () => {
+  test('two-agent race -- exactly one wins on fresh lease', async () => {
     // Shared transport, both call simultaneously. The CAS backend resolves
     // the race: the second caller sees the first's write and fails with
     // lost_race or held_by_other.
     const t = createMemoryTransport();
-    const r1 = tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
-    const r2 = tryAcquireLease(t, 'consolidation', 'lucas',  { ttlSeconds: 30, now: 1000 });
+    const r1 = await tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1000 });
+    const r2 = await tryAcquireLease(t, 'consolidation', 'lucas',  { ttlSeconds: 30, now: 1000 });
     const wins = [r1.acquired, r2.acquired].filter(Boolean).length;
     assert.strictEqual(wins, 1, 'expected exactly one winner in claim race');
   });
 
-  test('argument validation', () => {
+  test('argument validation', async () => {
     const t = createMemoryTransport();
-    assert.throws(() => tryAcquireLease(null, 'n', 'd'));
-    assert.throws(() => tryAcquireLease(t, '', 'd'));
-    assert.throws(() => tryAcquireLease(t, 'n', ''));
+    await assert.rejects(() => tryAcquireLease(null, 'n', 'd'));
+    await assert.rejects(() => tryAcquireLease(t, '', 'd'));
+    await assert.rejects(() => tryAcquireLease(t, 'n', ''));
   });
 });
 
 suite('refreshLease + releaseLease', () => {
-  test('refresh extends expiresAt for the holder', () => {
+  test('refresh extends expiresAt for the holder', async () => {
     const t = createMemoryTransport();
-    const a = tryAcquireLease(t, 'L', 'd', { ttlSeconds: 10, now: 1000 });
-    const r = refreshLease(t, 'L', 'd', { ttlSeconds: 10, now: 2000 });
+    const a = await tryAcquireLease(t, 'L', 'd', { ttlSeconds: 10, now: 1000 });
+    const r = await refreshLease(t, 'L', 'd', { ttlSeconds: 10, now: 2000 });
     assert.strictEqual(r.refreshed, true);
     assert.ok(Date.parse(r.lease.expiresAt) > Date.parse(a.lease.expiresAt));
   });
 
-  test('refresh by non-holder fails with holder info', () => {
+  test('refresh by non-holder fails with holder info', async () => {
     const t = createMemoryTransport();
-    tryAcquireLease(t, 'L', 'd', { ttlSeconds: 10, now: 1000 });
-    const r = refreshLease(t, 'L', 'lucas', { ttlSeconds: 10, now: 2000 });
+    await tryAcquireLease(t, 'L', 'd', { ttlSeconds: 10, now: 1000 });
+    const r = await refreshLease(t, 'L', 'lucas', { ttlSeconds: 10, now: 2000 });
     assert.strictEqual(r.refreshed, false);
     assert.match(r.reason, /held_by_other/);
     assert.strictEqual(r.holder.claimant, 'd');
   });
 
-  test('release by holder succeeds; re-acquire by other works', () => {
+  test('release by holder succeeds; re-acquire by other works', async () => {
     const t = createMemoryTransport();
-    tryAcquireLease(t, 'L', 'd', { ttlSeconds: 30, now: 1000 });
-    const rel = releaseLease(t, 'L', 'd');
+    await tryAcquireLease(t, 'L', 'd', { ttlSeconds: 30, now: 1000 });
+    const rel = await releaseLease(t, 'L', 'd');
     assert.strictEqual(rel.released, true);
-    const r2 = tryAcquireLease(t, 'L', 'lucas', { ttlSeconds: 30, now: 1001 });
+    const r2 = await tryAcquireLease(t, 'L', 'lucas', { ttlSeconds: 30, now: 1001 });
     assert.strictEqual(r2.acquired, true);
   });
 
-  test('release on already-empty is idempotent noop', () => {
+  test('release on already-empty is idempotent noop', async () => {
     const t = createMemoryTransport();
-    const r = releaseLease(t, 'L', 'd');
+    const r = await releaseLease(t, 'L', 'd');
     assert.strictEqual(r.released, true);
     assert.strictEqual(r.noop, true);
   });
 
-  test('release by non-holder fails', () => {
+  test('release by non-holder fails', async () => {
     const t = createMemoryTransport();
-    tryAcquireLease(t, 'L', 'd', { ttlSeconds: 30, now: 1000 });
-    const r = releaseLease(t, 'L', 'lucas');
+    await tryAcquireLease(t, 'L', 'd', { ttlSeconds: 30, now: 1000 });
+    const r = await releaseLease(t, 'L', 'lucas');
     assert.strictEqual(r.released, false);
   });
 });
 
 suite('readLease', () => {
-  test('reports stale=true when past expiry', () => {
+  test('reports stale=true when past expiry', async () => {
     const t = createMemoryTransport();
-    tryAcquireLease(t, 'L', 'd', { ttlSeconds: 5, now: 1000 });
+    await tryAcquireLease(t, 'L', 'd', { ttlSeconds: 5, now: 1000 });
     const live = readLease(t, 'L', { now: 1001 });
     const stale = readLease(t, 'L', { now: 1000 + 60_000 });
     assert.strictEqual(live.stale, false);
     assert.strictEqual(stale.stale, true);
   });
 
-  test('returns null for unknown lease', () => {
+  test('returns null for unknown lease', async () => {
     const t = createMemoryTransport();
     assert.strictEqual(readLease(t, 'missing', { now: 1 }), null);
   });
@@ -502,7 +517,7 @@ suite('withLease', () => {
 
   test('defers cleanly when another holder exists -- does not run fn', async () => {
     const t = createMemoryTransport();
-    tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1000 });
+    await tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1000 });
     let ran = false;
     const r = await withLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: 1001 }, async () => {
       ran = true;
@@ -528,50 +543,50 @@ suite('withLease', () => {
 });
 
 suite('task-claim wrappers', () => {
-  test('claimTask / heartbeatTaskClaim / releaseTaskClaim round-trip', () => {
+  test('claimTask / heartbeatTaskClaim / releaseTaskClaim round-trip', async () => {
     const t = createMemoryTransport();
-    const c = claimTask(t, 'T004', 'daniel', { ttlSeconds: DEFAULT_CLAIM_TTL_SECONDS, now: 1000 });
+    const c = await claimTask(t, 'T004', 'daniel', { ttlSeconds: DEFAULT_CLAIM_TTL_SECONDS, now: 1000 });
     assert.strictEqual(c.acquired, true);
-    const hb = heartbeatTaskClaim(t, 'T004', 'daniel', { ttlSeconds: DEFAULT_CLAIM_TTL_SECONDS, now: 2000 });
+    const hb = await heartbeatTaskClaim(t, 'T004', 'daniel', { ttlSeconds: DEFAULT_CLAIM_TTL_SECONDS, now: 2000 });
     assert.strictEqual(hb.refreshed, true);
-    const rel = releaseTaskClaim(t, 'T004', 'daniel');
+    const rel = await releaseTaskClaim(t, 'T004', 'daniel');
     assert.strictEqual(rel.released, true);
   });
 
-  test('two agents race for same task -- exactly one wins', () => {
+  test('two agents race for same task -- exactly one wins', async () => {
     const t = createMemoryTransport();
-    const r1 = claimTask(t, 'T004', 'daniel', { now: 1000 });
-    const r2 = claimTask(t, 'T004', 'lucas',  { now: 1000 });
+    const r1 = await claimTask(t, 'T004', 'daniel', { now: 1000 });
+    const r2 = await claimTask(t, 'T004', 'lucas',  { now: 1000 });
     const winners = [r1.acquired, r2.acquired].filter(Boolean).length;
     assert.strictEqual(winners, 1);
   });
 
-  test('stale claim is reclaimable after TTL', () => {
+  test('stale claim is reclaimable after TTL', async () => {
     const t = createMemoryTransport();
-    claimTask(t, 'T004', 'daniel', { ttlSeconds: 60, now: 1000 });
-    const r = claimTask(t, 'T004', 'lucas', { ttlSeconds: 60, now: 1000 + 120_000 });
+    await claimTask(t, 'T004', 'daniel', { ttlSeconds: 60, now: 1000 });
+    const r = await claimTask(t, 'T004', 'lucas', { ttlSeconds: 60, now: 1000 + 120_000 });
     assert.strictEqual(r.acquired, true);
     assert.strictEqual(r.tookOverStale, true);
   });
 
-  test('readTaskClaim reports stale flag', () => {
+  test('readTaskClaim reports stale flag', async () => {
     const t = createMemoryTransport();
-    claimTask(t, 'T004', 'daniel', { ttlSeconds: 10, now: 1000 });
+    await claimTask(t, 'T004', 'daniel', { ttlSeconds: 10, now: 1000 });
     const fresh = readTaskClaim(t, 'T004', { now: 1001 });
     const stale = readTaskClaim(t, 'T004', { now: 1000 + 60_000 });
     assert.strictEqual(fresh.stale, false);
     assert.strictEqual(stale.stale, true);
   });
 
-  test('listActiveTaskClaims filters out expired and non-claim leases', () => {
+  test('listActiveTaskClaims filters out expired and non-claim leases', async () => {
     const t = createMemoryTransport();
     const T = 1_000_000; // use large numbers so ttl math is unambiguous in ms
     // Active task claim: expires at T + 60s
-    claimTask(t, 'T004', 'daniel', { ttlSeconds: 60, now: T });
+    await claimTask(t, 'T004', 'daniel', { ttlSeconds: 60, now: T });
     // Expired task claim: claimed at T - 200s with only 10s ttl -> long expired
-    claimTask(t, 'T005', 'lucas',  { ttlSeconds: 10, now: T - 200_000 });
+    await claimTask(t, 'T005', 'lucas',  { ttlSeconds: 10, now: T - 200_000 });
     // Non-claim lease (consolidation) -- must not appear in active task claims
-    tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: T });
+    await tryAcquireLease(t, 'consolidation', 'daniel', { ttlSeconds: 30, now: T });
     const active = listActiveTaskClaims(t, { now: T + 1000 });
     const ids = active.map(a => a.task_id).sort();
     assert.deepStrictEqual(ids, ['T004']);
@@ -579,13 +594,13 @@ suite('task-claim wrappers', () => {
 });
 
 suite('defaults match spec-collab config contract', () => {
-  test('DEFAULT_CLAIM_TTL_SECONDS = 120 (matches R006 AC)', () => {
+  test('DEFAULT_CLAIM_TTL_SECONDS = 120 (matches R006 AC)', async () => {
     assert.strictEqual(DEFAULT_CLAIM_TTL_SECONDS, 120);
   });
-  test('DEFAULT_HEARTBEAT_SECONDS = 30 (matches R006 AC)', () => {
+  test('DEFAULT_HEARTBEAT_SECONDS = 30 (matches R006 AC)', async () => {
     assert.strictEqual(DEFAULT_HEARTBEAT_SECONDS, 30);
   });
-  test('DEFAULT_CONSOLIDATION_TTL_SECONDS <= 30 (matches R016 AC)', () => {
+  test('DEFAULT_CONSOLIDATION_TTL_SECONDS <= 30 (matches R016 AC)', async () => {
     assert.ok(DEFAULT_CONSOLIDATION_TTL_SECONDS <= 30);
   });
 });
@@ -595,26 +610,26 @@ suite('defaults match spec-collab config contract', () => {
 // =====================================================================
 
 suite('selectTransportMode (R013)', () => {
-  test('ABLY_KEY present -> ably', () => {
+  test('ABLY_KEY present -> ably', async () => {
     assert.strictEqual(selectTransportMode({ env: { ABLY_KEY: 'xxx' } }), 'ably');
   });
 
-  test('no ABLY_KEY + polling opt-in -> polling', () => {
+  test('no ABLY_KEY + polling opt-in -> polling', async () => {
     assert.strictEqual(selectTransportMode({ env: {}, polling: true }), 'polling');
   });
 
-  test('no ABLY_KEY + no polling opt-in -> setup-required', () => {
+  test('no ABLY_KEY + no polling opt-in -> setup-required', async () => {
     assert.strictEqual(selectTransportMode({ env: {} }), 'setup-required');
   });
 
-  test('explicit opts.mode overrides env detection', () => {
+  test('explicit opts.mode overrides env detection', async () => {
     assert.strictEqual(selectTransportMode({ env: { ABLY_KEY: 'x' }, mode: 'polling' }), 'polling');
     assert.strictEqual(selectTransportMode({ env: {}, mode: 'memory' }), 'memory');
   });
 });
 
 suite('renderSetupGuide (R013)', () => {
-  test('includes Ably signup url and ABLY_KEY hint', () => {
+  test('includes Ably signup url and ABLY_KEY hint', async () => {
     const g = renderSetupGuide();
     assert.match(g, /ably\.com/);
     assert.match(g, /ABLY_KEY/);
@@ -624,20 +639,20 @@ suite('renderSetupGuide (R013)', () => {
 });
 
 suite('createTransport dispatcher (R013)', () => {
-  test('no ABLY_KEY without polling -> returns setup-required object with guide', () => {
+  test('no ABLY_KEY without polling -> returns setup-required object with guide', async () => {
     const t = createTransport({ env: {} });
     assert.strictEqual(t.mode, 'setup-required');
     assert.match(t.guide, /ABLY_KEY/);
   });
 
-  test('memory mode returns a working lease store', () => {
+  test('memory mode returns a working lease store', async () => {
     const t = createTransport({ mode: 'memory' });
     assert.strictEqual(t.mode, 'memory');
     assert.strictEqual(typeof t.read, 'function');
     assert.strictEqual(typeof t.cas, 'function');
   });
 
-  test('polling mode returns a polling transport', () => {
+  test('polling mode returns a polling transport', async () => {
     const t = createTransport({ mode: 'polling', ioAdapter: _stubIo() });
     assert.strictEqual(t.mode, 'polling');
   });
@@ -660,7 +675,10 @@ suite('polling transport (R013, R015)', () => {
     await tA.disconnect(); await tB.disconnect();
   });
 
-  test('sendTargeted addresses a specific handle via target field (R015)', async () => {
+  test('sendTargeted addresses a specific handle via target field (R015, R004)', async () => {
+    // R004: transport-layer target filter. Subscriber callbacks get no
+    // application-layer `if (m.data.target === handle)` guard — the
+    // transport drops non-matching messages before invoking cb.
     const io = _stubIo();
     const tA = createPollingTransport({ ioAdapter: io, clientId: 'alice', intervalMs: 60_000 });
     const tDaniel = createPollingTransport({ ioAdapter: io, clientId: 'daniel', intervalMs: 60_000 });
@@ -668,13 +686,14 @@ suite('polling transport (R013, R015)', () => {
     await tA.connect(); await tDaniel.connect(); await tLucas.connect();
     const danMsgs = [];
     const lucMsgs = [];
-    tDaniel.subscribe('flag-ping', m => { if (m.data.target === 'daniel') danMsgs.push(m); });
-    tLucas.subscribe('flag-ping',  m => { if (m.data.target === 'lucas')  lucMsgs.push(m); });
+    tDaniel.subscribe('flag-ping', m => danMsgs.push(m));
+    tLucas.subscribe('flag-ping',  m => lucMsgs.push(m));
     await tA.sendTargeted('daniel', 'flag-ping', { flag: 'F001' });
     await tDaniel._internal._refresh();
     await tLucas._internal._refresh();
     assert.strictEqual(danMsgs.length, 1);
-    assert.strictEqual(lucMsgs.length, 0, 'non-target must receive zero messages per R015 AC');
+    assert.strictEqual(danMsgs[0].data.target, 'daniel');
+    assert.strictEqual(lucMsgs.length, 0, 'non-target must receive zero messages per R015 + R004 AC');
     await tA.disconnect(); await tDaniel.disconnect(); await tLucas.disconnect();
   });
 
@@ -892,7 +911,7 @@ suite('readAllInputs (R003)', () => {
 });
 
 suite('consolidateInputs (R003)', () => {
-  test('overlapping ideas merge into multi-contributor topic', () => {
+  test('overlapping ideas merge into multi-contributor topic', async () => {
     const inputs = [
       { handle: 'daniel', body: 'redis cache invalidation is tricky' },
       { handle: 'lucas',  body: 'cache invalidation strategy matters' },
@@ -903,11 +922,11 @@ suite('consolidateInputs (R003)', () => {
     assert.match(md, /contributors:.*sarah/);
   });
 
-  test('empty inputs -> empty string', () => {
+  test('empty inputs -> empty string', async () => {
     assert.strictEqual(consolidateInputs([]), '');
   });
 
-  test('injected consolidator overrides default', () => {
+  test('injected consolidator overrides default', async () => {
     assert.strictEqual(
       consolidateInputs([{ handle: 'd', body: 'x' }], { consolidator: () => 'custom' }),
       'custom'
@@ -916,7 +935,7 @@ suite('consolidateInputs (R003)', () => {
 });
 
 suite('categorizeInputs (R004, R014, R016)', () => {
-  test('three topics produce at least three categories', () => {
+  test('three topics produce at least three categories', async () => {
     const inputs = [
       { handle: 'daniel', body: 'redis cache' },
       { handle: 'lucas',  body: 'stripe payments' },
@@ -927,7 +946,7 @@ suite('categorizeInputs (R004, R014, R016)', () => {
     assert.ok(cats.length >= 3, 'expected >=3 categories, got ' + cats.length);
   });
 
-  test('each category has required fields including type in {coding, research}', () => {
+  test('each category has required fields including type in {coding, research}', async () => {
     const inputs = [{ handle: 'daniel', body: 'explore the mongo query planner' }];
     const md = consolidateInputs(inputs);
     const cats = categorizeInputs(md, inputs);
@@ -940,14 +959,14 @@ suite('categorizeInputs (R004, R014, R016)', () => {
     }
   });
 
-  test('classifier picks research for explore/investigate topics (R014)', () => {
+  test('classifier picks research for explore/investigate topics (R014)', async () => {
     const inputs = [{ handle: 'd', body: 'we should research cache eviction policies' }];
     const md = consolidateInputs(inputs);
     const cats = categorizeInputs(md, inputs);
     assert.ok(cats.some(c => c.type === 'research'));
   });
 
-  test('contradictions surface as is_decision: true (R005/R016)', () => {
+  test('contradictions surface as is_decision: true (R005/R016)', async () => {
     const inputs = [
       { handle: 'daniel', body: 'use redis for pub sub' },
       { handle: 'lucas',  body: 'use nats for pub sub' }
@@ -960,7 +979,7 @@ suite('categorizeInputs (R004, R014, R016)', () => {
     assert.ok(decisions[0].source_contributors.includes('lucas'));
   });
 
-  test('injected classifier + detector override defaults', () => {
+  test('injected classifier + detector override defaults', async () => {
     const inputs = [{ handle: 'd', body: 'hi' }];
     const md = consolidateInputs(inputs);
     const cats = categorizeInputs(md, inputs, {
@@ -994,7 +1013,7 @@ suite('writeConsolidatedUnderLease (R016)', () => {
     const { projectDir } = makeTempForgeDir();
     const collabDir = path.join(projectDir, '.forge', 'collab');
     const t = createMemoryTransport();
-    tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1000 });
+    await tryAcquireLease(t, 'consolidation', 'lucas', { ttlSeconds: 30, now: 1000 });
     const r = await writeConsolidatedUnderLease(t, collabDir, 'daniel', [{ handle: 'd', body: 'x' }], { ttlSeconds: 30, now: 1001 });
     assert.strictEqual(r.held, false);
     assert.match(r.reason, /held_by_lucas/);
@@ -1019,7 +1038,7 @@ suite('routeClarifyingQuestion (R015)', () => {
       text: 'which cache eviction policy should we use?',
       topic: 'cache',
       source_section: 'Topic 1'
-    });
+    }, { fallback_jaccard: true });
     assert.ok(fs.existsSync(r.path));
     assert.strictEqual(r.routed_to, 'daniel');
     const raw = fs.readFileSync(r.path, 'utf8');
@@ -1192,7 +1211,7 @@ suite('persistResearchResult (R014)', () => {
     assert.deepStrictEqual(ops, ['add', 'commit', 'push']);
   });
 
-  test('push=false writes file without any git invocations', () => {
+  test('push=false writes file without any git invocations', async () => {
     const { projectDir } = makeTempForgeDir();
     const collabDir = path.join(projectDir, '.forge', 'collab');
     const runner = createRecordingGitRunner();
@@ -1206,7 +1225,7 @@ suite('persistResearchResult (R014)', () => {
     assert.strictEqual(runner.calls.length, 0);
   });
 
-  test('commit failure -> returns committed:false with error', () => {
+  test('commit failure -> returns committed:false with error', async () => {
     const { projectDir } = makeTempForgeDir();
     const collabDir = path.join(projectDir, '.forge', 'collab');
     const runner = createRecordingGitRunner({ throwOn: (args) => args[0] === 'commit' });
@@ -1218,7 +1237,7 @@ suite('persistResearchResult (R014)', () => {
     assert.ok(r.error);
   });
 
-  test('push failure after commit -> committed:true, pushed:false', () => {
+  test('push failure after commit -> committed:true, pushed:false', async () => {
     const { projectDir } = makeTempForgeDir();
     const collabDir = path.join(projectDir, '.forge', 'collab');
     const runner = createRecordingGitRunner({ throwOn: (args) => args[0] === 'push' });
@@ -1233,7 +1252,7 @@ suite('persistResearchResult (R014)', () => {
 });
 
 suite('appendResearchSection (R014 streaming)', () => {
-  test('creates file on first append + commits and pushes each section', () => {
+  test('creates file on first append + commits and pushes each section', async () => {
     const { projectDir } = makeTempForgeDir();
     const collabDir = path.join(projectDir, '.forge', 'collab');
     const runner = createRecordingGitRunner();
@@ -1261,7 +1280,7 @@ suite('appendResearchSection (R014 streaming)', () => {
 });
 
 suite('mixed coding + research in a categorization', () => {
-  test('only research tasks hit the research pipeline; coding stays unchanged', () => {
+  test('only research tasks hit the research pipeline; coding stays unchanged', async () => {
     const tasks = [
       { id: 'C001', type: 'coding',   title: 'implement something' },
       { id: 'C002', type: 'research', title: 'investigate library options' },
@@ -1377,7 +1396,8 @@ suite('writeForwardMotionFlag -- targeted notification (R015)', () => {
       rationale: 'cache invalidation strategy',
       source_contributors: ['daniel'],
       participants,
-      transport
+      transport,
+      fallback_jaccard: true // legacy test; R007 flipped Jaccard to opt-in
     });
     assert.strictEqual(r.written, true);
     assert.strictEqual(r.notified.mode, 'targeted');
@@ -1457,7 +1477,7 @@ suite('overrideFlag (R009)', () => {
     assert.match(fs.readFileSync(loaded.path, 'utf8'), /Previous decision: "redis"/);
   });
 
-  test('missing flag returns overridden:false with reason', () => {
+  test('missing flag returns overridden:false with reason', async () => {
     const { projectDir } = makeTempForgeDir();
     const collabDir = path.join(projectDir, '.forge', 'collab');
     const r = overrideFlag(collabDir, 'Fmissing', 'x');
@@ -1599,10 +1619,10 @@ suite('squashMergeAndPush -- race retry (R010)', () => {
 });
 
 suite('squashMergeAndPush -- defaults', () => {
-  test('DEFAULT_MERGE_RETRIES is 3 per R010 AC', () => {
+  test('DEFAULT_MERGE_RETRIES is 3 per R010 AC', async () => {
     assert.strictEqual(DEFAULT_MERGE_RETRIES, 3);
   });
-  test('DEFAULT_MERGE_BACKOFF_MS is positive (linear)', () => {
+  test('DEFAULT_MERGE_BACKOFF_MS is positive (linear)', async () => {
     assert.ok(DEFAULT_MERGE_BACKOFF_MS > 0);
   });
 });
@@ -1612,25 +1632,25 @@ suite('squashMergeAndPush -- defaults', () => {
 // =====================================================================
 
 suite('readAutoPushConfig (R011)', () => {
-  test('defaults to true when config missing', () => {
+  test('defaults to true when config missing', async () => {
     const { forgeDir } = makeTempForgeDir();
     fs.rmSync(path.join(forgeDir, 'config.json'), { force: true });
     assert.strictEqual(readAutoPushConfig(forgeDir), true);
   });
 
-  test('returns explicit true / false from top-level auto_push', () => {
+  test('returns explicit true / false from top-level auto_push', async () => {
     const a = makeTempForgeDir({ config: { auto_push: false } });
     assert.strictEqual(readAutoPushConfig(a.forgeDir), false);
     const b = makeTempForgeDir({ config: { auto_push: true } });
     assert.strictEqual(readAutoPushConfig(b.forgeDir), true);
   });
 
-  test('supports collab.auto_push namespace', () => {
+  test('supports collab.auto_push namespace', async () => {
     const { forgeDir } = makeTempForgeDir({ config: { collab: { auto_push: false } } });
     assert.strictEqual(readAutoPushConfig(forgeDir), false);
   });
 
-  test('malformed config defaults to true (safe)', () => {
+  test('malformed config defaults to true (safe)', async () => {
     const { forgeDir } = makeTempForgeDir();
     fs.writeFileSync(path.join(forgeDir, 'config.json'), '{not json');
     assert.strictEqual(readAutoPushConfig(forgeDir), true);
@@ -1688,24 +1708,24 @@ suite('gatedPush (R011)', () => {
 });
 
 suite('filterClaimableForLateJoin (R012)', () => {
-  test('skips already-claimed tasks', () => {
+  test('skips already-claimed tasks', async () => {
     const t = createMemoryTransport();
-    claimTask(t, 'T004', 'daniel', { ttlSeconds: 120, now: 1_000_000 });
-    claimTask(t, 'T005', 'lucas',  { ttlSeconds: 120, now: 1_000_000 });
+    await claimTask(t, 'T004', 'daniel', { ttlSeconds: 120, now: 1_000_000 });
+    await claimTask(t, 'T005', 'lucas',  { ttlSeconds: 120, now: 1_000_000 });
     const claimable = filterClaimableForLateJoin(t, ['T004', 'T005', 'T006', 'T007'], { now: 1_000_000 + 1000 });
     assert.deepStrictEqual(claimable.sort(), ['T006', 'T007']);
   });
 
-  test('stale claims DO become claimable', () => {
+  test('stale claims DO become claimable', async () => {
     const t = createMemoryTransport();
-    claimTask(t, 'T004', 'daniel', { ttlSeconds: 10, now: 1_000_000 });
+    await claimTask(t, 'T004', 'daniel', { ttlSeconds: 10, now: 1_000_000 });
     const claimable = filterClaimableForLateJoin(t, ['T004'], { now: 1_000_000 + 60_000 });
     assert.deepStrictEqual(claimable, ['T004']);
   });
 
-  test('empty unblocked list -> empty claimable', () => {
+  test('empty unblocked list -> empty claimable', async () => {
     const t = createMemoryTransport();
-    claimTask(t, 'T004', 'daniel', { ttlSeconds: 120, now: 1_000_000 });
+    await claimTask(t, 'T004', 'daniel', { ttlSeconds: 120, now: 1_000_000 });
     assert.deepStrictEqual(filterClaimableForLateJoin(t, [], { now: 1_000_000 + 1000 }), []);
   });
 });
@@ -1715,7 +1735,7 @@ suite('lateJoinBootstrap (R012)', () => {
     const runner = createRecordingGitRunner();
     const t = createMemoryTransport();
     // connect() is absent on memory transport; should not fail.
-    claimTask(t, 'T004', 'daniel', { ttlSeconds: 120, now: 1_000_000 });
+    await claimTask(t, 'T004', 'daniel', { ttlSeconds: 120, now: 1_000_000 });
     const r = await lateJoinBootstrap({
       transport: t,
       unblockedTaskIds: ['T004', 'T005', 'T006'],

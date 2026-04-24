@@ -1,12 +1,23 @@
 ---
 description: "Opt-in multiplayer mode -- brain-dump together, claim tasks across machines, flag decisions async"
-argument-hint: "[start|join|brainstorm|status|claim|flags|override|leave] [args]"
+argument-hint: "[start|join|brainstorm|status|claim|flags|override|leave|recover] [args]"
 allowed-tools: ["Bash(${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node -e *)", "Bash(git:*)", "Bash(gh:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Agent(*)"]
 ---
 
 # Forge Collaborate
 
 Activates hackathon-native multiplayer mode: N users on different machines brain-dump ideas, AI consolidates into categorized tasks, tasks dispatch across machines via a distributed claim queue, each agent squash-merges its own completed task. Forward-motion during execute: AI picks + flags decisions, humans override async.
+
+## Prerequisites
+
+Two transport modes are supported. Pick one BEFORE running `/forge:collaborate start`:
+
+- **Realtime (Ably)** — sub-second cross-machine latency via WebSockets. Requires:
+  1. The `ably` npm package installed: `npm install ably` in your project (or globally). It's declared an OPTIONAL peerDependency in the plugin's `package.json`, so `/forge:collaborate start` hard-fails with "forge:collab realtime mode requires the `ably` peer dependency" until you install it.
+  2. An Ably API key in your environment: `export ABLY_KEY="<your-key>"`. Free tier at https://ably.com/sign-up covers typical hackathon teams (6M messages/month, 200 peak connections).
+- **Polling (zero-setup)** — coordination via a dedicated `forge/collab-state` git branch, ~2.5s latency. No extra dependencies, no API keys. Pass `--polling` to `/forge:collaborate start` to opt into this path even when `ABLY_KEY` is in env.
+
+If neither is configured and `--polling` is not passed, `start` prints a setup guide and exits.
 
 ## Subcommands
 
@@ -20,6 +31,7 @@ Activates hackathon-native multiplayer mode: N users on different machines brain
 | `/forge:collaborate flags` | List all forward-motion flags with status |
 | `/forge:collaborate override <flagId> <new-decision>` | Override an AI decision, mark flag overridden |
 | `/forge:collaborate leave` | Release claims and disconnect |
+| `/forge:collaborate recover` | Diagnose and repair a stale collab session (crash between start/leave steps) |
 
 ## Step 1: Pre-flight
 
@@ -32,6 +44,29 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh" .
 Verify a git `origin` remote exists. If not, tell the user to set one and stop:
 
 > `/forge:collaborate` needs a git `origin` remote to derive the session ID. Run `git remote add origin <url>` first.
+
+**Gitignore migration check (R001).** Before any `start` subcommand writes
+participant state, detect whether this checkout predates the collab
+carve-out rules. If so, prompt the user to patch them; silently ignoring
+this step would cause every brainstorm dump and flag write to be swallowed
+by the legacy `.forge/` rule.
+
+```bash
+node -e "const c=require('${CLAUDE_PLUGIN_ROOT}/scripts/forge-collab.cjs');const r=c.detectLegacyGitignore({cwd:process.cwd()});console.log(JSON.stringify(r));"
+```
+
+If `needsPatching` is `true` on a `start` subcommand, surface the detection
+`reason` to the user and offer to run:
+
+```bash
+node -e "const c=require('${CLAUDE_PLUGIN_ROOT}/scripts/forge-collab.cjs');console.log(JSON.stringify(c.patchGitignore({cwd:process.cwd()})));"
+```
+
+On confirmation, run the patch. On decline, stop with a clear message:
+collab cannot proceed until `.gitignore` allows `.forge/collab/` through.
+For non-`start` subcommands (status, claim, flags, ...) the check may be
+informational only -- those paths do not depend on git-tracked artifacts
+being propagated.
 
 ## Step 2: Parse subcommand
 
@@ -58,5 +93,18 @@ After the skill returns, present a concise summary of what changed:
 - For `flags`: table of flag id, task, decision, status.
 - For `override`: confirmation + previous decision + re-run of dependent tasks.
 - For `leave`: claims released.
+- For `recover`: classification + remedy applied (or "no recovery needed").
 
 If the skill reports an error (e.g., lease held by another agent), surface it clearly and suggest what to do next.
+
+## Recovery invariants (R008)
+
+`/forge:collaborate start` writes `participant.json` first, then
+`.forge/collab/.enabled` as the final atomic action. `/forge:collaborate
+leave` deletes `.enabled` first, releases claims, disconnects, then
+deletes `participant.json` last. Those orderings guarantee that any
+crash leaves the system in a state that `/forge:collaborate recover` can
+detect and repair. If you ever find `participant.json` without
+`.enabled`, that is `stale_participant` (reset); `.enabled` without
+`participant.json` is `stale_enabled` (repair). Never mutate
+`.forge/collab/` by hand — go through the skill.

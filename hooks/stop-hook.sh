@@ -198,15 +198,67 @@ if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
   " 2>/dev/null || echo "")
 
   if echo "$LAST_OUTPUT" | grep -qF "<promise>${COMPLETION_PROMISE}</promise>"; then
-    # Fix #9: Generate summary on completion before exiting
-    node "$TOOLS_CJS" summary --forge-dir "$FORGE_DIR" 2>>"$DEBUG_LOG" || true
-    # T013: release the loop lock on completion.
+    # === T017 / R009: completion promise is gated on all four gates ===
+    # A bare FORGE_COMPLETE emission from the agent is not authoritative.
+    # Run checkCompletionGates and, if any gate has regressed, rewrite the
+    # emission as FORGE_BLOCKED with the reasons JSON inline and persist
+    # `blocked_reason` into state.md frontmatter so the TUI + review-branch
+    # surface it. Only honor FORGE_COMPLETE when every gate passes.
+    GATES_JSON=$(node "$TOOLS_CJS" completion-check --forge-dir "$FORGE_DIR" 2>>"$DEBUG_LOG") || GATES_EXIT=$?
+    GATES_EXIT=${GATES_EXIT:-0}
+    GATES_COMPLETE=$(printf '%s' "$GATES_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const o=JSON.parse(d);console.log(o.complete===true?'1':'0')}catch(e){console.log('0')}})" 2>/dev/null || echo "0")
+
+    if [ "$GATES_COMPLETE" = "1" ]; then
+      # All gates green -- honor the FORGE_COMPLETE emission.
+      node "$TOOLS_CJS" summary --forge-dir "$FORGE_DIR" 2>>"$DEBUG_LOG" || true
+      # T013: release the loop lock on completion.
+      node -e "
+        try { require('${TOOLS_CJS}'.replace(/\\\\/g,'/')).releaseLock('${FORGE_DIR}'); }
+        catch (e) {}
+      " 2>>"$DEBUG_LOG" || true
+      rm -f "$LOOP_FILE"
+      exit 0
+    fi
+
+    # One or more gates failed. The agent emitted FORGE_COMPLETE but the
+    # structural check disagrees. Persist the reasons so the human (and
+    # downstream tooling) can see why the loop did not finish, then fall
+    # through into the normal routing path so the loop continues driving
+    # work rather than silently terminating.
+    echo "forge: FORGE_COMPLETE emitted by agent but gates failed; rewriting as FORGE_BLOCKED" >&2
+    echo "[$(date -Iseconds)] completion gates failed: ${GATES_JSON}" >> "$DEBUG_LOG"
+
+    # Emit the blocked promise + inline reasons so the next prompt (and
+    # any log consumers tailing this hook) sees the discriminated form.
+    node "$TOOLS_CJS" completion-emit --forge-dir "$FORGE_DIR" 2>>"$DEBUG_LOG" || true
+
+    # Write `blocked_reason` into state.md frontmatter. A compact JSON
+    # summary of the first few failing reasons goes in; the full list is
+    # available by re-running `completion-check`.
     node -e "
-      try { require('${TOOLS_CJS}'.replace(/\\\\/g,'/')).releaseLock('${FORGE_DIR}'); }
-      catch (e) {}
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const tools = require('${TOOLS_CJS}'.replace(/\\\\/g, '/'));
+        const forgeDir = '${FORGE_DIR}';
+        const gates = tools.checkCompletionGates(forgeDir, {});
+        const top = (gates.reasons || []).slice(0, 5).map(r => {
+          const ac = r.ac ? ' ac=' + r.ac : '';
+          const task = r.task ? ' task=' + r.task : '';
+          const flag = r.flag ? ' flag=' + r.flag : '';
+          return r.gate + ':' + (r.detail || '(no detail)') + ac + task + flag;
+        });
+        const summary = 'completion_gates_failed: ' + top.join('; ');
+        const st = tools.readState(forgeDir);
+        st.data.blocked_reason = summary;
+        tools.writeState(forgeDir, st.data, st.content);
+      } catch (e) {
+        try { require('fs').appendFileSync('${DEBUG_LOG}', '[' + new Date().toISOString() + '] blocked_reason write failed: ' + (e && e.message || e) + '\n'); } catch (_) {}
+      }
     " 2>>"$DEBUG_LOG" || true
-    rm -f "$LOOP_FILE"
-    exit 0
+
+    # Fall through to route -- the loop continues so outstanding gates
+    # (missing visuals, open flags, blocked tasks) can be resolved.
   fi
 fi
 
@@ -316,6 +368,66 @@ echo "$LOOP_DATA" | node -e "
   d.last_updated=new Date().toISOString();
   console.log(JSON.stringify(d,null,2));
 " > "$LOOP_FILE" 2>/dev/null
+
+# === T008/R014: transcript capture ===
+# Every iteration records a single JSONL entry describing the route decision
+# and task snapshot. appendTranscript handles phase-boundary lines
+# automatically; we pass in phase/agent/task_id/status so /forge:review-branch
+# can later cross-check agent activity against commits. Errors go to the
+# debug log and never break the loop.
+node -e "
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const tools = require('${TOOLS_CJS}'.replace(/\\\\/g, '/'));
+    const forgeDir = '${FORGE_DIR}';
+
+    // Derive a cycle id. Priority:
+    //   1. state.md frontmatter key 'current_cycle' (caveman module already sets this)
+    //   2. loop started_at timestamp compacted (YYYYMMDDTHHMM)
+    //   3. today's date YYYY-MM-DD
+    let cycleId = '';
+    try {
+      const st = tools.readState(forgeDir);
+      if (st && st.data && st.data.current_cycle) cycleId = String(st.data.current_cycle);
+    } catch (_) {}
+    if (!cycleId) {
+      try {
+        const loop = JSON.parse(fs.readFileSync(path.join(forgeDir, '.forge-loop.json'), 'utf8'));
+        if (loop && loop.started_at) {
+          cycleId = String(loop.started_at).replace(/[:\-]/g, '').replace(/\.\d+Z?$/, '').slice(0, 13);
+        }
+      } catch (_) {}
+    }
+    if (!cycleId) cycleId = new Date().toISOString().slice(0, 10);
+
+    // Pull current phase + active task from state.md (already read above as
+    // CURRENT_PHASE, but we re-read in-process to keep this one node call
+    // self-contained).
+    let phase = 'unknown';
+    let taskId = '';
+    try {
+      const st = tools.readState(forgeDir);
+      if (st && st.data) {
+        if (st.data.phase) phase = String(st.data.phase);
+        if (st.data.current_task) taskId = String(st.data.current_task);
+      }
+    } catch (_) {}
+
+    tools.appendTranscript(forgeDir, cycleId, {
+      phase,
+      agent: 'stop-hook',
+      task_id: taskId,
+      tool_calls_count: 0,
+      duration_ms: 0,
+      status: 'iteration_${NEXT_ITERATION}',
+      summary: 'route decision recorded'
+    });
+  } catch (e) {
+    // Best-effort; log to debug and move on.
+    try { require('fs').appendFileSync('${DEBUG_LOG}', '[' + new Date().toISOString() + '] transcript append failed: ' + (e && e.message || e) + '\n'); } catch (_) {}
+  }
+" 2>>"$DEBUG_LOG" || true
 
 # === Status block injection (R-status, in-session dashboard) ===
 # Calls scripts/forge-status-block.cjs which reads .forge/ and emits a

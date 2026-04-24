@@ -7,12 +7,142 @@ const { execFileSync, execSync } = require('child_process');
 
 // === YAML Frontmatter Parser (minimal, no dependencies) ===
 
+// Parse the leading YAML frontmatter from a text blob. If multiple frontmatter
+// blocks are stacked at the top of the file (an artifact of older writeState
+// behavior pre forge-self-fixes R007), recursively merge all of them with
+// LATER values winning, and return `content` as everything after the last
+// frontmatter block. This lets setup-state be idempotent: any pre-existing
+// stacked blocks collapse into a single canonical frontmatter on the next
+// write, and writeState never prepends a duplicate block.
+// _verifyStructuralAcs (forge-self-fixes R006)
+//
+// Walks a spec line by line, pulls out every `- [ ]` AC line, tries to
+// parse it into one of three structural-claim shapes, and asserts each
+// claim against the provided HTML body. Returns { pass, fail, skipped,
+// failures, results } where `results` preserves per-AC outcomes and
+// `failures` is just the subset with status === 'fail'.
+function _verifyStructuralAcs(specText, html) {
+  const bodyText = html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+
+  const lines = specText.split(/\r?\n/);
+  const results = [];
+  const failures = [];
+  let pass = 0, fail = 0, skipped = 0;
+
+  // Regexes keyed by INTENT, not phrase structure. We first detect the
+  // verb ("exists", "contains", "N elements ... match") then pull parameters.
+  // This tolerates markdown noise between the attribute and the verb
+  // (backticks, italics, parenthetical asides).
+  const TESTID_ATTR = /data-testid\s*=\s*["']([^"']+)["']/i;
+  const QUOTED_STR = /["']([^"']+)["']/;
+  const COUNT_PREFIX = /(?:exactly\s+)?(\d+)\s+elements?\s+(?:match|with|tagged|carrying)\b/i;
+  const EXISTS_VERB = /\b(exists?|present|renders?|in\s+the\s+DOM|is\s+(?:an?\s+)?(?:element|descendant))\b/i;
+  const CONTAINS_VERB = /\b(contains?|includes?)\b/i;
+  const TEXT_SUBJECT = /\b(textContent|text\s+content|page\s+(?:text|content)|body\s+(?:text|content)|copy|prose|page|renders\s+text)\b/i;
+  const LITERAL_CUE = /\bliteral\s+(?:substring|string|text)\b/i;
+
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const trimmed = raw.trim();
+    if (/^```/.test(trimmed)) { inFence = !inFence; continue; }
+    if (inFence) continue;
+    if (!/^- \[[ xX]\]/.test(trimmed)) continue;
+
+    const acText = trimmed.replace(/^- \[[ xX]\]\s*/, '');
+
+    // Priority order matters. Count assertions include "elements match" which
+    // also triggers EXISTS_VERB, so count comes first.
+    const countMatch = acText.match(COUNT_PREFIX);
+    const testidMatch = acText.match(TESTID_ATTR);
+
+    if (countMatch && testidMatch) {
+      const want = parseInt(countMatch[1], 10);
+      const testid = testidMatch[1];
+      const re = new RegExp(`data-testid\\s*=\\s*["']${_reEscape(testid)}["']`, 'g');
+      const got = (html.match(re) || []).length;
+      if (got === want) { results.push({ line: i + 1, status: 'pass', ac: acText, rule: 'testid-count', target: testid, want, got }); pass++; }
+      else {
+        const rec = { line: i + 1, status: 'fail', ac: acText, rule: 'testid-count', target: testid, want, got, reason: `expected ${want} elements with data-testid="${testid}", found ${got}` };
+        results.push(rec); failures.push(rec); fail++;
+      }
+      continue;
+    }
+
+    if (testidMatch && EXISTS_VERB.test(acText) && !CONTAINS_VERB.test(acText)) {
+      const testid = testidMatch[1];
+      const has = html.includes(`data-testid="${testid}"`) || html.includes(`data-testid='${testid}'`);
+      if (has) { results.push({ line: i + 1, status: 'pass', ac: acText, rule: 'testid-exists', target: testid }); pass++; }
+      else {
+        const rec = { line: i + 1, status: 'fail', ac: acText, rule: 'testid-exists', target: testid, reason: `data-testid="${testid}" not found in artifact` };
+        results.push(rec); failures.push(rec); fail++;
+      }
+      continue;
+    }
+
+    // Text-contains: (a) mentions a text-subject keyword, OR (b) uses the
+    // "literal substring" cue — either way we pull the first quoted string.
+    if ((TEXT_SUBJECT.test(acText) || LITERAL_CUE.test(acText)) && CONTAINS_VERB.test(acText)) {
+      const qm = acText.match(QUOTED_STR);
+      if (qm) {
+        const needle = qm[1];
+        const has = bodyText.includes(needle);
+        if (has) { results.push({ line: i + 1, status: 'pass', ac: acText, rule: 'text-contains', target: needle }); pass++; }
+        else {
+          const rec = { line: i + 1, status: 'fail', ac: acText, rule: 'text-contains', target: needle, reason: `text "${needle}" not found in rendered body` };
+          results.push(rec); failures.push(rec); fail++;
+        }
+        continue;
+      }
+    }
+
+    // Non-parseable → skipped with reason.
+    results.push({ line: i + 1, status: 'skipped', ac: acText, reason: 'AC shape not recognised by minimal parser; needs headless DOM or Playwright' });
+    skipped++;
+  }
+
+  return { pass, fail, skipped, failures, results };
+}
+
+function _reEscape(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function parseFrontmatter(text) {
   const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!match) return { data: {}, content: text };
 
+  const data = _parseYamlLines(match[1]);
+  let remainder = match[2];
+
+  // Strip leading blank lines and recursively consume any additional stacked
+  // frontmatter blocks. Later values shadow earlier ones (representing the
+  // most recent write).
+  while (true) {
+    const lstripped = remainder.replace(/^\s*\n+/, '');
+    if (!lstripped.startsWith('---\n')) break;
+    const next = lstripped.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+    if (!next) break;
+    const moreData = _parseYamlLines(next[1]);
+    Object.assign(data, moreData);
+    remainder = next[2];
+  }
+
+  return { data, content: remainder };
+}
+
+function _parseYamlLines(block) {
   const data = {};
-  for (const line of match[1].split('\n')) {
+  for (const line of block.split('\n')) {
     const sep = line.indexOf(':');
     if (sep === -1) continue;
     const key = line.slice(0, sep).trim();
@@ -29,7 +159,7 @@ function parseFrontmatter(text) {
     else if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
     data[key] = val;
   }
-  return { data, content: match[2] };
+  return data;
 }
 
 function serializeFrontmatter(data, content) {
@@ -124,6 +254,15 @@ const DEFAULT_CONFIG = {
       debug_attempts_before_rescue: 2,
       model: null
     }
+  },
+  // T029 / R006: per-AC streaming DAG. Default on. Downstream tasks dispatch
+  // provisionally the moment an upstream AC they declared as a dependency is
+  // met, with rollback on regression and bounded speculation. Set to false
+  // only if you need strict tier-by-tier serial execution (rare).
+  streaming_dag: {
+    enabled: true,
+    max_provisional: 3,
+    max_failures_before_fallback: 2
   }
 };
 
@@ -770,6 +909,196 @@ function _cavemanCheckpointFields(cp) {
   return cp;
 }
 
+// === Caveman Whitelist Enforcement (R015) ===
+//
+// `formatCavemanValue` itself operates on strings, not paths, so path policy
+// must be enforced at the writers that fan out to disk. The whitelist
+// corresponds to the scope declared in skills/caveman-internal/SKILL.md:
+// state.md bodies, progress checkpoints, artifact summaries, context bundles,
+// and review-report summaries under .forge/summaries/. Anything else throws.
+//
+// Hard-blocked paths also short-circuit the allow list: source files,
+// commits, YAML config, `.git/` internals, and user-facing spec/doc trees.
+
+const CAVEMAN_HARD_BLOCKED_EXTS = new Set([
+  '.js', '.cjs', '.mjs', '.ts', '.tsx', '.jsx',
+  '.py', '.rb', '.go', '.rs', '.java', '.kt', '.swift',
+  '.c', '.cc', '.cpp', '.h', '.hpp',
+  '.sh', '.bash', '.ps1',
+  '.yml', '.yaml', '.toml', '.ini',
+  '.html', '.css', '.scss', '.sql'
+]);
+
+const CAVEMAN_HARD_BLOCKED_PREFIXES = [
+  '.git/',
+  '.forge/specs/',
+  'docs/superpowers/',
+  'docs/audit/',
+  'docs/',
+  'specs/',
+  'skills/',
+  'commands/',
+  'agents/',
+  'hooks/',
+  'scripts/',
+  'tests/',
+  'templates/',
+  'references/'
+];
+
+function _normalizeRelPath(relPath) {
+  if (typeof relPath !== 'string' || relPath.length === 0) return '';
+  // Strip drive letters and leading separators, normalise to forward slashes.
+  let p = relPath.replace(/\\/g, '/');
+  p = p.replace(/^[a-zA-Z]:\//, '');
+  while (p.startsWith('/')) p = p.slice(1);
+  return p;
+}
+
+// Returns true when relPath falls inside the caveman whitelist. The whitelist
+// corresponds to the declared scope in skills/caveman-internal/SKILL.md.
+//
+// Whitelist:
+//   .forge/state.md
+//   .forge/progress/<task>.json        (handoff checkpoints)
+//   .forge/artifacts/<task>.json       (handoff summaries)
+//   .forge/context-bundles/<task>.md   (handoff notes)
+//   .forge/summaries/**                (review + status summaries)
+//   .forge/history/cycles/**/summary*  (review report summaries)
+//   .forge/resume.md                   (budget-exhausted handoff)
+//   .forge/context-summary.md          (compress-context summary)
+function isCavemanAllowedPath(relPath) {
+  const p = _normalizeRelPath(relPath);
+  if (!p) return false;
+
+  // Exact handoff files.
+  if (p === '.forge/state.md') return true;
+  if (p === '.forge/resume.md') return true;
+  if (p === '.forge/context-summary.md') return true;
+
+  // Scoped handoff dirs.
+  if (p.startsWith('.forge/progress/') && p.endsWith('.json')) return true;
+  if (p.startsWith('.forge/artifacts/') && p.endsWith('.json')) return true;
+  if (p.startsWith('.forge/context-bundles/') && p.endsWith('.md')) return true;
+  if (p.startsWith('.forge/summaries/')) return true;
+  if (p.startsWith('.forge/history/cycles/') && /summary|review/i.test(p)) return true;
+
+  return false;
+}
+
+// Throws a descriptive error when relPath is outside the whitelist or matches
+// a hard-blocked extension/prefix. Callers pass the repo-relative path of the
+// artifact they are about to write.
+function assertCavemanWhitelist(relPath) {
+  const p = _normalizeRelPath(relPath);
+  if (!p) {
+    throw new Error(`caveman: refusing to compress empty or non-string path (got ${JSON.stringify(relPath)})`);
+  }
+
+  // Hard block by extension first -- a source file under an otherwise allowed
+  // prefix must still be rejected.
+  const dotIdx = p.lastIndexOf('.');
+  const ext = dotIdx === -1 ? '' : p.slice(dotIdx).toLowerCase();
+  if (CAVEMAN_HARD_BLOCKED_EXTS.has(ext)) {
+    throw new Error(`caveman: refusing to compress ${p} -- extension ${ext} is hard-blocked (source/config/markup files never go through compression)`);
+  }
+
+  // Hard block by prefix: commit messages, specs, docs, skills, scripts live
+  // outside .forge/ and must never see compression.
+  for (const prefix of CAVEMAN_HARD_BLOCKED_PREFIXES) {
+    if (p.startsWith(prefix)) {
+      throw new Error(`caveman: refusing to compress ${p} -- path prefix ${prefix} is hard-blocked (user-facing content never goes through compression)`);
+    }
+  }
+
+  if (!isCavemanAllowedPath(p)) {
+    throw new Error(`caveman: refusing to compress ${p} -- not in the declared whitelist {state.md, progress/, artifacts/, context-bundles/, summaries/, resume.md, context-summary.md}`);
+  }
+}
+
+// === Compression Stats Ledger (R015) ===
+//
+// Per-cycle totals of bytes compressed + bytes saved. `/forge:status` reads
+// these to surface regressions in compression quality over time. Cycle id
+// comes from `.forge/state.md` frontmatter (current_cycle) or defaults to
+// the ISO day so tests and ad-hoc runs still accumulate somewhere sensible.
+
+function _compressionStatsPath(forgeDir) {
+  return path.join(forgeDir, 'compression-stats.json');
+}
+
+function _currentCavemanCycle(forgeDir) {
+  try {
+    const state = parseFrontmatter(fs.readFileSync(path.join(forgeDir, 'state.md'), 'utf8'));
+    const data = state && state.data ? state.data : {};
+    if (data.current_cycle) return String(data.current_cycle);
+    if (data.cycle) return String(data.cycle);
+  } catch (_) { /* fall through */ }
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function recordCompressionStats(forgeDir, relPath, bytesBefore, bytesAfter) {
+  if (typeof bytesBefore !== 'number' || typeof bytesAfter !== 'number') return null;
+  if (bytesBefore < 0 || bytesAfter < 0) return null;
+  const statsPath = _compressionStatsPath(forgeDir);
+  let ledger = { cycles: {} };
+  try {
+    ledger = JSON.parse(fs.readFileSync(statsPath, 'utf8'));
+    if (!ledger || typeof ledger !== 'object') ledger = { cycles: {} };
+    if (!ledger.cycles || typeof ledger.cycles !== 'object') ledger.cycles = {};
+  } catch (_) { /* new ledger */ }
+
+  const cycle = _currentCavemanCycle(forgeDir);
+  const entry = ledger.cycles[cycle] || {
+    bytes_before: 0,
+    bytes_after: 0,
+    bytes_saved: 0,
+    artifact_count: 0,
+    first_at: new Date().toISOString()
+  };
+  entry.bytes_before += bytesBefore;
+  entry.bytes_after += bytesAfter;
+  entry.bytes_saved = Math.max(0, entry.bytes_before - entry.bytes_after);
+  entry.artifact_count += 1;
+  entry.last_at = new Date().toISOString();
+  entry.last_path = _normalizeRelPath(relPath);
+  ledger.cycles[cycle] = entry;
+
+  try {
+    const tmp = statsPath + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(ledger, null, 2));
+    fs.renameSync(tmp, statsPath);
+  } catch (e) {
+    // Stats are best-effort -- never crash the write path.
+    try { fs.unlinkSync(statsPath + '.tmp'); } catch (_) {}
+  }
+  return entry;
+}
+
+function readCompressionStats(forgeDir) {
+  try {
+    return JSON.parse(fs.readFileSync(_compressionStatsPath(forgeDir), 'utf8'));
+  } catch (_) {
+    return { cycles: {} };
+  }
+}
+
+// compressWithGuard is the single entry point used by writers that want
+// both the whitelist check and the stats ledger. It returns the compressed
+// string (or the original if skipCaveman is true) so callers can drop it in
+// place of raw formatCavemanValue calls.
+function compressWithGuard(forgeDir, relPath, text, opts) {
+  opts = opts || {};
+  if (opts.skipCavemanFormat) return text;
+  if (typeof text !== 'string' || text.length === 0) return text;
+  assertCavemanWhitelist(relPath);
+  const before = Buffer.byteLength(text, 'utf8');
+  const out = formatCavemanValue(text);
+  const after = Buffer.byteLength(typeof out === 'string' ? out : '', 'utf8');
+  recordCompressionStats(forgeDir, relPath, before, after);
+  return out;
+}
+
 function readState(forgeDir) {
   const statePath = path.join(forgeDir, 'state.md');
   try {
@@ -822,6 +1151,160 @@ function _atomicWriteFile(targetPath, contents) {
   throw lastErr || new Error('atomic write failed');
 }
 
+// === Setup-state Guard (T009, R008) ===
+//
+// R008 exists because of the graph-visual-quality real run where a fresh spec
+// entered state.md with `task_status: complete, current_task: null` which
+// would have short-circuited execute had a human not spotted it. The guard
+// refuses any frontmatter write that lands `task_status: complete` unless
+// ALL of the following are true:
+//   (a) A frontier file exists for the active spec
+//       (.forge/plans/<spec>-frontier.md).
+//   (b) Every task id in the frontier has a status entry in the registry
+//       (.forge/task-status.json) — "or the equivalent structured field"
+//       per the spec prompt; the registry is that field.
+//   (c) Every status entry is one of {complete, complete_with_concerns,
+//       DONE, DONE_WITH_CONCERNS} — we accept both the internal lowercase
+//       form and the forge-executor status-report form for robustness.
+//
+// Violations append a JSONL line to
+// .forge/history/cycles/<cycle>/state-violations.jsonl with a stable shape
+// so /forge:review-branch can audit after the fact, then throw so the caller
+// sees an actionable error.
+
+const _COMPLETE_ALLOWED_STATUSES = new Set([
+  'complete',
+  'complete_with_concerns',
+  'DONE',
+  'DONE_WITH_CONCERNS'
+]);
+
+// Derive the cycle directory name used by the violation log. If state.md
+// already carries a `cycle` frontmatter key (transcript cycle convention),
+// reuse it so violations and transcripts co-locate. Otherwise synthesize a
+// compact UTC stamp `YYYYMMDDTHHmmZ` from `opts.now` or the wall clock.
+// Tests pass `opts.now` for deterministic filenames.
+function _deriveViolationCycleId(currentData, opts) {
+  if (currentData && typeof currentData.cycle === 'string' && currentData.cycle) {
+    // Reuse the active transcript cycle when present.
+    const c = currentData.cycle;
+    if (!/[\\/]/.test(c) && c !== '.' && c !== '..') return c;
+  }
+  const now = (opts && opts.now) ? new Date(opts.now) : new Date();
+  const iso = now.toISOString(); // e.g. 2026-04-20T17:30:12.345Z
+  // Strip to YYYYMMDDTHHMMZ — 14 chars, no separators, always valid as a dir name.
+  return iso.slice(0, 16).replace(/[-:]/g, '').replace(/\.\d+$/, '') + 'Z';
+}
+
+function _logStateViolation(forgeDir, violation, opts) {
+  // Best-effort sink. Never throw from the logger itself; the caller throws
+  // after we return so the root cause is visible at the write site.
+  try {
+    const cycleId = _deriveViolationCycleId(violation.currentData || {}, opts || {});
+    const cycleDir = path.join(forgeDir, 'history', 'cycles', cycleId);
+    fs.mkdirSync(cycleDir, { recursive: true });
+    const filePath = path.join(cycleDir, 'state-violations.jsonl');
+    const record = {
+      at: (opts && opts.now) || new Date().toISOString(),
+      attempted: violation.attempted || {},
+      reason: violation.reason || '',
+      frontier_path: violation.frontier_path || null,
+      missing_task_ids: Array.isArray(violation.missing_task_ids)
+        ? violation.missing_task_ids
+        : []
+    };
+    fs.appendFileSync(filePath, JSON.stringify(record) + '\n');
+    return filePath;
+  } catch (_) {
+    // Never swallow the guard error because logging failed.
+    return null;
+  }
+}
+
+// Inspect `mergedData` (the frontmatter about to be written) + the filesystem,
+// and if the combination is the R008 trap, log a violation and throw.
+function _assertStateCompleteAllowed(forgeDir, mergedData, currentData, opts) {
+  if (!mergedData || mergedData.task_status !== 'complete') return;
+
+  const spec = mergedData.spec || (currentData && currentData.spec) || null;
+  const frontierFile = spec ? `${spec}-frontier.md` : null;
+  const frontierPath = spec ? path.join(forgeDir, 'plans', frontierFile) : null;
+
+  const violation = {
+    attempted: {
+      task_status: mergedData.task_status,
+      current_task: mergedData.current_task || null,
+      spec: spec
+    },
+    currentData: currentData || {},
+    frontier_path: frontierPath
+  };
+
+  // Gate (a): frontier file exists.
+  if (!spec) {
+    violation.reason = 'Refusing task_status=complete: no active spec declared in state.md frontmatter.';
+    violation.missing_task_ids = [];
+    _logStateViolation(forgeDir, violation, opts);
+    const err = new Error(violation.reason);
+    err.code = 'E_STATE_WRITE_GUARD';
+    throw err;
+  }
+  if (!fs.existsSync(frontierPath)) {
+    violation.reason = `Refusing task_status=complete: frontier file not found at ${frontierPath}.`;
+    violation.missing_task_ids = [];
+    _logStateViolation(forgeDir, violation, opts);
+    const err = new Error(violation.reason);
+    err.code = 'E_STATE_WRITE_GUARD';
+    throw err;
+  }
+
+  // Parse the frontier and cross-check every task id against the registry.
+  let frontierTasks = [];
+  try {
+    const frontierText = fs.readFileSync(frontierPath, 'utf8');
+    frontierTasks = parseFrontier(frontierText);
+  } catch (e) {
+    violation.reason = `Refusing task_status=complete: frontier at ${frontierPath} is unreadable (${e.message}).`;
+    violation.missing_task_ids = [];
+    _logStateViolation(forgeDir, violation, opts);
+    const err = new Error(violation.reason);
+    err.code = 'E_STATE_WRITE_GUARD';
+    throw err;
+  }
+
+  const registry = readTaskRegistry(forgeDir);
+  const missing = [];
+  const nonDone = [];
+  for (const t of frontierTasks) {
+    const entry = registry.tasks ? registry.tasks[t.id] : null;
+    if (!entry) {
+      missing.push(t.id);
+    } else if (!_COMPLETE_ALLOWED_STATUSES.has(entry.status)) {
+      nonDone.push({ id: t.id, status: entry.status || null });
+    }
+  }
+
+  if (missing.length > 0 || nonDone.length > 0) {
+    const parts = [];
+    if (missing.length > 0) parts.push(`missing registry entries for ${missing.join(', ')}`);
+    if (nonDone.length > 0) {
+      parts.push(
+        'non-DONE statuses for ' +
+          nonDone.map(n => `${n.id}=${n.status == null ? 'null' : n.status}`).join(', ')
+      );
+    }
+    violation.reason =
+      `Refusing task_status=complete: ${parts.join('; ')}. ` +
+      `Every task in ${frontierFile} must have a registry entry in ` +
+      `{complete, complete_with_concerns, DONE, DONE_WITH_CONCERNS} before the spec-level complete flag can flip.`;
+    violation.missing_task_ids = missing.concat(nonDone.map(n => n.id));
+    _logStateViolation(forgeDir, violation, opts);
+    const err = new Error(violation.reason);
+    err.code = 'E_STATE_WRITE_GUARD';
+    throw err;
+  }
+}
+
 // writeState supports two calling conventions for backward compatibility:
 //   writeState(forgeDir, data, content [, opts])   -- legacy full-write (atomic)
 //   writeState(forgeDir, updates [, opts])         -- partial frontmatter merge.
@@ -829,20 +1312,30 @@ function _atomicWriteFile(targetPath, contents) {
 //                                              __content       -- replaces body
 //                                              __contentAppend -- appended to body
 //   opts: { skipCavemanFormat: bool }  -- default false; caveman is on by default
+//         { now: ISOString }           -- injected clock for deterministic
+//                                        violation-log cycle ids in tests.
 function writeState(forgeDir, dataOrUpdates, contentOrOpts, maybeOpts) {
   const statePath = path.join(forgeDir, 'state.md');
+
+  const stateRel = '.forge/state.md';
 
   // Detect legacy 3-arg form: 3rd arg is a string (content body).
   if (arguments.length >= 3 && typeof contentOrOpts === 'string') {
     const opts = maybeOpts || {};
-    const body = opts.skipCavemanFormat ? contentOrOpts : formatCavemanValue(contentOrOpts);
+    // R008 guard: inspect full-write frontmatter before serializing.
+    let currentData = {};
+    try {
+      currentData = parseFrontmatter(fs.readFileSync(statePath, 'utf8')).data || {};
+    } catch (e) { /* first write is fine */ }
+    _assertStateCompleteAllowed(forgeDir, dataOrUpdates || {}, currentData, opts);
+
+    const body = compressWithGuard(forgeDir, stateRel, contentOrOpts, opts);
     _atomicWriteFile(statePath, serializeFrontmatter(dataOrUpdates, body));
     return;
   }
 
   // 2-arg partial form (with optional opts as 3rd arg).
   const opts = (contentOrOpts && typeof contentOrOpts === 'object') ? contentOrOpts : {};
-  const skipCaveman = !!opts.skipCavemanFormat;
 
   const updates = dataOrUpdates || {};
   let current = { data: {}, content: '' };
@@ -854,15 +1347,18 @@ function writeState(forgeDir, dataOrUpdates, contentOrOpts, maybeOpts) {
   let mergedContent = current.content;
   for (const [key, val] of Object.entries(updates)) {
     if (key === '__content') {
-      mergedContent = skipCaveman ? val : formatCavemanValue(val);
+      mergedContent = compressWithGuard(forgeDir, stateRel, val, opts);
     } else if (key === '__contentAppend') {
-      const piece = skipCaveman ? val : formatCavemanValue(val);
+      const piece = compressWithGuard(forgeDir, stateRel, val, opts);
       mergedContent = (mergedContent || '') + piece;
     } else {
       // Frontmatter values are short / structured -- never caveman them.
       mergedData[key] = val;
     }
   }
+
+  // R008 guard: inspect merged frontmatter before serializing.
+  _assertStateCompleteAllowed(forgeDir, mergedData, current.data || {}, opts);
 
   _atomicWriteFile(statePath, serializeFrontmatter(mergedData, mergedContent));
 }
@@ -1366,7 +1862,11 @@ function parseFrontier(text) {
       const repoMatch = rest.match(/repo:\s*(\S+)/);
       const dependsMatch = rest.match(/depends:\s*([A-Z0-9.,\s]+?)(?:\s*\||$)/);
       const estMatch = rest.match(/est:\s*~?(\d+)k/);
-      const providesMatch = rest.match(/provides:\s*([a-z0-9_,\s-]+?)(?:\s*\||$)/);
+      // T029 (R006): `provides` now accepts AC-level tokens like `R002.AC1`
+      // in addition to the legacy lowercase coarse tokens (`register_endpoint`).
+      // Character class is expanded to allow uppercase + `.` while remaining
+      // back-compatible with every existing frontier.
+      const providesMatch = rest.match(/provides:\s*([A-Za-z0-9_.,\s-]+?)(?:\s*\||$)/);
       const consumesMatch = rest.match(/consumes:\s*([a-z0-9_,\s-]+?)(?:\s*\||$)/);
       // T015 (R005): files: path/a.ts, path/b.ts -- declared overlap surface for conflict detection.
       // Accepts both `files:` and `filesTouched:` for forwards compatibility.
@@ -1390,6 +1890,398 @@ function parseFrontier(text) {
     }
   }
   return tasks;
+}
+
+// === T020 (R007): Visual AC parsing + verifier orchestration ===
+//
+// Spec AC syntax extension (mock-and-visual-verify uses it, defined here):
+//   - [ ] [visual] path=/ viewport=1280x800 checks=["legible labels", "no halo overlap"]
+//
+// `path=` is mandatory; `viewport=` defaults to 1280x800; `checks=` is a JSON
+// array of free-text perceptual claims the LLM-vision step evaluates.
+//
+// Returned shape:
+//   [{ requirementId: "R001", acId: "R001.AC1", path: "/", viewport: "1280x800",
+//      checks: ["legible labels", "no halo overlap"], line: 28, raw: "- [ ] [visual] ..." }]
+//
+// acId is synthesised as "<R>.AC<n>" where n is the 1-based index of the
+// checkbox within that requirement. Agents and the completion gate use
+// this exact form (see R007 AC1 example "R003.AC2"). Both `- [ ]` (unchecked)
+// and `- [x]` / `- [X]` (checked) are recognised.
+//
+// Malformed AC lines are skipped silently — `parseVisualAcs` is defensive
+// so a partial spec does not break the verifier. Callers that want strict
+// checking should validate the return shape themselves.
+function parseVisualAcs(specPath) {
+  let text;
+  try { text = fs.readFileSync(specPath, 'utf8'); }
+  catch (_) { return []; }
+
+  const { content } = parseFrontmatter(text);
+  const lines = content.split('\n');
+  const out = [];
+
+  let currentR = null;        // e.g. "R001"
+  let acCounterForR = 0;      // 1-based within each requirement
+
+  // Requirements in Forge specs are headed by `### R<NNN>: <name>`. Track
+  // the active requirement id so every checkbox lands under the right R.
+  const rHeading = /^###\s+(R\d+)\s*:/;
+  // Checkbox row: `- [ ]` or `- [x]` / `- [X]` followed by AC body. The
+  // body must start with `[visual]` (case-insensitive) to qualify here.
+  const checkboxRow = /^-\s+\[[ xX]\]\s+(.*)$/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const h = line.match(rHeading);
+    if (h) {
+      currentR = h[1];
+      acCounterForR = 0;
+      continue;
+    }
+    if (!currentR) continue;
+
+    const m = line.match(checkboxRow);
+    if (!m) continue;
+    // Every AC increments the per-R counter (so visual and non-visual
+    // share the counter — matches R007 AC1's R003.AC2 example where AC2
+    // means "second AC under R003" regardless of its kind).
+    acCounterForR++;
+    const body = m[1].trim();
+    if (!/^\[visual\]/i.test(body)) continue;
+
+    // path= token (mandatory). Accepts path=/foo or path=/foo/bar with
+    // no spaces — whitespace in paths is not supported (would collide
+    // with viewport/checks tokenisation).
+    const pathMatch = body.match(/\bpath=(\S+)/);
+    if (!pathMatch) continue;
+    const pathVal = pathMatch[1];
+
+    // viewport=WxH (optional, default 1280x800). Loose regex: accepts
+    // digits x digits with no spaces.
+    const vpMatch = body.match(/\bviewport=(\d+x\d+)/);
+    const viewport = vpMatch ? vpMatch[1] : '1280x800';
+
+    // checks=[...] JSON-ish array. We accept standard JSON strings with
+    // either " or ' delimiters. Falls back to the empty list when
+    // unparseable; an empty checks list means "render succeeds" — a
+    // weaker but still useful assertion.
+    let checks = [];
+    const checksMatch = body.match(/\bchecks=(\[[\s\S]*?\])/);
+    if (checksMatch) {
+      const raw = checksMatch[1];
+      // Normalise single quotes to double quotes for JSON.parse; also
+      // trim trailing commas which authors sometimes leave.
+      const normalised = raw
+        .replace(/'/g, '"')
+        .replace(/,\s*\]/g, ']');
+      try {
+        const parsed = JSON.parse(normalised);
+        if (Array.isArray(parsed)) checks = parsed.map(String);
+      } catch (_) { /* keep checks = [] */ }
+    }
+
+    out.push({
+      requirementId: currentR,
+      acId: currentR + '.AC' + acCounterForR,
+      path: pathVal,
+      viewport,
+      checks,
+      line: i + 1,
+      raw: line
+    });
+  }
+
+  return out;
+}
+
+// Capability gate for the visual verifier. Returns `{ available: bool, reason?: string }`
+// so the agent can short-circuit into `blocked` instead of attempting a Playwright call.
+//
+//   - FORGE_DISABLE_PLAYWRIGHT=1 in the env     -> available:false, reason:"playwright_unavailable"
+//   - caps.sandbox.browser === false             -> available:false, reason:"browser_cap_disabled"
+//   - no `mcp__playwright` or `playwright` entry under caps.mcp_servers AND the env does
+//     not opt-out of the capability check     -> available:false, reason:"playwright_unavailable"
+//   - otherwise                                 -> available:true
+//
+// `caps` is the parsed .forge/capabilities.json object. Pass `null` or `{}`
+// to skip the capabilities check (useful in tests that only exercise the
+// env-var path).
+function checkVisualCapabilities(caps, env) {
+  env = env || process.env;
+  if (env.FORGE_DISABLE_PLAYWRIGHT === '1') {
+    return { available: false, reason: 'playwright_unavailable' };
+  }
+  if (caps && caps.sandbox && caps.sandbox.browser === false) {
+    return { available: false, reason: 'browser_cap_disabled' };
+  }
+  if (caps && caps.mcp_servers) {
+    const keys = Object.keys(caps.mcp_servers);
+    const hasPlaywright = keys.some(k => /playwright/i.test(k));
+    if (!hasPlaywright) {
+      return { available: false, reason: 'playwright_unavailable' };
+    }
+  }
+  return { available: true };
+}
+
+// Baseline path for a visual AC screenshot. Schema:
+//   .forge/baselines/<spec-id>/<requirementId>-<acId>.png
+//
+// Example: spec=001-readable-graph, ac={R001,R001.AC1}
+//   -> .forge/baselines/001-readable-graph/R001-R001.AC1.png
+//
+// Kept pure so callers can compute the path without side effects. The
+// first-successful-pass-under-record-baselines branch in the verifier
+// is the only caller that actually writes to this path.
+function baselinePath(forgeDir, specId, ac) {
+  return path.join(
+    forgeDir, 'baselines', String(specId),
+    String(ac.requirementId) + '-' + String(ac.acId) + '.png'
+  );
+}
+
+// Write `visual_acs` results to a per-task progress file under
+// .forge/progress/<taskId>.json. Called by the verifier once every AC
+// has a result (`pass` / `fail` / `blocked`). Merges with whatever
+// progress record already exists so the executor's own context_bundle
+// is preserved. Returns the final progress object.
+//
+// Shape of `visualAcResults`:
+//   [{ acId, status: 'pass'|'fail'|'blocked', detail?: string,
+//      baseline?: string, screenshot?: string }]
+//
+// checkCompletionGates (T017) reads these via _scanProgressForAcs.
+function writeVisualProgress(forgeDir, taskId, visualAcResults) {
+  const progDir = path.join(forgeDir, 'progress');
+  try { fs.mkdirSync(progDir, { recursive: true }); } catch (_) {}
+  const file = path.join(progDir, String(taskId) + '.json');
+  let obj = {};
+  try { obj = JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (_) { obj = {}; }
+  if (!obj || typeof obj !== 'object') obj = {};
+
+  obj.task_id = obj.task_id || taskId;
+  obj.last_updated = new Date().toISOString();
+  obj.visual_acs = Array.isArray(visualAcResults) ? visualAcResults.map(r => ({
+    acId: r.acId,
+    status: r.status,
+    detail: r.detail || null,
+    baseline: r.baseline || null,
+    screenshot: r.screenshot || null
+  })) : [];
+
+  fs.writeFileSync(file, JSON.stringify(obj, null, 2));
+  return obj;
+}
+
+// Orchestration entry point for the `forge-visual-verifier` agent. Pure
+// (no network, no Playwright invocation) so it can be unit-tested
+// deterministically. The agent is responsible for the actual
+// `mcp__playwright__browser_*` calls; this function prepares the AC list,
+// classifies the environment, and produces the progress record + a
+// summary the agent returns to its caller.
+//
+// opts:
+//   specPath     absolute path to the spec file (required).
+//   taskId       the task id this verification run is attributed to (default: "visual-verify").
+//   specId       the spec identifier (default: derived from specPath basename without .md).
+//   capsPath     where to read capabilities.json (default: <forgeDir>/capabilities.json).
+//   env          env var source (default: process.env). Honors FORGE_DISABLE_PLAYWRIGHT.
+//   recordBaselines   explicit override of the record-mode flag. When omitted the
+//                     function reads state.md frontmatter `record_baselines: true`
+//                     (stamped by the T016 setup-state CLI on --record-baselines runs).
+//   takeScreenshot    injected hook for the agent's Playwright bridge. Signature:
+//                     async (ac) => { pngBuffer: Buffer }. When null, the verifier
+//                     skips all screenshot work and leaves results blank — the agent
+//                     is expected to call this loop itself with a real bridge in
+//                     production. Unit tests pass a stub.
+//   visionCompare     async (screenshotPng, baselinePng, checks) => { status, detail }.
+//                     Only used when baselines exist and we're in compare-mode.
+//
+// Return shape:
+//   {
+//     specId, taskId,
+//     status: 'pass'|'fail'|'blocked'|'empty',
+//     acs: [{ acId, status, detail, baseline, screenshot }],
+//     capability: { available: bool, reason?: string },
+//     progress: <the written progress record>
+//   }
+//
+// Agents consume this function as the deterministic planning layer and
+// then execute the Playwright calls themselves.
+async function runVisualVerifier(forgeDir, opts) {
+  opts = opts || {};
+  const specPath = opts.specPath;
+  if (!specPath) throw new Error('runVisualVerifier: opts.specPath required');
+  const taskId = opts.taskId || 'visual-verify';
+  const specId = opts.specId || path.basename(specPath).replace(/\.md$/i, '');
+  const env = opts.env || process.env;
+
+  // Capability gate: if Playwright isn't available every AC returns blocked.
+  let caps = null;
+  if (opts.caps !== undefined) {
+    caps = opts.caps;
+  } else {
+    const capsPath = opts.capsPath || path.join(forgeDir, 'capabilities.json');
+    try { caps = JSON.parse(fs.readFileSync(capsPath, 'utf8')); }
+    catch (_) { caps = null; }
+  }
+  const capability = checkVisualCapabilities(caps, env);
+
+  const acs = parseVisualAcs(specPath);
+  if (acs.length === 0) {
+    const progress = writeVisualProgress(forgeDir, taskId, []);
+    return {
+      specId, taskId, status: 'empty', acs: [],
+      capability, progress
+    };
+  }
+
+  // If Playwright isn't wired every AC is `blocked` with the capability
+  // reason as detail. No screenshots are taken. No baselines are written.
+  if (!capability.available) {
+    const blocked = acs.map(ac => ({
+      acId: ac.acId,
+      status: 'blocked',
+      detail: capability.reason,
+      baseline: null,
+      screenshot: null
+    }));
+    const progress = writeVisualProgress(forgeDir, taskId, blocked);
+    return {
+      specId, taskId, status: 'blocked',
+      acs: blocked, capability, progress
+    };
+  }
+
+  // record_baselines flag: explicit opts.recordBaselines wins; otherwise
+  // read state.md frontmatter. T016's setup-state CLI stamps this field
+  // when the user invokes /forge:execute --record-baselines.
+  let recordBaselines = false;
+  if (typeof opts.recordBaselines === 'boolean') {
+    recordBaselines = opts.recordBaselines;
+  } else {
+    try {
+      const st = readState(forgeDir);
+      if (st && st.data && st.data.record_baselines === true) recordBaselines = true;
+    } catch (_) { recordBaselines = false; }
+  }
+
+  // The actual Playwright-driven screenshot + vision compare is the
+  // agent's responsibility. When the agent passes bridges, run them;
+  // otherwise return `pending` results that the agent must fill in.
+  const results = [];
+  const baselinesDir = path.join(forgeDir, 'baselines', specId);
+
+  for (const ac of acs) {
+    const bPath = baselinePath(forgeDir, specId, ac);
+    const baselineExists = fs.existsSync(bPath);
+    const result = {
+      acId: ac.acId,
+      status: 'pending',
+      detail: null,
+      baseline: baselineExists ? bPath : null,
+      screenshot: null
+    };
+
+    if (typeof opts.takeScreenshot !== 'function') {
+      // No bridge: the agent will fill in per-AC results itself. Carry
+      // the metadata (path, viewport, checks, baseline existence) so
+      // the agent can act on it without re-reading the spec.
+      result.status = 'pending';
+      result.detail = 'agent-bridge-missing; agent must populate result';
+      result.path = ac.path;
+      result.viewport = ac.viewport;
+      result.checks = ac.checks;
+      results.push(result);
+      continue;
+    }
+
+    let shot;
+    try {
+      shot = await opts.takeScreenshot(ac);
+    } catch (err) {
+      result.status = 'blocked';
+      result.detail = 'screenshot_error: ' + (err && err.message || String(err));
+      results.push(result);
+      continue;
+    }
+    if (!shot || !shot.pngBuffer) {
+      result.status = 'blocked';
+      result.detail = 'screenshot_empty';
+      results.push(result);
+      continue;
+    }
+
+    if (recordBaselines || !baselineExists) {
+      // Record-mode (or first-ever run for this AC): write the baseline
+      // and declare pass. Subsequent runs will compare against it.
+      try { fs.mkdirSync(baselinesDir, { recursive: true }); } catch (_) {}
+      try {
+        fs.writeFileSync(bPath, shot.pngBuffer);
+        result.baseline = bPath;
+        result.screenshot = bPath;
+        result.status = 'pass';
+        result.detail = baselineExists ? 'baseline-rerecorded' : 'baseline-recorded';
+      } catch (err) {
+        result.status = 'blocked';
+        result.detail = 'baseline_write_error: ' + (err && err.message || String(err));
+      }
+      results.push(result);
+      continue;
+    }
+
+    // Compare against the existing baseline via the agent's vision bridge.
+    if (typeof opts.visionCompare !== 'function') {
+      result.status = 'pending';
+      result.detail = 'vision-bridge-missing; agent must compare baseline';
+      results.push(result);
+      continue;
+    }
+    let cmp;
+    try {
+      const baselineBuf = fs.readFileSync(bPath);
+      cmp = await opts.visionCompare(shot.pngBuffer, baselineBuf, ac.checks);
+    } catch (err) {
+      result.status = 'blocked';
+      result.detail = 'vision_error: ' + (err && err.message || String(err));
+      results.push(result);
+      continue;
+    }
+    result.status = (cmp && cmp.status) || 'fail';
+    result.detail = (cmp && cmp.detail) || null;
+    results.push(result);
+  }
+
+  // Summary status: pass when every AC is pass; fail when any is fail;
+  // blocked when any is blocked and none is fail; pending when any AC
+  // remains pending (bridges missing). pending maps to blocked for the
+  // completion gate because an unresolved AC cannot clear it.
+  let overall = 'pass';
+  for (const r of results) {
+    if (r.status === 'fail') { overall = 'fail'; break; }
+    if (r.status === 'blocked') overall = 'blocked';
+    else if (r.status === 'pending' && overall !== 'blocked') overall = 'pending';
+  }
+
+  // Persist a gate-compatible form. The completion-gate scanner only
+  // accepts `pass` as clearing. Pending is surfaced as blocked with a
+  // distinct detail.
+  const gateForm = results.map(r => ({
+    acId: r.acId,
+    status: r.status === 'pending' ? 'blocked' : r.status,
+    detail: r.status === 'pending' ? (r.detail || 'pending; agent has not completed') : r.detail,
+    baseline: r.baseline,
+    screenshot: r.screenshot
+  }));
+  const progress = writeVisualProgress(forgeDir, taskId, gateForm);
+
+  return {
+    specId, taskId,
+    status: overall === 'pending' ? 'blocked' : overall,
+    acs: results, capability, progress
+  };
 }
 
 // === T015 (R005): Worktree Conflict Detection + Serialization ===
@@ -1717,22 +2609,37 @@ function isBlockedByParallelConstraint(taskId, runningTasks, constraints) {
 function writeArtifact(forgeDir, taskId, artifact) {
   const artifactsDir = path.join(forgeDir, 'artifacts');
   try { fs.mkdirSync(artifactsDir, { recursive: true }); } catch (e) {}
+  // R015: enforce whitelist before any compression. Throws on bad paths.
+  const relPath = `.forge/artifacts/${taskId}.json`;
+  assertCavemanWhitelist(relPath);
+  // R005: artifact summary values use caveman compression for compact handoffs.
+  // Track bytes before/after across every string field so the cycle ledger
+  // surfaces regressions via /forge:status.
+  let totalBefore = 0;
+  let totalAfter = 0;
+  const compressedArtifacts = Object.fromEntries(
+    Object.entries(artifact.artifacts || {}).map(([k, v]) => {
+      if (typeof v !== 'string') return [k, v];
+      totalBefore += Buffer.byteLength(v, 'utf8');
+      const compressed = formatCavemanValue(v);
+      totalAfter += Buffer.byteLength(compressed, 'utf8');
+      return [k, compressed];
+    })
+  );
   const data = {
     task_id: taskId,
     status: artifact.status || 'complete',
     commit: artifact.commit || null,
-    // R005: artifact summary values use caveman compression for compact handoffs
-    artifacts: Object.fromEntries(
-      Object.entries(artifact.artifacts || {}).map(([k, v]) =>
-        [k, typeof v === 'string' ? formatCavemanValue(v) : v]
-      )
-    ),
+    artifacts: compressedArtifacts,
     files_created: artifact.files_created || [],
     files_modified: artifact.files_modified || [],
     key_decisions: artifact.key_decisions || [],
     completed_at: new Date().toISOString()
   };
   fs.writeFileSync(path.join(artifactsDir, `${taskId}.json`), JSON.stringify(data, null, 2));
+  if (totalBefore > 0) {
+    recordCompressionStats(forgeDir, relPath, totalBefore, totalAfter);
+  }
   return data;
 }
 
@@ -1837,8 +2744,19 @@ function writeCheckpoint(forgeDir, taskId, checkpoint, opts) {
   validateCheckpoint(cp);
   let normalized = normalizeCheckpoint(cp);
   // Caveman-format free-text fields by default (T029, R013).
+  const relPath = `.forge/progress/${taskId}.json`;
   if (!(opts && opts.skipCavemanFormat)) {
+    // R015: whitelist guard -- throws if someone ever routes checkpoint writes
+    // through a non-progress path. The canonical path is always allowed.
+    assertCavemanWhitelist(relPath);
+    // Measure bytes before/after on free-text fields so the cycle ledger
+    // reflects checkpoint compression alongside artifacts + state.
+    const before = _cavemanFieldByteSize(normalized);
     normalized = _cavemanCheckpointFields(normalized);
+    const after = _cavemanFieldByteSize(normalized);
+    if (before > 0) {
+      recordCompressionStats(forgeDir, relPath, before, after);
+    }
   }
 
   const target = checkpointPath(forgeDir, taskId);
@@ -1846,6 +2764,24 @@ function writeCheckpoint(forgeDir, taskId, checkpoint, opts) {
   fs.writeFileSync(tmp, JSON.stringify(normalized, null, 2));
   fs.renameSync(tmp, target);
   return { written: true, path: target };
+}
+
+// Size only the fields _cavemanCheckpointFields actually touches, so the
+// byte delta in the stats ledger mirrors what compression changed.
+function _cavemanFieldByteSize(cp) {
+  let total = 0;
+  if (cp && cp.context_bundle && typeof cp.context_bundle === 'object') {
+    for (const v of Object.values(cp.context_bundle)) {
+      if (typeof v === 'string') total += Buffer.byteLength(v, 'utf8');
+    }
+  }
+  if (cp && Array.isArray(cp.error_log)) {
+    for (const entry of cp.error_log) {
+      if (typeof entry === 'string') total += Buffer.byteLength(entry, 'utf8');
+      else if (entry && typeof entry.msg === 'string') total += Buffer.byteLength(entry.msg, 'utf8');
+    }
+  }
+  return total;
 }
 
 function readCheckpoint(forgeDir, taskId) {
@@ -1951,6 +2887,11 @@ function buildContextBundle(forgeDir, task, specContent, frontierTasks) {
   }
 
   // Key decisions from dependency artifacts (caveman-compressed)
+  const bundleRel = `.forge/context-bundles/${task.id}.md`;
+  // R015: whitelist guard -- bundle path is inside the declared handoff scope.
+  assertCavemanWhitelist(bundleRel);
+  let bundleBefore = 0;
+  let bundleAfter = 0;
   if (task.depends && task.depends.length > 0) {
     const decisions = [];
     const fileList = [];
@@ -1959,7 +2900,14 @@ function buildContextBundle(forgeDir, task, specContent, frontierTasks) {
       if (!artifact) continue;
       if (artifact.key_decisions && artifact.key_decisions.length > 0) {
         for (const d of artifact.key_decisions) {
-          decisions.push(`- ${depId}: ${formatCavemanValue(d)}`);
+          if (typeof d === 'string') {
+            bundleBefore += Buffer.byteLength(d, 'utf8');
+            const compressed = formatCavemanValue(d);
+            bundleAfter += Buffer.byteLength(compressed, 'utf8');
+            decisions.push(`- ${depId}: ${compressed}`);
+          } else {
+            decisions.push(`- ${depId}: ${d}`);
+          }
         }
       }
       if (artifact.files_created) fileList.push(...artifact.files_created);
@@ -1975,6 +2923,9 @@ function buildContextBundle(forgeDir, task, specContent, frontierTasks) {
 
   const bundlePath = path.join(bundleDir, `${task.id}.md`);
   fs.writeFileSync(bundlePath, sections.join('\n\n'));
+  if (bundleBefore > 0) {
+    recordCompressionStats(forgeDir, bundleRel, bundleBefore, bundleAfter);
+  }
   return bundlePath;
 }
 
@@ -1986,63 +2937,256 @@ function cleanupContextBundle(forgeDir, taskId) {
 
 // === Capability Discovery ===
 
-function discoverCapabilities(projectDir, claudeJsonPath) {
-  const caps = { mcp_servers: {}, skills: {}, plugins: {}, discovered_at: new Date().toISOString() };
+// === Discover helpers (R002) ===
 
-  // Read MCP config
+// Recursively collect files matching a basename under `root` up to `maxDepth`
+// directories below root. Returns absolute paths. Silent on unreadable dirs.
+function _discoverWalk(root, basename, maxDepth) {
+  const hits = [];
+  if (!root) return hits;
+  const stack = [{ dir: root, depth: 0 }];
+  while (stack.length) {
+    const { dir, depth } = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) { continue; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isFile() && e.name === basename) {
+        hits.push(full);
+      } else if (e.isDirectory() && depth < maxDepth) {
+        // Skip node_modules / .git to keep discovery quick on a dev machine
+        if (e.name === 'node_modules' || e.name === '.git') continue;
+        stack.push({ dir: full, depth: depth + 1 });
+      }
+    }
+  }
+  return hits;
+}
+
+// Probe for a CLI on $PATH. Returns { available, version } or null.
+// Uses PATHEXT-aware resolution on Windows; avoids invoking a shell.
+function _discoverProbeCli(name, versionArgs) {
+  const pathDirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  const exts = process.platform === 'win32'
+    ? ['.exe', '.cmd', '.bat', ''].concat(
+        (process.env.PATHEXT || '').split(';').map(s => s.toLowerCase()).filter(Boolean))
+    : [''];
+  let resolved = null;
+  for (const dir of pathDirs) {
+    for (const ext of exts) {
+      const candidate = path.join(dir, name + ext);
+      try {
+        const st = fs.statSync(candidate);
+        if (st.isFile()) { resolved = candidate; break; }
+      } catch (e) { /* not here */ }
+    }
+    if (resolved) break;
+  }
+  if (!resolved) return null;
+  let version = 'unknown';
+  try {
+    const out = execFileSync(resolved, versionArgs, {
+      encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+    }).trim();
+    const first = out.split('\n')[0] || '';
+    const m = first.match(/\d+(?:\.\d+)+[\w.-]*/);
+    if (m) version = m[0];
+    else if (first) version = first.slice(0, 80);
+  } catch (e) { /* tool present but version probe failed */ }
+  return { path: resolved, version };
+}
+
+// Given a plugin.json path, derive the enclosing plugin root (directory that
+// holds the `.claude-plugin` folder, or the cache subdirectory for manifests
+// placed at the plugin root).
+function _discoverPluginRoot(manifestPath) {
+  const parent = path.dirname(manifestPath);
+  if (path.basename(parent) === '.claude-plugin') return path.dirname(parent);
+  return parent;
+}
+
+// Split a SKILL.md path into { marketplace, plugin, skill } for clustering.
+// Accepts both user-skill and plugin-shipped skill locations.
+function _discoverSkillSource(skillPath, home) {
+  const norm = skillPath.replace(/\\/g, '/');
+  const homeNorm = (home || '').replace(/\\/g, '/');
+  if (homeNorm && norm.startsWith(homeNorm + '/.claude/skills/')) {
+    const rel = norm.slice((homeNorm + '/.claude/skills/').length);
+    const parts = rel.split('/');
+    // ~/.claude/skills/<name>/SKILL.md  OR  ~/.claude/skills/_archived-*/...
+    if (parts[0] && parts[0].startsWith('_archived')) {
+      return { source: 'archived', marketplace: null, plugin: parts[0], skill: parts[1] || parts[0] };
+    }
+    if (parts[0] === '.system') {
+      return { source: 'system', marketplace: null, plugin: '.system', skill: parts[1] || '.system' };
+    }
+    return { source: 'user-skills', marketplace: null, plugin: null, skill: parts[0] };
+  }
+  if (homeNorm && norm.startsWith(homeNorm + '/.claude/plugins/cache/')) {
+    const rel = norm.slice((homeNorm + '/.claude/plugins/cache/').length);
+    const parts = rel.split('/');
+    // cache/<marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md
+    const mkt = parts[0] || 'unknown';
+    const plug = parts[1] || 'unknown';
+    const skillsIdx = parts.indexOf('skills');
+    const skill = skillsIdx !== -1 ? (parts[skillsIdx + 1] || plug) : plug;
+    return { source: `plugin:${plug}`, marketplace: mkt, plugin: plug, skill };
+  }
+  return { source: 'other', marketplace: null, plugin: null, skill: path.basename(path.dirname(norm)) };
+}
+
+function discoverCapabilities(projectDir, claudeJsonPath, opts) {
+  const options = opts || {};
+  const expand = !!options.expand;
+  const timeBudgetMs = typeof options.timeBudgetMs === 'number' ? options.timeBudgetMs : 5000;
+  const clusterThreshold = typeof options.clusterThreshold === 'number' ? options.clusterThreshold : 50;
+  const homeOverride = options.homeOverride || null;
+  const skillRootsOverride = options.skillRoots || null;
+  const pluginCacheOverride = options.pluginCache || null;
+
+  const started = Date.now();
+  const warnings = [];
+  const caps = {
+    mcp_servers: {},
+    skills: {},
+    plugins: {},
+    discovered_at: new Date().toISOString(),
+  };
+
+  // Read MCP config: merge ~/.mcp.json and ~/.claude.json, prefer entries from
+  // the project-local files first (active project) then home (user default).
+  const home = homeOverride || process.env.HOME || process.env.USERPROFILE || '';
   const mcpPaths = [
     claudeJsonPath || path.join(projectDir, '.claude.json'),
     path.join(projectDir, '.mcp.json'),
   ];
-  // Also check home directory
-  const home = process.env.HOME || process.env.USERPROFILE || '';
-  if (home) mcpPaths.push(path.join(home, '.claude.json'));
+  if (home) {
+    mcpPaths.push(path.join(home, '.mcp.json'));
+    mcpPaths.push(path.join(home, '.claude.json'));
+  }
 
   for (const mcpPath of mcpPaths) {
     try {
       const data = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
-      if (data.mcpServers) {
+      if (data && data.mcpServers) {
         for (const [name, config] of Object.entries(data.mcpServers)) {
-          caps.mcp_servers[name] = { command: config.command, use_for: inferMcpUse(name) };
+          // Prefer first write (active project beats home default) but merge
+          // command / source so later callers can see where it came from.
+          if (!caps.mcp_servers[name]) {
+            caps.mcp_servers[name] = {
+              command: (config && config.command) || null,
+              use_for: inferMcpUse(name),
+              source: mcpPath,
+            };
+          }
         }
       }
     } catch (e) { /* file not found or invalid */ }
   }
 
-  // Read installed plugins (best-effort, internal path)
+  // Walk plugin manifests under ~/.claude/plugins/cache (depth ≤ 4 from cache).
+  // Manifests live either at <root>/plugin.json or <root>/.claude-plugin/plugin.json.
+  const pluginCache = pluginCacheOverride
+    || (home ? path.join(home, '.claude', 'plugins', 'cache') : null);
+  caps.plugins = {};
+  if (pluginCache) {
+    const manifests = _discoverWalk(pluginCache, 'plugin.json', 4);
+    for (const manifestPath of manifests) {
+      try {
+        const data = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        if (!data || !data.name) continue;
+        // Dedup on name+version; keep the first-seen path.
+        const key = data.version ? `${data.name}@${data.version}` : data.name;
+        if (caps.plugins[key]) continue;
+        caps.plugins[key] = {
+          name: data.name,
+          version: data.version || null,
+          description: data.description || null,
+          path: _discoverPluginRoot(manifestPath),
+        };
+      } catch (e) { /* malformed manifest */ }
+    }
+  }
+  // Preserve legacy installed_plugins.json entries if available so callers that
+  // read shape-specific fields keep working.
   try {
     const pluginsPath = path.join(home, '.claude', 'plugins', 'installed_plugins.json');
     const plugins = JSON.parse(fs.readFileSync(pluginsPath, 'utf8'));
     if (Array.isArray(plugins)) {
       for (const p of plugins) {
-        if (p.name) caps.plugins[p.name] = { scope: p.scope || 'user' };
+        if (p && p.name && !caps.plugins[p.name]) {
+          caps.plugins[p.name] = { name: p.name, scope: p.scope || 'user' };
+        }
       }
     }
   } catch (e) { /* best-effort */ }
 
-  // Discover CLI tools available on the system
-  const cliToolChecks = [
-    { name: 'gh', check: 'gh --version', use_for: 'GitHub PR/issue management, CI/CD, and API access' },
-    { name: 'vercel', check: 'vercel --version', use_for: 'deployment, preview URLs, and serverless functions' },
-    { name: 'stripe', check: 'stripe --version', use_for: 'payment testing, webhook simulation, and billing' },
-    { name: 'ffmpeg', check: 'ffmpeg -version', use_for: 'video/audio processing, transcoding, and rendering' },
-    { name: 'playwright', check: 'npx playwright --version', use_for: 'browser automation and E2E testing' },
-    { name: 'gws', check: 'gws --version', use_for: 'Google Workspace — Drive, Gmail, Calendar, Sheets, Docs' },
-    { name: 'notebooklm', check: 'python -m notebooklm --version', use_for: 'research with grounded citations from knowledge bases' },
-    { name: 'supabase', check: 'supabase --version', use_for: 'database, auth, edge functions, and realtime' },
-    { name: 'firebase', check: 'firebase --version', use_for: 'app hosting, auth, Firestore, and cloud functions' },
-    { name: 'docker', check: 'docker --version', use_for: 'container management and isolated environments' },
-    { name: 'wrangler', check: 'wrangler --version', use_for: 'Cloudflare Workers deployment and KV management' },
-    { name: 'graphify', check: 'graphify -h', use_for: 'codebase knowledge graphs for architecture-aware planning' },
+  // Walk skills from both ~/.claude/skills and plugin-shipped skills.
+  // Depth ≤ 4 per spec; parse YAML frontmatter for name + description.
+  const skillRoots = skillRootsOverride || [
+    home ? path.join(home, '.claude', 'skills') : null,
+    pluginCache,
+  ].filter(Boolean);
+
+  caps.skills = {};
+  caps.deprecated = {};
+  for (const root of skillRoots) {
+    const files = _discoverWalk(root, 'SKILL.md', 4);
+    for (const skillPath of files) {
+      try {
+        const raw = fs.readFileSync(skillPath, 'utf8');
+        const { data } = parseFrontmatter(raw);
+        const name = (data && data.name) || path.basename(path.dirname(skillPath));
+        const desc = (data && data.description) || '';
+        const src = _discoverSkillSource(skillPath, home);
+        const entry = {
+          name,
+          description: desc,
+          path: skillPath,
+          source: src.source,
+          plugin: src.plugin,
+        };
+        const key = src.plugin ? `${src.plugin}:${name}` : name;
+        // Deprecated: description begins with "Deprecated" (case-sensitive per spec).
+        if (/^Deprecated\b/.test(desc.trim())) {
+          entry.status = 'deprecated';
+          caps.deprecated[key] = entry;
+          continue;
+        }
+        if (src.source === 'archived') entry.status = 'archived';
+        if (!caps.skills[key]) caps.skills[key] = entry;
+      } catch (e) { /* unreadable SKILL.md */ }
+    }
+  }
+
+  // Probe $PATH for the declared allow-list. Keep the legacy cli_tools shape
+  // { available, use_for, version } so existing callers continue to work.
+  const cliAllowList = [
+    { name: 'node', args: ['--version'], use_for: 'JavaScript runtime for running tools and tests' },
+    { name: 'npm', args: ['--version'], use_for: 'Node.js package manager' },
+    { name: 'bun', args: ['--version'], use_for: 'fast JavaScript runtime and package manager' },
+    { name: 'git', args: ['--version'], use_for: 'version control and worktree management' },
+    { name: 'gh', args: ['--version'], use_for: 'GitHub PR/issue management, CI/CD, and API access' },
+    { name: 'playwright', args: ['--version'], use_for: 'browser automation and E2E testing' },
+    { name: 'stripe', args: ['--version'], use_for: 'payment testing, webhook simulation, and billing' },
+    { name: 'claude', args: ['--version'], use_for: 'Claude Code CLI for headless orchestration' },
+    { name: 'docker', args: ['--version'], use_for: 'container management and isolated environments' },
+    { name: 'psql', args: ['--version'], use_for: 'PostgreSQL client for database introspection and migrations' },
   ];
 
   caps.cli_tools = {};
-  for (const tool of cliToolChecks) {
-    try {
-      const output = execSync(tool.check, { stdio: 'pipe', timeout: 5000 }).toString().trim();
-      const version = output.split('\n')[0].replace(/^[^0-9]*/, '').trim();
-      caps.cli_tools[tool.name] = { available: true, use_for: tool.use_for, version: version || 'unknown' };
-    } catch (e) { /* tool not installed — skip */ }
+  for (const tool of cliAllowList) {
+    const probe = _discoverProbeCli(tool.name, tool.args);
+    if (probe) {
+      caps.cli_tools[tool.name] = {
+        available: true,
+        use_for: tool.use_for,
+        version: probe.version,
+        path: probe.path,
+      };
+    }
   }
 
   // Discover CLI-Anything generated CLIs (cli-anything-*)
@@ -2077,57 +3221,138 @@ function discoverCapabilities(projectDir, claudeJsonPath) {
 
   // Detect Codex CLI and plugin availability
   caps.codex = { available: false, reason: 'not checked' };
-  try {
-    // Check Codex CLI
-    let codexVersion = null;
+  codex_block: {
     try {
-      codexVersion = execFileSync('codex', ['--version'], {
-        encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
-      }).trim();
-    } catch (e) {
-      caps.codex = { available: false, reason: 'Codex CLI not installed' };
-      return caps;
-    }
-
-    // Check codex-companion.mjs in plugin cache
-    let pluginRoot = null;
-    const pluginSearchPaths = [
-      path.join(home, '.claude', 'plugins', 'cache', 'openai-codex'),
-      path.join(home, '.claude', 'plugins', 'marketplaces', 'openai-codex'),
-    ];
-    for (const searchPath of pluginSearchPaths) {
+      // Check Codex CLI
+      let codexVersion = null;
       try {
-        const walkDir = (dir, depth) => {
-          if (depth > 3) return null;
-          const entries = fs.readdirSync(dir, { withFileTypes: true });
-          for (const e of entries) {
-            if (e.name === 'codex-companion.mjs') return dir;
-            if (e.isDirectory()) {
-              const found = walkDir(path.join(dir, e.name), depth + 1);
-              if (found) return found;
-            }
-          }
-          return null;
-        };
-        const found = walkDir(searchPath, 0);
-        if (found) { pluginRoot = found; break; }
-      } catch (e) { /* path not found */ }
-    }
+        codexVersion = execFileSync('codex', ['--version'], {
+          encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
+        }).trim();
+      } catch (e) {
+        caps.codex = { available: false, reason: 'Codex CLI not installed' };
+        break codex_block;
+      }
 
-    if (!pluginRoot) {
-      caps.codex = { available: false, version: codexVersion, reason: 'Codex plugin not installed' };
-    } else {
-      caps.codex = {
-        available: true,
-        version: codexVersion,
-        pluginRoot,
-        companionPath: path.join(pluginRoot, 'codex-companion.mjs'),
-        reason: null
-      };
+      // Check codex-companion.mjs in plugin cache
+      let pluginRoot = null;
+      const pluginSearchPaths = [
+        path.join(home, '.claude', 'plugins', 'cache', 'openai-codex'),
+        path.join(home, '.claude', 'plugins', 'marketplaces', 'openai-codex'),
+      ];
+      for (const searchPath of pluginSearchPaths) {
+        try {
+          const walkDir = (dir, depth) => {
+            if (depth > 3) return null;
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const e of entries) {
+              if (e.name === 'codex-companion.mjs') return dir;
+              if (e.isDirectory()) {
+                const found = walkDir(path.join(dir, e.name), depth + 1);
+                if (found) return found;
+              }
+            }
+            return null;
+          };
+          const found = walkDir(searchPath, 0);
+          if (found) { pluginRoot = found; break; }
+        } catch (e) { /* path not found */ }
+      }
+
+      if (!pluginRoot) {
+        caps.codex = { available: false, version: codexVersion, reason: 'Codex plugin not installed' };
+      } else {
+        caps.codex = {
+          available: true,
+          version: codexVersion,
+          pluginRoot,
+          companionPath: path.join(pluginRoot, 'codex-companion.mjs'),
+          reason: null
+        };
+      }
+    } catch (e) {
+      caps.codex = { available: false, reason: 'Detection failed: ' + e.message };
     }
-  } catch (e) {
-    caps.codex = { available: false, reason: 'Detection failed: ' + e.message };
   }
+
+  // ── Sandbox affordances (R010 AC3) ────────────────────────────────────────
+  // Reports what the sandbox CAN do so specs decide feasibility before
+  // planning. 1 s ceiling on the network probe keeps discover fast.
+  try {
+    const { probeSandbox } = require('./forge-dev-server.cjs');
+    caps.sandbox = probeSandbox(caps, { networkTimeoutMs: 1000 });
+  } catch (e) {
+    caps.sandbox = { browser: false, spawn: false, network: false, error: e.message };
+  }
+
+  // ── Clustering + profile tail (R002 AC3, AC4) ─────────────────────────────
+  // When skills + plugins > clusterThreshold (default 50) and caller did not
+  // request --expand, emit clustered counts by source instead of inlining
+  // every entry. `skills_full` / `plugins_full` stay available under `--expand`.
+  const skillEntries = Object.entries(caps.skills);
+  const pluginEntries = Object.entries(caps.plugins);
+  const totalBulk = skillEntries.length + pluginEntries.length;
+  const clustersNeeded = totalBulk > clusterThreshold && !expand;
+
+  if (clustersNeeded) {
+    const skillClusters = {};
+    for (const [key, entry] of skillEntries) {
+      const src = entry.source || 'other';
+      if (!skillClusters[src]) skillClusters[src] = { count: 0, sample: [] };
+      skillClusters[src].count += 1;
+      if (skillClusters[src].sample.length < 5) skillClusters[src].sample.push(entry.name);
+    }
+    const pluginClusters = {};
+    for (const [key, entry] of pluginEntries) {
+      // Cluster plugins by marketplace segment in path, falling back to 'unknown'.
+      let mkt = 'unknown';
+      if (entry.path) {
+        const norm = entry.path.replace(/\\/g, '/');
+        const m = norm.match(/\/plugins\/cache\/([^/]+)\//);
+        if (m) mkt = m[1];
+      }
+      if (!pluginClusters[mkt]) pluginClusters[mkt] = { count: 0, sample: [] };
+      pluginClusters[mkt].count += 1;
+      if (pluginClusters[mkt].sample.length < 5) pluginClusters[mkt].sample.push(entry.name);
+    }
+    caps.clustered = true;
+    caps.clusters = { skills: skillClusters, plugins: pluginClusters };
+    caps.totals = {
+      skills: skillEntries.length,
+      plugins: pluginEntries.length,
+      deprecated: Object.keys(caps.deprecated).length,
+      mcp_servers: Object.keys(caps.mcp_servers).length,
+      cli_tools: Object.keys(caps.cli_tools).length,
+    };
+    // Replace the verbose skills + plugins maps with empty objects so the
+    // default output stays readable; full tree is available via --expand.
+    caps.skills = {};
+    caps.plugins = {};
+  } else {
+    caps.clustered = false;
+    caps.totals = {
+      skills: skillEntries.length,
+      plugins: pluginEntries.length,
+      deprecated: Object.keys(caps.deprecated).length,
+      mcp_servers: Object.keys(caps.mcp_servers).length,
+      cli_tools: Object.keys(caps.cli_tools).length,
+    };
+  }
+
+  const elapsed = Date.now() - started;
+  if (elapsed > timeBudgetMs) {
+    warnings.push({
+      code: 'DISCOVER_TIMEOUT',
+      message: `discovery exceeded time budget (${elapsed}ms > ${timeBudgetMs}ms); partial results returned`,
+    });
+  }
+  caps.meta = {
+    completed_in_ms: elapsed,
+    time_budget_ms: timeBudgetMs,
+    aborted: elapsed > timeBudgetMs,
+    warnings,
+    expand,
+  };
 
   return caps;
 }
@@ -3940,6 +5165,465 @@ function _formatRecoveryReport(report) {
   return lines.join('\n');
 }
 
+// === T008 / R014: execute-run transcripts =================================
+//
+// Every agent invocation inside `/forge:execute` appends a single JSON line
+// to `.forge/history/cycles/<cycleId>/transcript.jsonl`. `/forge:review-branch`
+// later cross-checks these lines against the commits on the branch.
+//
+// Design invariants (R014 acceptance criteria):
+//   - Per-entry lines contain NO timestamp so a deterministic mock run produces
+//     byte-identical output across repeats.
+//   - Exactly one `{ "phase": "boundary", "at": "<iso>" }` line is emitted
+//     per phase transition (detected by comparing `entry.phase` to the last
+//     non-boundary entry in the file). Boundary lines are the only place `at`
+//     appears; the rest of the file diffs cleanly across runs.
+//   - Keys are serialized in a fixed order so `JSON.stringify`'s key-insertion
+//     semantics do not produce noisy diffs.
+//   - The cycle directory is created on demand.
+//
+// Callers:
+//   - hooks/stop-hook.sh on every iteration (route-decision snapshot)
+//   - executor agents via `node scripts/forge-tools.cjs transcript-append ...`
+//   - any internal routing code that wants to record an agent hand-off
+
+const _TRANSCRIPT_ENTRY_KEY_ORDER = [
+  'phase', 'agent', 'task_id', 'tool_calls_count',
+  'duration_ms', 'status', 'summary'
+];
+const _TRANSCRIPT_BOUNDARY_KEY_ORDER = ['phase', 'at'];
+
+function _transcriptCycleDir(forgeDir, cycleId) {
+  if (!cycleId || typeof cycleId !== 'string') {
+    throw new Error('appendTranscript: cycleId is required');
+  }
+  // Defend against path traversal in the cycleId. The historical cycle
+  // naming scheme is timestamp-y (e.g. "20260420T1730") or a simple tag;
+  // anything with a path separator is rejected.
+  if (/[\\/]/.test(cycleId) || cycleId === '.' || cycleId === '..') {
+    throw new Error('appendTranscript: invalid cycleId');
+  }
+  return path.join(forgeDir, 'history', 'cycles', cycleId);
+}
+
+function _transcriptPath(forgeDir, cycleId) {
+  return path.join(_transcriptCycleDir(forgeDir, cycleId), 'transcript.jsonl');
+}
+
+// Serialize an object with a deterministic key order. Entry keys appear in
+// the same order every run so JSONL files diff cleanly.
+function _serializeTranscriptEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    throw new Error('appendTranscript: entry must be an object');
+  }
+  const isBoundary = entry.phase === 'boundary';
+  const order = isBoundary ? _TRANSCRIPT_BOUNDARY_KEY_ORDER : _TRANSCRIPT_ENTRY_KEY_ORDER;
+  const out = {};
+  for (const key of order) {
+    if (Object.prototype.hasOwnProperty.call(entry, key)) {
+      out[key] = entry[key];
+    }
+  }
+  // Any extra keys the caller supplied land after the canonical keys in
+  // sorted order so their appearance is also deterministic.
+  const extras = Object.keys(entry).filter((k) => !order.includes(k)).sort();
+  for (const key of extras) out[key] = entry[key];
+  return JSON.stringify(out);
+}
+
+// Read the last non-boundary entry's phase from an existing transcript. Used
+// to decide whether to emit a boundary line before the next entry. Returns
+// `null` for an empty/missing file.
+function _lastTranscriptPhase(filePath) {
+  let text;
+  try { text = fs.readFileSync(filePath, 'utf8'); }
+  catch (_) { return null; }
+  if (!text) return null;
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (obj && obj.phase && obj.phase !== 'boundary') return obj.phase;
+    } catch (_) { /* skip malformed line */ }
+  }
+  return null;
+}
+
+// Append a transcript entry. If the caller supplies `{ phase: "boundary", at }`
+// directly, it is written verbatim (caller owns timestamp). Otherwise, if the
+// entry's phase differs from the last entry's phase, a boundary line is
+// synthesised first using `opts.now` (defaults to `new Date().toISOString()`).
+// The cycle directory is created on demand.
+//
+// Returns an object describing what was written:
+//   { path, boundaryWritten: bool, entryWritten: bool }
+function appendTranscript(forgeDir, cycleId, entry, opts) {
+  opts = opts || {};
+  const cycleDir = _transcriptCycleDir(forgeDir, cycleId);
+  if (!fs.existsSync(cycleDir)) {
+    fs.mkdirSync(cycleDir, { recursive: true });
+  }
+  const filePath = path.join(cycleDir, 'transcript.jsonl');
+
+  const result = { path: filePath, boundaryWritten: false, entryWritten: false };
+
+  if (entry && entry.phase === 'boundary') {
+    // Caller-owned boundary line. Require `at`.
+    if (!entry.at || typeof entry.at !== 'string') {
+      throw new Error('appendTranscript: boundary entry must include "at"');
+    }
+    fs.appendFileSync(filePath, _serializeTranscriptEntry(entry) + '\n');
+    result.boundaryWritten = true;
+    return result;
+  }
+
+  // Regular entry. Reject explicit timestamps on per-entry lines so a
+  // misbehaving caller cannot poison deterministic diffs.
+  if (entry && typeof entry === 'object' && 'at' in entry) {
+    throw new Error('appendTranscript: non-boundary entries must not include "at"');
+  }
+  if (!entry || !entry.phase || typeof entry.phase !== 'string') {
+    throw new Error('appendTranscript: entry.phase is required');
+  }
+
+  const lastPhase = _lastTranscriptPhase(filePath);
+  if (lastPhase !== entry.phase) {
+    const boundary = {
+      phase: 'boundary',
+      at: opts.now || new Date().toISOString()
+    };
+    fs.appendFileSync(filePath, _serializeTranscriptEntry(boundary) + '\n');
+    result.boundaryWritten = true;
+  }
+
+  fs.appendFileSync(filePath, _serializeTranscriptEntry(entry) + '\n');
+  result.entryWritten = true;
+  return result;
+}
+
+// Read a transcript file and return { entries: [...], boundaries: [...] }.
+// Non-JSON lines are silently skipped.
+function readTranscript(forgeDir, cycleId) {
+  const filePath = _transcriptPath(forgeDir, cycleId);
+  const out = { path: filePath, entries: [], boundaries: [] };
+  let text;
+  try { text = fs.readFileSync(filePath, 'utf8'); }
+  catch (_) { return out; }
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    let obj;
+    try { obj = JSON.parse(line); } catch (_) { continue; }
+    if (obj && obj.phase === 'boundary') out.boundaries.push(obj);
+    else if (obj) out.entries.push(obj);
+  }
+  return out;
+}
+
+// ======================================================================
+// T017 / R009 — Completion promise gates
+//
+// `<promise>FORGE_COMPLETE</promise>` must gate on four independent
+// conditions before firing. If any gate fails, the loop must emit
+// `<promise>FORGE_BLOCKED</promise>` with a structured `reasons:` JSON
+// payload inline so downstream consumers (collab participants, the
+// review-branch command, the TUI dashboard) can discriminate rather than
+// treat all non-COMPLETE exits as identical.
+//
+// The four gates:
+//   tasks    — every task id in the frontier/registry is DONE or
+//              DONE_WITH_CONCERNS (the guard from R008 already enforces
+//              this on state.md writes, but the completion promise check
+//              is belt-and-braces and also runs when the agent bypasses
+//              writeState).
+//   visual   — every [visual] AC has status `pass`. Visual AC status is
+//              sourced from `.forge/completion-gates.json` first (the
+//              authoritative file written by T020's visual verifier once
+//              that lands), falling back to per-task progress files at
+//              `.forge/progress/<task-id>.json` where an agent can record
+//              `{visual_acs: [{id, status, detail}]}` inline.
+//   nonvisual — every non-visual AC that the agent has reported. Absence
+//              of data here is not a failure (structural tests are the
+//              traditional non-visual signal and they already gate at the
+//              task level). This gate only fails when the agent or a
+//              verifier has explicitly recorded `fail`/`blocked` for a
+//              non-visual AC.
+//   flags    — zero open collab flags in `.forge/collab/flags/*.md`. A
+//              flag with `status: open` means a forward-motion decision
+//              is still awaiting human review; shipping COMPLETE on top
+//              of an open flag would be the same class of silent-pass
+//              bug as the blurry-graph case R009 exists to fix.
+//
+// Return shape is stable for both contract tests and the JSON payload
+// inlined in FORGE_BLOCKED:
+//   {
+//     complete: boolean,
+//     gates: { tasks, visual, nonvisual, flags },  // each true | false
+//     reasons: [{ gate, ac?, task?, detail }]
+//   }
+// `reasons` is empty iff `complete === true`.
+// ======================================================================
+
+// Statuses that count as "task done" per R008 (both the internal
+// lowercase registry form and the status-report UPPERCASE form the
+// forge-executor agent emits are accepted).
+const _COMPLETION_TASK_DONE_STATUSES = new Set([
+  'complete', 'complete_with_concerns',
+  'DONE', 'DONE_WITH_CONCERNS'
+]);
+
+// AC pass statuses. Accepts both cases so the visual verifier and the
+// agent self-reports can use whatever convention they prefer.
+const _COMPLETION_AC_PASS_STATUSES = new Set(['pass', 'PASS']);
+
+// Walk every frontier file in .forge/plans/ and collect task ids. The
+// registry may grow beyond the frontier (sub-tasks from redecomposition,
+// legacy entries), so the authoritative "tasks we must check" set is
+// frontier ∪ registry. That way a frontier-declared task missing from
+// the registry is still flagged.
+function _completionGatesCollectTaskIds(forgeDir) {
+  const ids = new Set();
+  const plansDir = path.join(forgeDir, 'plans');
+  try {
+    const files = fs.readdirSync(plansDir).filter(f => f.endsWith('-frontier.md'));
+    for (const f of files) {
+      let text;
+      try { text = fs.readFileSync(path.join(plansDir, f), 'utf8'); }
+      catch (_) { continue; }
+      const tasks = parseFrontier(text);
+      for (const t of tasks) if (t && t.id) ids.add(t.id);
+    }
+  } catch (_) { /* no plans dir -> fall back to registry only */ }
+  return ids;
+}
+
+// Read the authoritative completion-gates JSON if present. Shape:
+//   {
+//     visual:    [{ id, task_id?, path?, status, detail? }, ...],
+//     nonvisual: [{ id, task_id?, status, detail? }, ...]
+//   }
+// Missing file is not an error; returns null and the caller falls back
+// to progress/*.json scanning.
+function _readCompletionGatesFile(forgeDir) {
+  const p = path.join(forgeDir, 'completion-gates.json');
+  try {
+    const obj = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!obj || typeof obj !== 'object') return null;
+    return {
+      visual: Array.isArray(obj.visual) ? obj.visual : [],
+      nonvisual: Array.isArray(obj.nonvisual) ? obj.nonvisual : []
+    };
+  } catch (_) { return null; }
+}
+
+// Scan progress/*.json for embedded AC records. Agents may record an
+// inline `visual_acs` or `nonvisual_acs` array on their progress file so
+// completion gates can see per-task self-reports even before T020's
+// dedicated file lands. Return value mirrors the completion-gates.json
+// shape.
+function _scanProgressForAcs(forgeDir) {
+  const out = { visual: [], nonvisual: [] };
+  const dir = path.join(forgeDir, 'progress');
+  let files;
+  try { files = fs.readdirSync(dir).filter(f => f.endsWith('.json')); }
+  catch (_) { return out; }
+  for (const f of files) {
+    let obj;
+    try { obj = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); }
+    catch (_) { continue; }
+    if (!obj || typeof obj !== 'object') continue;
+    const taskId = obj.task_id || f.replace(/\.json$/, '');
+    if (Array.isArray(obj.visual_acs)) {
+      for (const ac of obj.visual_acs) {
+        if (ac && typeof ac === 'object') {
+          out.visual.push(Object.assign({ task_id: taskId }, ac));
+        }
+      }
+    }
+    if (Array.isArray(obj.nonvisual_acs)) {
+      for (const ac of obj.nonvisual_acs) {
+        if (ac && typeof ac === 'object') {
+          out.nonvisual.push(Object.assign({ task_id: taskId }, ac));
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Count open collab flags. Opts.collabDir override supports tests that
+// seed fixtures outside the default `<forgeDir>/collab` location.
+function _countOpenCollabFlags(forgeDir, opts) {
+  const collabDir = (opts && opts.collabDir) || path.join(forgeDir, 'collab');
+  const flagsDir = path.join(collabDir, 'flags');
+  let files;
+  try { files = fs.readdirSync(flagsDir).filter(f => f.endsWith('.md')); }
+  catch (_) { return { open: 0, openFlags: [] }; }
+  const openFlags = [];
+  for (const f of files) {
+    let text;
+    try { text = fs.readFileSync(path.join(flagsDir, f), 'utf8'); }
+    catch (_) { continue; }
+    // Match the flag frontmatter emitted by forge-collab.cjs: a
+    // `status: open` line inside the leading `---` block.
+    const m = text.match(/^---\n([\s\S]*?)\n---/);
+    if (!m) continue;
+    const statusLine = m[1].split('\n').find(l => /^status:\s*/.test(l));
+    if (!statusLine) continue;
+    const status = statusLine.replace(/^status:\s*/, '').trim();
+    if (status === 'open') {
+      // Extract id and task_id for the reasons payload so humans can
+      // jump straight to the flag without grepping.
+      const idMatch = m[1].match(/^id:\s*(.+)$/m);
+      const taskMatch = m[1].match(/^task_id:\s*(.+)$/m);
+      openFlags.push({
+        id: idMatch ? idMatch[1].trim() : f.replace(/\.md$/, ''),
+        task_id: taskMatch ? taskMatch[1].trim() : null,
+        path: path.join(flagsDir, f)
+      });
+    }
+  }
+  return { open: openFlags.length, openFlags };
+}
+
+/**
+ * Evaluate the four completion gates. Pure read-only — safe to call
+ * anywhere, including inside the stop hook before deciding whether to
+ * let a FORGE_COMPLETE emission through.
+ *
+ * opts:
+ *   collabDir           override `<forgeDir>/collab` (tests).
+ *   gatesFile           override `<forgeDir>/completion-gates.json` (tests).
+ *   requireTaskRegistry when true (default), an empty registry fails the
+ *                       tasks gate with reason "no_tasks_registered". When
+ *                       false (used by the setup-state path) an empty
+ *                       registry passes — we do not want to block a fresh
+ *                       project from ever firing a completion event.
+ */
+function checkCompletionGates(forgeDir, opts) {
+  opts = opts || {};
+  const reasons = [];
+  const gates = { tasks: true, visual: true, nonvisual: true, flags: true };
+
+  // --- Gate: tasks --------------------------------------------------------
+  const registry = readTaskRegistry(forgeDir);
+  const frontierIds = _completionGatesCollectTaskIds(forgeDir);
+  const registryIds = new Set(Object.keys(registry.tasks || {}));
+  const allIds = new Set([...frontierIds, ...registryIds]);
+
+  if (allIds.size === 0 && opts.requireTaskRegistry !== false) {
+    gates.tasks = false;
+    reasons.push({ gate: 'tasks', detail: 'no tasks registered; frontier and task-status.json both empty' });
+  } else {
+    for (const id of allIds) {
+      const entry = registry.tasks[id];
+      if (!entry) {
+        gates.tasks = false;
+        reasons.push({
+          gate: 'tasks', task: id,
+          detail: `task ${id} is in the frontier but has no registry entry`
+        });
+        continue;
+      }
+      if (!_COMPLETION_TASK_DONE_STATUSES.has(entry.status)) {
+        gates.tasks = false;
+        reasons.push({
+          gate: 'tasks', task: id,
+          detail: `task ${id} status=${entry.status} (expected DONE or DONE_WITH_CONCERNS)`
+        });
+      }
+    }
+  }
+
+  // --- Gates: visual + nonvisual ------------------------------------------
+  // Prefer the authoritative completion-gates.json when present; fall
+  // back to scanning per-task progress files. When both are present the
+  // authoritative file wins (tests assert this).
+  let acSource = null;
+  if (opts.gatesFile) {
+    try { acSource = JSON.parse(fs.readFileSync(opts.gatesFile, 'utf8')); }
+    catch (_) { acSource = null; }
+  }
+  if (!acSource) acSource = _readCompletionGatesFile(forgeDir);
+  if (!acSource) acSource = _scanProgressForAcs(forgeDir);
+  const visualAcs = Array.isArray(acSource.visual) ? acSource.visual : [];
+  const nonvisualAcs = Array.isArray(acSource.nonvisual) ? acSource.nonvisual : [];
+
+  for (const ac of visualAcs) {
+    if (!ac || !_COMPLETION_AC_PASS_STATUSES.has(ac.status)) {
+      gates.visual = false;
+      reasons.push({
+        gate: 'visual',
+        ac: ac && ac.id ? ac.id : '(unknown)',
+        task: ac && ac.task_id ? ac.task_id : undefined,
+        detail: ac && ac.detail
+          ? String(ac.detail)
+          : `visual AC ${ac && ac.id ? ac.id : '(unknown)'} status=${ac ? ac.status : 'missing'}`
+      });
+    }
+  }
+
+  for (const ac of nonvisualAcs) {
+    if (!ac || !_COMPLETION_AC_PASS_STATUSES.has(ac.status)) {
+      gates.nonvisual = false;
+      reasons.push({
+        gate: 'nonvisual',
+        ac: ac && ac.id ? ac.id : '(unknown)',
+        task: ac && ac.task_id ? ac.task_id : undefined,
+        detail: ac && ac.detail
+          ? String(ac.detail)
+          : `non-visual AC ${ac && ac.id ? ac.id : '(unknown)'} status=${ac ? ac.status : 'missing'}`
+      });
+    }
+  }
+
+  // --- Gate: flags --------------------------------------------------------
+  const flagResult = _countOpenCollabFlags(forgeDir, opts);
+  if (flagResult.open > 0) {
+    gates.flags = false;
+    for (const flag of flagResult.openFlags) {
+      reasons.push({
+        gate: 'flags',
+        flag: flag.id,
+        task: flag.task_id || undefined,
+        detail: `collab flag ${flag.id} is still open (${flag.path})`
+      });
+    }
+  }
+
+  const complete = gates.tasks && gates.visual && gates.nonvisual && gates.flags;
+  return { complete, gates, reasons };
+}
+
+/**
+ * Build the wire form of the completion promise, gated on the four
+ * completion gates (T017 / R009 AC2).
+ *
+ * When gates pass: returns `<promise>FORGE_COMPLETE</promise>\n`.
+ * When any gate fails: returns
+ *   `<promise>FORGE_BLOCKED</promise>\n{"reasons":[...]}\n`
+ * with the reasons JSON inlined on the next line so humans and tooling
+ * can discriminate why the loop did not complete without re-running the
+ * check. `opts` is forwarded to `checkCompletionGates`.
+ *
+ * Return shape:
+ *   { emission: string, result: { complete, gates, reasons } }
+ * so callers can both write the wire form and inspect the underlying
+ * gate state in a single call.
+ */
+function emitCompletionPromise(forgeDir, opts) {
+  const result = checkCompletionGates(forgeDir, opts || {});
+  let emission;
+  if (result.complete) {
+    emission = '<promise>FORGE_COMPLETE</promise>\n';
+  } else {
+    emission = '<promise>FORGE_BLOCKED</promise>\n'
+      + JSON.stringify({ reasons: result.reasons }) + '\n';
+  }
+  return { emission, result };
+}
+
 // === CLI Entry Point ===
 
 if (require.main === module) {
@@ -3963,9 +5647,94 @@ if (require.main === module) {
 
   if (command === 'discover') {
     const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
-    const caps = discoverCapabilities(path.dirname(forgeDir));
+    const expand = args.includes('--expand');
+    const caps = discoverCapabilities(path.dirname(forgeDir), null, { expand });
     fs.writeFileSync(path.join(forgeDir, 'capabilities.json'), JSON.stringify(caps, null, 2));
     process.stdout.write(JSON.stringify(caps, null, 2));
+  }
+
+  // === Sandbox dev-server lifecycle (T016 / R010) ===
+  // Usage:
+  //   forge-tools dev-server --forge-dir .forge --action start
+  //       -> JSON: { pid, state: "ready"|"timeout"|"missing_config" }
+  //   forge-tools dev-server --forge-dir .forge --action stop --pid 1234
+  //       -> JSON: { killed: boolean, signal: "SIGTERM"|"SIGKILL"|"taskkill"|null }
+  if (command === 'dev-server') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const action = args.find((a, i) => args[i - 1] === '--action') || '';
+    const pidArg = args.find((a, i) => args[i - 1] === '--pid');
+    const { startDevServer, stopDevServer } = require('./forge-dev-server.cjs');
+    (async () => {
+      if (action === 'start') {
+        const res = await startDevServer(forgeDir, {});
+        process.stdout.write(JSON.stringify(res));
+      } else if (action === 'stop') {
+        const pid = pidArg ? parseInt(pidArg, 10) : null;
+        if (!pid) {
+          process.stderr.write('dev-server stop: --pid required\n');
+          process.exit(2);
+        }
+        const res = await stopDevServer(pid, {});
+        process.stdout.write(JSON.stringify(res));
+      } else {
+        process.stderr.write('dev-server: --action start|stop required\n');
+        process.exit(2);
+      }
+    })().catch((err) => {
+      process.stderr.write('dev-server error: ' + (err && err.message || err) + '\n');
+      process.exit(1);
+    });
+  }
+
+  // === T020 / R007: visual verifier CLI shell ===
+  // Two sub-actions:
+  //   visual-verify --forge-dir .forge --spec <path> [--task-id T020] [--spec-id <id>]
+  //       -> run the verifier (no bridges = all ACs land as "pending",
+  //          intended shape for agents that will fill in per-AC). Honors
+  //          FORGE_DISABLE_PLAYWRIGHT=1 via the env layer.
+  //
+  //   visual-verify parse --spec <path>
+  //       -> JSON-dump the parsed [visual] AC list without side effects.
+  //          Used by the agent to decide which ACs it needs to drive.
+  //
+  // Exit codes: 0 success; 1 usage error; 2 internal error.
+  if (command === 'visual-verify') {
+    const sub = args[1];
+    const specArg = args.find((a, i) => args[i - 1] === '--spec') || '';
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const taskId = args.find((a, i) => args[i - 1] === '--task-id') || 'visual-verify';
+    const specIdArg = args.find((a, i) => args[i - 1] === '--spec-id');
+
+    if (sub === 'parse') {
+      if (!specArg) {
+        process.stderr.write('visual-verify parse: --spec required\n');
+        process.exit(1);
+      }
+      const list = parseVisualAcs(specArg);
+      process.stdout.write(JSON.stringify(list, null, 2) + '\n');
+    } else {
+      // Default: run the verifier in metadata-only mode (no bridges).
+      if (!specArg) {
+        process.stderr.write('visual-verify: --spec required\n');
+        process.exit(1);
+      }
+      (async () => {
+        try {
+          const result = await runVisualVerifier(forgeDir, {
+            specPath: specArg,
+            taskId,
+            specId: specIdArg
+          });
+          // Strip the progress object from stdout (tests read it from the
+          // file). Keep status/capability/acs for the agent.
+          const { progress, ...pub } = result;
+          process.stdout.write(JSON.stringify(pub, null, 2) + '\n');
+        } catch (err) {
+          process.stderr.write('visual-verify error: ' + (err && err.message || err) + '\n');
+          process.exit(2);
+        }
+      })();
+    }
   }
 
   // === Spec approval validation ===
@@ -4028,6 +5797,11 @@ if (require.main === module) {
     const maxIter = args.find((a, i) => args[i - 1] === '--max-iterations') || '100';
     const budget = args.find((a, i) => args[i - 1] === '--token-budget') || '500000';
     const promise = args.find((a, i) => args[i - 1] === '--completion-promise') || 'FORGE_COMPLETE';
+    // T016 / R010 AC4: `--record-baselines` marks the run as the
+    // first-successful-visual-AC path so T020's visual verifier writes
+    // baselines instead of comparing. Setup-state only lands the flag in
+    // state.md frontmatter; the verifier (T020) consumes it.
+    const recordBaselines = args.includes('--record-baselines');
 
     // === WORKFLOW GATE: Validate specs are approved and frontiers exist ===
     const workflowErrors = validateWorkflowPrerequisites(forgeDir);
@@ -4062,18 +5836,44 @@ if (require.main === module) {
     state.data.tokens_used = 0;
     state.data.review_iterations = 0;
     state.data.debug_attempts = 0;
-    writeState(forgeDir, state.data, state.content);
 
     // Fix #4: Initialize task registry from all frontier files
+    let firstTaskId = null;
     try {
       const plans = fs.readdirSync(path.join(forgeDir, 'plans')).filter(f => f.endsWith('-frontier.md'));
       const allTasks = [];
+      const perSpecTasks = {};
       for (const plan of plans) {
         const text = fs.readFileSync(path.join(forgeDir, 'plans', plan), 'utf8');
-        allTasks.push(...parseFrontier(text));
+        const tasks = parseFrontier(text);
+        allTasks.push(...tasks);
+        // Remember the first task id for the active spec so ingest lands on T001.
+        // Spec-plan naming is `<spec>-frontier.md` (see writeState R008 guard).
+        const specKey = plan.replace(/-frontier\.md$/, '');
+        perSpecTasks[specKey] = tasks;
       }
       initTaskRegistry(forgeDir, allTasks);
+      if (spec && perSpecTasks[spec] && perSpecTasks[spec].length > 0) {
+        firstTaskId = perSpecTasks[spec][0].id;
+      } else if (allTasks.length > 0) {
+        firstTaskId = allTasks[0].id;
+      }
     } catch (e) { /* no plans yet */ }
+
+    // T009 / R008: Setup-state hardening.
+    // Unconditionally land `task_status=pending`, `current_task=<first>`,
+    // `completed_tasks=[]` regardless of whatever frontmatter the inbound
+    // state.md happens to carry. This closes the graph-visual-quality
+    // "fresh spec ships with task_status: complete" trap by making the
+    // ingest path authoritative for these three fields.
+    state.data.task_status = 'pending';
+    state.data.current_task = firstTaskId || 'T001';
+    state.data.completed_tasks = [];
+    state.data.blocked_reason = null;
+    if (recordBaselines) {
+      state.data.record_baselines = true;
+    }
+    writeState(forgeDir, state.data, state.content);
 
     // Clear progress history for fresh start
     try { fs.unlinkSync(path.join(forgeDir, '.progress-history.json')); } catch (e) {}
@@ -4356,15 +6156,32 @@ if (require.main === module) {
   }
 
   // === Collab CLI bridges (T013 integration follow-up) =====================
-  // Executor agent shells out to these subcommands when `.forge/collab/
-  // participant.json` is present. They wrap primitives in scripts/forge-collab.cjs
-  // so the agent never has to JSON-encode payloads by hand.
+  // Executor agent shells out to these subcommands when collab mode is on.
+  // They wrap primitives in scripts/forge-collab.cjs so the agent never has
+  // to JSON-encode payloads by hand.
 
+  // T028/R008: collab-mode detection now checks the explicit `.enabled`
+  // marker, not `participant.json`. Forward-compat for existing sessions:
+  // if `participant.json` is present but `.enabled` is not (pre-T028 session
+  // carried across the upgrade), we silently write `.enabled` so the CLI
+  // keeps working without forcing the user to /forge:collaborate leave first.
   if (command === 'collab-mode-active') {
     const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
-    const flag = fs.existsSync(path.join(forgeDir, 'collab', 'participant.json'));
-    process.stdout.write(flag ? 'true\n' : 'false\n');
-    process.exit(flag ? 0 : 1);
+    const enabledPath = path.join(forgeDir, 'collab', '.enabled');
+    const participantPath = path.join(forgeDir, 'collab', 'participant.json');
+    let enabled = fs.existsSync(enabledPath);
+    if (!enabled && fs.existsSync(participantPath)) {
+      // Silent forward-compat migration: upgrade a pre-T028 session by
+      // dropping the marker now. Keeps `/forge:collaborate` usable without
+      // requiring the user to leave + restart.
+      try {
+        fs.mkdirSync(path.dirname(enabledPath), { recursive: true });
+        fs.writeFileSync(enabledPath, '');
+        enabled = true;
+      } catch (_) { /* best-effort; treat as off if we cannot write */ }
+    }
+    process.stdout.write(enabled ? 'true\n' : 'false\n');
+    process.exit(enabled ? 0 : 1);
   }
 
   if (command === 'collab-flag-decision') {
@@ -4412,6 +6229,616 @@ if (require.main === module) {
         process.exit(1);
       }
     })();
+  }
+
+  // T008/R014: append a line to the execute-run transcript. Shell callers
+  // (notably hooks/stop-hook.sh and the forge-executor agent) use this
+  // subcommand so they do not have to reimplement the boundary-line logic.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs transcript-append \
+  //     --forge-dir .forge \
+  //     --cycle <cycleId> \
+  //     --entry '<json>'
+  //
+  // The --entry payload is a JSON object with at minimum `phase`. A
+  // `{ "phase": "boundary", "at": "..." }` payload is written verbatim.
+  // Non-boundary entries must omit `at`; the command injects a boundary
+  // line on phase transitions automatically.
+  //
+  // Exit codes: 0 on success, 2 on invalid arguments, 1 on write error.
+  if (command === 'transcript-append') {
+    // forge-self-fixes R008: manual-walkthrough and CI callers need to write
+    // phase-boundary events without the stop hook. --cycle is now optional;
+    // absent, we look up the active cycle from state.md frontmatter, and if
+    // that's also absent we synthesize a fresh one so every caller can leave
+    // an audit trail. --event is the preferred flag; --entry retained for
+    // back-compat with earlier callers.
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    let cycle = args.find((a, i) => args[i - 1] === '--cycle');
+    const raw = args.find((a, i) => args[i - 1] === '--event')
+             || args.find((a, i) => args[i - 1] === '--entry');
+    if (!raw) {
+      process.stderr.write('transcript-append: --event (or --entry) is required\n');
+      process.exit(2);
+    }
+    let entry;
+    try { entry = JSON.parse(raw); }
+    catch (e) {
+      process.stderr.write('transcript-append: --event is not valid JSON: ' + e.message + '\n');
+      process.exit(2);
+    }
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      process.stderr.write('transcript-append: --event must parse to a JSON object\n');
+      process.exit(2);
+    }
+    if (!entry.phase || typeof entry.phase !== 'string') {
+      process.stderr.write('transcript-append: event JSON must include a string "phase" key\n');
+      process.exit(2);
+    }
+    if (!entry.ts) {
+      entry.ts = new Date().toISOString();
+    }
+    if (!cycle) {
+      // Prefer the active cycle recorded in state.md; fall back to a fresh
+      // compact UTC stamp so the tool can be used from a clean tree.
+      try {
+        const st = parseFrontmatter(fs.readFileSync(path.join(forgeDir, 'state.md'), 'utf8'));
+        if (st.data && typeof st.data.cycle === 'string' && st.data.cycle) {
+          cycle = st.data.cycle;
+        }
+      } catch (_) { /* state.md may not exist */ }
+      if (!cycle) {
+        const now = new Date().toISOString();
+        cycle = now.slice(0, 16).replace(/[-:]/g, '').replace(/\.\d+$/, '') + 'Z';
+      }
+    }
+    try {
+      const r = appendTranscript(forgeDir, cycle, entry);
+      process.stdout.write(JSON.stringify(Object.assign({ cycle }, r)) + '\n');
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write('transcript-append failed: ' + e.message + '\n');
+      process.exit(1);
+    }
+  }
+
+  // list-cited-docs (forge-self-fixes R009)
+  //
+  // Scans a spec file for path references that point OUTSIDE the current
+  // repo (absolute paths, Windows drive-letter paths, MSYS /c/ paths, ~/
+  // home paths, and any repo-rooted path whose leading segment names a
+  // DIFFERENT repo than the one containing the spec). Emits a JSON array
+  // of { line, path } so the executor can mandatory-read each one before
+  // writing code. Internal paths (plain relative, resolving inside the
+  // current repo) are excluded — they are already tracked by
+  // forge-speccer-validator.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs list-cited-docs --spec .forge/specs/spec-x.md [--repo-root .]
+  //
+  // Exit codes:
+  //   0  ok (even if zero external refs found; empty array printed)
+  //   1  fatal (spec not readable)
+  //   2  bad args
+  if (command === 'list-cited-docs') {
+    const specPath = args.find((a, i) => args[i - 1] === '--spec');
+    const repoRoot = args.find((a, i) => args[i - 1] === '--repo-root') || process.cwd();
+    if (!specPath) {
+      process.stderr.write('list-cited-docs: --spec is required\n');
+      process.exit(2);
+    }
+    let specText;
+    try { specText = fs.readFileSync(specPath, 'utf8'); }
+    catch (e) {
+      process.stderr.write('list-cited-docs: cannot read spec: ' + e.message + '\n');
+      process.exit(1);
+    }
+    // Rules for "external":
+    //   - Absolute windows path: ^[A-Z]:[\\\/]
+    //   - Absolute POSIX path: ^/ but only when the second segment is not
+    //     relative-to-repo (we accept all absolute /-paths as external; on
+    //     Windows Git Bash MSYS paths /c/... should also match)
+    //   - Home-relative: ^~/
+    //   - Any other path whose leading segment is a known sibling-repo name.
+    //     Heuristic: if repoRoot's basename is FOO and the path starts with
+    //     BAR/... where BAR is a directory at the PARENT of repoRoot, treat
+    //     as external.
+    const lines = specText.split(/\r?\n/);
+    const externalRefs = [];
+    const seen = new Set();
+    const repoName = path.basename(path.resolve(repoRoot));
+    const parentDir = path.dirname(path.resolve(repoRoot));
+    let siblings = new Set();
+    try {
+      for (const ent of fs.readdirSync(parentDir, { withFileTypes: true })) {
+        if (ent.isDirectory() && ent.name !== repoName) siblings.add(ent.name);
+      }
+    } catch (_) { /* no access, skip sibling heuristic */ }
+
+    const ABS_WIN = /^[A-Za-z]:[\\\/]/;
+    const ABS_POSIX = /^\//;
+    const HOME_REL = /^~\//;
+
+    let inFence = false;
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i];
+      const trimmed = raw.trim();
+      if (/^```/.test(trimmed)) { inFence = !inFence; continue; }
+      // Only harvest from backtick spans outside fences and full lines
+      // inside fences. Prose-outside-backticks is ignored by design —
+      // same convention as forge-speccer-validator.
+      const sources = [];
+      if (inFence) {
+        sources.push(raw);
+      } else {
+        const spanRe = /`([^`]+)`/g;
+        let m;
+        while ((m = spanRe.exec(raw)) !== null) sources.push(m[1]);
+      }
+      for (const src of sources) {
+        // Split on whitespace/punct, keep leading characters that matter
+        // for absolute-path detection.
+        const candidates = src.split(/[\s,()[\]<>"']+/).filter(Boolean);
+        for (let tok of candidates) {
+          tok = tok.replace(/[.,:;!?]+$/, '');
+          if (!tok) continue;
+          if (tok.includes('://')) continue; // URLs
+          const isAbs = ABS_WIN.test(tok) || ABS_POSIX.test(tok) || HOME_REL.test(tok);
+          let isSiblingRepo = false;
+          if (!isAbs) {
+            const seg = tok.split(/[\\\/]/)[0];
+            if (seg && siblings.has(seg)) isSiblingRepo = true;
+          }
+          if (!isAbs && !isSiblingRepo) continue;
+          if (seen.has(tok)) continue;
+          seen.add(tok);
+          externalRefs.push({ line: i + 1, path: tok });
+        }
+      }
+    }
+    process.stdout.write(JSON.stringify(externalRefs, null, 2) + '\n');
+    process.exit(0);
+  }
+
+  // verify-structural-acs (forge-self-fixes R006)
+  //
+  // Executes parseable structural acceptance criteria against a built HTML
+  // artifact. Supports three patterns today (spec AC text must mention the
+  // phrase so the parser can recognise it):
+  //
+  //   1. "data-testid="X" exists"           — substring match on the attribute
+  //   2. "textContent contains \"X\""       — substring on the HTML body text
+  //      ("text content includes", "contains the literal 'X'", "contains \"X\"" all accepted)
+  //   3. "exactly N elements match data-testid="X"" — count of the attribute
+  //      ("N elements with", "exactly N ... match" accepted)
+  //
+  // Anything else is reported as `skipped` with a short reason. This is
+  // deliberately narrow: a 20-line regex parser is more reliable on the
+  // specific AC phrasings Forge specs tend to use than a full CSS engine
+  // bolted onto a headless DOM. When a spec needs richer verification,
+  // the [visual] AC family + Playwright MCP path already exists.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs verify-structural-acs \
+  //     --spec .forge/specs/spec-x.md \
+  //     --artifact dist/index.html
+  //
+  // Output: {pass: N, fail: N, skipped: N, failures: [{ac, reason}], results: [{ac, status, reason?}]}
+  //
+  // Exit codes:
+  //   0  all non-skipped ACs passed
+  //   2  bad args
+  //   3  one or more ACs failed
+  if (command === 'verify-structural-acs') {
+    const specPath = args.find((a, i) => args[i - 1] === '--spec');
+    const artifactPath = args.find((a, i) => args[i - 1] === '--artifact');
+    if (!specPath || !artifactPath) {
+      process.stderr.write('verify-structural-acs: --spec and --artifact are required\n');
+      process.exit(2);
+    }
+    let specText, html;
+    try { specText = fs.readFileSync(specPath, 'utf8'); }
+    catch (e) {
+      process.stderr.write('verify-structural-acs: cannot read spec: ' + e.message + '\n');
+      process.exit(2);
+    }
+    try { html = fs.readFileSync(artifactPath, 'utf8'); }
+    catch (e) {
+      process.stderr.write('verify-structural-acs: cannot read artifact: ' + e.message + '\n');
+      process.exit(2);
+    }
+    const result = _verifyStructuralAcs(specText, html);
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    process.exit(result.fail === 0 ? 0 : 3);
+  }
+
+  // detect-contention (forge-self-fixes R005)
+  //
+  // Scans a frontier file for same-tier tasks that declare overlapping
+  // filesTouched paths. Overlaps mean two parallel-dispatched tasks would
+  // both modify the same file, guaranteeing a squash-merge conflict when
+  // worktrees are reconciled. The planner is supposed to either move one
+  // task to a later tier OR split the shared file into its own integration
+  // task; this CLI is the verification gate.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs detect-contention --frontier .forge/plans/spec-x-frontier.md
+  //
+  // Output: JSON { conflicts: [{ tier, file, tasks: [ids] }] }
+  //
+  // Exit codes:
+  //   0  no conflicts
+  //   2  bad args
+  //   3  one or more conflicts detected
+  if (command === 'detect-contention') {
+    const frontierPath = args.find((a, i) => args[i - 1] === '--frontier');
+    if (!frontierPath) {
+      process.stderr.write('detect-contention: --frontier is required\n');
+      process.exit(2);
+    }
+    let text;
+    try { text = fs.readFileSync(frontierPath, 'utf8'); }
+    catch (e) {
+      process.stderr.write('detect-contention: cannot read frontier: ' + e.message + '\n');
+      process.exit(2);
+    }
+    const tasks = parseFrontier(text);
+    // Group tasks by tier, then by each filesTouched path per tier. Any path
+    // claimed by >1 task in the same tier is a contention.
+    const byTier = new Map();
+    for (const t of tasks) {
+      if (!byTier.has(t.tier)) byTier.set(t.tier, []);
+      byTier.get(t.tier).push(t);
+    }
+    const conflicts = [];
+    for (const [tier, tierTasks] of byTier.entries()) {
+      const fileMap = new Map(); // file -> [task ids]
+      for (const t of tierTasks) {
+        for (const f of t.filesTouched || []) {
+          if (!fileMap.has(f)) fileMap.set(f, []);
+          fileMap.get(f).push(t.id);
+        }
+      }
+      for (const [file, ids] of fileMap.entries()) {
+        if (ids.length > 1) {
+          conflicts.push({ tier, file, tasks: ids });
+        }
+      }
+    }
+    process.stdout.write(JSON.stringify({ conflicts }, null, 2) + '\n');
+    process.exit(conflicts.length === 0 ? 0 : 3);
+  }
+
+  // task-classify (forge-self-fixes R003)
+  //
+  // Deterministic UI-task detection. Returns { ui:boolean, brand:string|null,
+  // reasons:[...] } for a given task id. The executing skill uses this to
+  // decide whether to invoke frontend-design + brand-guidelines BEFORE
+  // writing any component code.
+  //
+  // Detection rules (ui:true when ANY triggers):
+  //   - Task's R-numbered AC text references any of:
+  //       src/**, components/**, pages/**, app/**,
+  //       *.tsx, *.jsx, *.vue, *.svelte, *.astro
+  //   - .forge/capabilities.json (mcp_servers + cli_tools + skills) or
+  //     package.json (detected via capabilities.json having Vite/React/etc.)
+  //     indicates a frontend stack
+  //
+  // Brand detection: if the spec text contains any of a small closed list
+  // of known brand names (case-insensitive), report it in `brand`. Future
+  // iterations can swap this for an LLM-based classifier.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs task-classify \
+  //     --task-id T001 \
+  //     --spec .forge/specs/spec-foo.md \
+  //     [--capabilities .forge/capabilities.json]
+  //
+  // Exit codes:
+  //   0  ok (prints JSON to stdout)
+  //   2  bad args
+  if (command === 'task-classify') {
+    const taskId = args.find((a, i) => args[i - 1] === '--task-id');
+    const specPath = args.find((a, i) => args[i - 1] === '--spec');
+    const capsPath = args.find((a, i) => args[i - 1] === '--capabilities');
+    if (!taskId || !specPath) {
+      process.stderr.write('task-classify: --task-id and --spec are required\n');
+      process.exit(2);
+    }
+    let specText = '';
+    try { specText = fs.readFileSync(specPath, 'utf8'); }
+    catch (e) {
+      process.stderr.write('task-classify: cannot read spec: ' + e.message + '\n');
+      process.exit(2);
+    }
+    const reasons = [];
+    const lower = specText.toLowerCase();
+    const uiPatterns = [
+      /\bsrc\//i, /\bcomponents\//i, /\bpages\//i, /\bapp\//i,
+      /\.tsx\b/i, /\.jsx\b/i, /\.vue\b/i, /\.svelte\b/i, /\.astro\b/i
+    ];
+    for (const re of uiPatterns) {
+      if (re.test(specText)) {
+        reasons.push('spec-matches ' + re.source);
+      }
+    }
+    // Capabilities signal: look for any frontend framework in the discovered
+    // cli_tools, skills, or mcp_servers maps.
+    let uiFromCaps = false;
+    if (capsPath) {
+      try {
+        const caps = JSON.parse(fs.readFileSync(capsPath, 'utf8'));
+        const frontendHints = ['vite', 'react', 'vue', 'svelte', 'next', 'astro', 'tailwindcss', 'tailwind'];
+        const hay = JSON.stringify(caps).toLowerCase();
+        for (const h of frontendHints) {
+          if (hay.includes(h)) {
+            uiFromCaps = true;
+            reasons.push('capabilities-has ' + h);
+            break;
+          }
+        }
+      } catch (_) { /* capabilities absent is fine */ }
+    }
+    const BRANDS = [
+      'anthropic', 'claude', 'linear', 'stripe', 'vercel', 'raycast',
+      'supabase', 'shopify', 'notion', 'figma', 'github'
+    ];
+    let brand = null;
+    for (const b of BRANDS) {
+      const re = new RegExp('\\b' + b + '\\b', 'i');
+      if (re.test(specText)) {
+        brand = b;
+        reasons.push('brand-mentioned ' + b);
+        break;
+      }
+    }
+    const ui = reasons.length > 0;
+    process.stdout.write(JSON.stringify({
+      ui,
+      brand,
+      task_id: taskId,
+      reasons
+    }) + '\n');
+    process.exit(0);
+  }
+
+  // brainstorm-check-design (forge-self-fixes R002)
+  //
+  // Phase-4 gate: when the brainstorming skill has identified a brand-based
+  // aesthetic choice (user picked "Linear-style dark", "Anthropic brand",
+  // etc.), it must confirm a DESIGN.md exists at the repo root BEFORE
+  // proceeding to approach proposals. Without this gate the executor will
+  // write UI code using approximated brand tokens, as observed on
+  // 2026-04-21.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs brainstorm-check-design --repo-root . --brand-name anthropic
+  //
+  // Exit codes:
+  //   0  design.md present -> stdout { ok:true, path:"DESIGN.md" }
+  //   3  design.md missing -> stdout { ok:false, reason:"missing_design_md", brand:"..." }
+  //   2  bad args
+  if (command === 'brainstorm-check-design') {
+    const repoRoot = args.find((a, i) => args[i - 1] === '--repo-root') || process.cwd();
+    const brandName = args.find((a, i) => args[i - 1] === '--brand-name') || null;
+    const candidates = ['DESIGN.md', 'design.md', path.join('docs', 'DESIGN.md')];
+    let found = null;
+    for (const rel of candidates) {
+      const abs = path.resolve(repoRoot, rel);
+      if (fs.existsSync(abs)) { found = rel; break; }
+    }
+    if (found) {
+      process.stdout.write(JSON.stringify({ ok: true, path: found }) + '\n');
+      process.exit(0);
+    }
+    process.stdout.write(JSON.stringify({
+      ok: false,
+      reason: 'missing_design_md',
+      brand: brandName,
+      searched: candidates
+    }) + '\n');
+    process.exit(3);
+  }
+
+  // research-append (T014 / R005) -- shell bridge into forge-research-aggregator.
+  // Called from skill runtime after a background forge-researcher dispatch
+  // returns so the output lands in .forge/specs/<spec>.research.md.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs research-append \
+  //     --spec forge-v03-gaps \
+  //     --heading "Dagster-style asset graph" \
+  //     --body-file /tmp/researcher-out.md \
+  //     [--sources url1,url2,url3] \
+  //     [--forge-dir .forge]
+  if (command === 'research-append') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const spec = args.find((a, i) => args[i - 1] === '--spec');
+    const heading = args.find((a, i) => args[i - 1] === '--heading');
+    const bodyFile = args.find((a, i) => args[i - 1] === '--body-file');
+    const sourcesRaw = args.find((a, i) => args[i - 1] === '--sources');
+    if (!spec) {
+      process.stderr.write('research-append: --spec is required\n');
+      process.exit(2);
+    }
+    if (!heading) {
+      process.stderr.write('research-append: --heading is required\n');
+      process.exit(2);
+    }
+    if (!bodyFile) {
+      process.stderr.write('research-append: --body-file is required\n');
+      process.exit(2);
+    }
+    let body;
+    try { body = fs.readFileSync(bodyFile, 'utf8'); }
+    catch (e) {
+      process.stderr.write('research-append: cannot read --body-file: ' + e.message + '\n');
+      process.exit(2);
+    }
+    const sources = sourcesRaw
+      ? sourcesRaw.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
+    try {
+      const { appendResearchSection } = require('./forge-research-aggregator.cjs');
+      const r = appendResearchSection(forgeDir, spec, { heading, body, sources });
+      process.stdout.write(JSON.stringify(r) + '\n');
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write('research-append failed: ' + e.message + '\n');
+      process.exit(1);
+    }
+  }
+
+  // === T017 / R009 — completion-check ===
+  // Emits the JSON result of checkCompletionGates so callers (stop hook,
+  // review-branch, TUI, humans) can decide whether FORGE_COMPLETE is
+  // legitimate. Exit code: 0 when complete === true, 3 when false (gates
+  // failed — distinguished from generic errors so wrappers can branch on
+  // it). Errors parsing the forge dir exit with code 2 so callers can
+  // discriminate "gates failed" from "check itself failed".
+  if (command === 'completion-check') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const collabDir = args.find((a, i) => args[i - 1] === '--collab-dir') || null;
+    const gatesFile = args.find((a, i) => args[i - 1] === '--gates-file') || null;
+    const requireTaskRegistry = !args.includes('--allow-empty-registry');
+    try {
+      const result = checkCompletionGates(forgeDir, {
+        collabDir, gatesFile, requireTaskRegistry
+      });
+      process.stdout.write(JSON.stringify(result) + '\n');
+      process.exit(result.complete ? 0 : 3);
+    } catch (e) {
+      process.stderr.write('completion-check failed: ' + e.message + '\n');
+      process.exit(2);
+    }
+  }
+
+  // === T017 / R009 — completion-emit ===
+  // Emits the gated wire form of the completion promise:
+  //   - `<promise>FORGE_COMPLETE</promise>` when all four gates pass
+  //   - `<promise>FORGE_BLOCKED</promise>` + inline `{reasons:[...]}`
+  //     JSON on the next line when any gate fails
+  // Used by the stop hook to override a bare FORGE_COMPLETE emission
+  // from the agent when gates have regressed. Exit code mirrors
+  // completion-check: 0 on complete, 3 on blocked, 2 on internal error.
+  if (command === 'completion-emit') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const collabDir = args.find((a, i) => args[i - 1] === '--collab-dir') || null;
+    const gatesFile = args.find((a, i) => args[i - 1] === '--gates-file') || null;
+    const requireTaskRegistry = !args.includes('--allow-empty-registry');
+    try {
+      const { emission, result } = emitCompletionPromise(forgeDir, {
+        collabDir, gatesFile, requireTaskRegistry
+      });
+      process.stdout.write(emission);
+      process.exit(result.complete ? 0 : 3);
+    } catch (e) {
+      process.stderr.write('completion-emit failed: ' + e.message + '\n');
+      process.exit(2);
+    }
+  }
+
+  // ac-met (T029 / R006) — executor agents emit AC events as they pass
+  // each acceptance criterion. The CLI appends one JSONL line to
+  // `.forge/streaming/events.jsonl`; the dispatcher replays events on its
+  // next tick to advance the streaming scheduler. If `streaming_dag.enabled`
+  // is false in config, the emission still records (harmless) so enabling
+  // the feature later does not lose history.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs ac-met \
+  //     --task T013 --ac R002.AC1 \
+  //     --witness-hash sha256:abc... \
+  //     [--witness-paths src/a.ts,src/b.ts] \
+  //     [--forge-dir .forge]
+  //
+  // Exit codes: 0 on success, 2 on invalid args.
+  if (command === 'ac-met' || command === 'ac-verify' || command === 'ac-regress') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const taskId = args.find((a, i) => args[i - 1] === '--task');
+    const acId = args.find((a, i) => args[i - 1] === '--ac');
+    const witnessHash = args.find((a, i) => args[i - 1] === '--witness-hash') || null;
+    const witnessPathsRaw = args.find((a, i) => args[i - 1] === '--witness-paths') || '';
+    const witnessPaths = witnessPathsRaw
+      ? witnessPathsRaw.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
+    if (!taskId) {
+      process.stderr.write(command + ': --task is required\n');
+      process.exit(2);
+    }
+    // ac-verify may be emitted with no --ac when the whole task verifies.
+    if (command !== 'ac-verify' && !acId) {
+      process.stderr.write(command + ': --ac is required\n');
+      process.exit(2);
+    }
+    const kind = command === 'ac-met' ? 'ac_met'
+      : command === 'ac-verify' ? 'task_verified'
+      : 'ac_regression';
+    const evt = {
+      kind,
+      task_id: taskId,
+      ac_id: acId || null,
+      witness_hash: witnessHash,
+      witness_paths: witnessPaths,
+      emitted_at: new Date().toISOString()
+    };
+    try {
+      const dir = path.join(forgeDir, 'streaming');
+      fs.mkdirSync(dir, { recursive: true });
+      const eventsPath = path.join(dir, 'events.jsonl');
+      fs.appendFileSync(eventsPath, JSON.stringify(evt) + '\n');
+      process.stdout.write(JSON.stringify({ recorded: true, kind, task_id: taskId, ac_id: acId || null, path: eventsPath }) + '\n');
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write(command + ' failed: ' + e.message + '\n');
+      process.exit(1);
+    }
+  }
+
+  // streaming-mermaid (T029 / R006) — render the current AC-DAG as a
+  // Mermaid flowchart for `/forge:watch`. Reads the frontier + the event
+  // log, instantiates a scheduler, replays events, and prints mermaid.
+  //
+  // Usage:
+  //   node scripts/forge-tools.cjs streaming-mermaid --frontier <path> [--forge-dir .forge]
+  if (command === 'streaming-mermaid') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    const frontierPath = args.find((a, i) => args[i - 1] === '--frontier');
+    if (!frontierPath) {
+      process.stderr.write('streaming-mermaid: --frontier is required\n');
+      process.exit(2);
+    }
+    try {
+      const frontierText = fs.readFileSync(frontierPath, 'utf8');
+      const tasks = parseFrontier(frontierText);
+      const dag = require('./forge-streaming-dag.cjs');
+      const scheduler = dag.createStreamingScheduler({ frontier: tasks });
+      // Replay events.
+      const eventsPath = path.join(forgeDir, 'streaming', 'events.jsonl');
+      if (fs.existsSync(eventsPath)) {
+        const lines = fs.readFileSync(eventsPath, 'utf8').split('\n').filter(Boolean);
+        for (const line of lines) {
+          let e; try { e = JSON.parse(line); } catch (_) { continue; }
+          if (e.kind === 'ac_met') {
+            scheduler.emitAcMet({
+              taskId: e.task_id, acId: e.ac_id,
+              witnessHash: e.witness_hash, witnessPaths: e.witness_paths,
+              emittedAt: e.emitted_at
+            });
+          } else if (e.kind === 'task_verified') {
+            scheduler.emitTaskVerified({ taskId: e.task_id });
+          } else if (e.kind === 'ac_regression') {
+            scheduler.emitAcRegression({ taskId: e.task_id, acId: e.ac_id });
+          }
+        }
+      }
+      process.stdout.write(dag.toMermaid(scheduler) + '\n');
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write('streaming-mermaid failed: ' + e.message + '\n');
+      process.exit(1);
+    }
   }
 }
 
@@ -5390,8 +7817,13 @@ module.exports = {
   parseFrontmatter, serializeFrontmatter,
   loadConfig, DEFAULT_CONFIG, deepMerge, getConfig,
   estimateTokensFromTranscript, readState, writeState, formatCavemanValue,
+  assertCavemanWhitelist, isCavemanAllowedPath,
+  recordCompressionStats, readCompressionStats, compressWithGuard,
   acquireLock, releaseLock, heartbeat, detectStaleLock, readLock,
   updateTokenLedger, parseFrontier,
+  // T020 / R007: visual verifier plumbing.
+  parseVisualAcs, checkVisualCapabilities, baselinePath,
+  writeVisualProgress, runVisualVerifier,
   detectFileConflicts, serializeConflictingTasks, logConflictEvent, planTierExecution, detectParallelConflicts,
   writeParallelConstraints, readParallelConstraints, isBlockedByParallelConstraint,
   readLedger, writeLedgerAtomic, resolveTaskBudget,
@@ -5419,5 +7851,25 @@ module.exports = {
   graphifyAvailable, graphifyBuild, graphifySummary, graphifyQuery, graphifyDependents,
   ERROR_TAXONOMY, classifyError, getRecoveryAction, logError,
   captureTrajectory, trajectoryStats, tokenReport, promoteToGlobalLearning,
-  compressContext, shouldCompress, getCompressionThreshold
+  compressContext, shouldCompress, getCompressionThreshold,
+  appendTranscript, readTranscript,
+  // T017 / R009: completion-promise gates (tasks + visual + non-visual + flags).
+  checkCompletionGates,
+  emitCompletionPromise,
+  // T014 / R005: research aggregator re-exports for convenience.
+  // The canonical implementation lives in forge-research-aggregator.cjs.
+  get appendResearchSection() { return require('./forge-research-aggregator.cjs').appendResearchSection; },
+  get readResearchFile() { return require('./forge-research-aggregator.cjs').readResearchFile; },
+  // T016 / R010: dev-server lifecycle re-exports. Canonical implementation
+  // lives in forge-dev-server.cjs.
+  get startDevServer() { return require('./forge-dev-server.cjs').startDevServer; },
+  get stopDevServer() { return require('./forge-dev-server.cjs').stopDevServer; },
+  get probeSandbox() { return require('./forge-dev-server.cjs').probeSandbox; },
+  // T029 / R006: streaming DAG re-exports. Canonical implementation lives
+  // in forge-streaming-dag.cjs. Default on via config.streaming_dag.enabled.
+  get createStreamingScheduler() { return require('./forge-streaming-dag.cjs').createStreamingScheduler; },
+  get computeWitnessHash() { return require('./forge-streaming-dag.cjs').computeWitnessHash; },
+  get streamingDagToMermaid() { return require('./forge-streaming-dag.cjs').toMermaid; },
+  get isStreamingDagEnabled() { return require('./forge-streaming-dag.cjs').isStreamingEnabled; },
+  get classifyAcDeps() { return require('./forge-streaming-dag.cjs').classifyDeps; }
 };

@@ -29,6 +29,63 @@ const DEFAULT_HEARTBEAT_SECONDS = 30;
 const DEFAULT_CONSOLIDATION_TTL_SECONDS = 30;
 const CLAIM_PREFIX = 'claim:';
 
+// T019 (spec-collab-fix R003): bounded append queue cap on state.json.
+// Writers evict oldest-first once messages.length exceeds the cap and emit
+// a console.warn so an operator sees the ceiling being hit.
+const MESSAGE_QUEUE_CAP = 500;
+const SCHEMA_PATH = path.join(__dirname, 'forge-collab-schema.json');
+
+/**
+ * Minimal validator for the collab state document. Zero-dep by design: we
+ * do not want to add ajv to Forge's dependency surface for a 2-key schema.
+ * The JSON-schema file at scripts/forge-collab-schema.json is the canonical
+ * description; this function enforces the load-bearing subset (shape + the
+ * few required keys per message/lease) and returns a list of human-readable
+ * error strings. Callers log warnings on malformed payloads but accept them
+ * for forward compat -- later state-document versions must never brick an
+ * older client.
+ *
+ * Returns: { valid: boolean, errors: string[] }
+ */
+function _validateStateShape(state) {
+  const errors = [];
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    return { valid: false, errors: ['state is not an object'] };
+  }
+  if (!state.leases || typeof state.leases !== 'object' || Array.isArray(state.leases)) {
+    errors.push('leases is not an object');
+  } else {
+    for (const [name, lease] of Object.entries(state.leases)) {
+      if (!lease || typeof lease !== 'object' || Array.isArray(lease)) {
+        errors.push('leases.' + name + ' is not an object');
+        continue;
+      }
+      if (typeof lease.claimant !== 'string') {
+        errors.push('leases.' + name + '.claimant is not a string');
+      }
+      if (typeof lease.acquiredAt !== 'string') {
+        errors.push('leases.' + name + '.acquiredAt is not a string');
+      }
+    }
+  }
+  if (!Array.isArray(state.messages)) {
+    errors.push('messages is not an array');
+  } else {
+    for (let i = 0; i < state.messages.length; i++) {
+      const m = state.messages[i];
+      if (!m || typeof m !== 'object' || Array.isArray(m)) {
+        errors.push('messages[' + i + '] is not an object');
+        continue;
+      }
+      if (typeof m.id !== 'string') errors.push('messages[' + i + '].id is not a string');
+      if (typeof m.event !== 'string') errors.push('messages[' + i + '].event is not a string');
+      if (typeof m.from !== 'string') errors.push('messages[' + i + '].from is not a string');
+      if (typeof m.ts !== 'string') errors.push('messages[' + i + '].ts is not a string');
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}
+
 /**
  * Return the origin remote URL for the repo at `cwd`, or throw if none exists.
  */
@@ -103,6 +160,96 @@ function _readEpsilonFromConfig(forgeDir) {
   return null;
 }
 
+/**
+ * Read the configured scorer module path from `.forge/config.json` at
+ * `collab.scorer` (a shell-style command string like
+ * "node scripts/forge-collab-scorer.cjs"). Returns the resolved absolute
+ * script path and the default export function when it loads, or null when
+ * the config key is missing or the module cannot be required.
+ *
+ * Spec-collab-fix R007 AC 1/2.
+ */
+function _readScorerFromConfig(forgeDir) {
+  try {
+    if (!forgeDir) return null;
+    const p = path.join(forgeDir, 'config.json');
+    if (!fs.existsSync(p)) return null;
+    const raw = fs.readFileSync(p, 'utf8');
+    const cfg = JSON.parse(raw);
+    const spec = cfg && cfg.collab && cfg.collab.scorer;
+    if (typeof spec !== 'string' || spec.trim() === '') return null;
+    // Accept "node path/to/file.cjs" or a bare path; pull the last whitespace
+    // token and resolve it relative to the project root (parent of forgeDir).
+    const parts = spec.trim().split(/\s+/);
+    const rel = parts[parts.length - 1];
+    const projectRoot = path.dirname(path.resolve(forgeDir));
+    const abs = path.isAbsolute(rel) ? rel : path.join(projectRoot, rel);
+    const mod = require(abs);
+    if (typeof mod === 'function') return mod;
+    if (mod && typeof mod.llmScorer === 'function') return mod.llmScorer;
+    if (mod && typeof mod.default === 'function') return mod.default;
+    return null;
+  } catch (_) { /* fall through to null -- caller decides whether this is fatal */ }
+  return null;
+}
+
+/**
+ * Read the explicit Jaccard-fallback opt-in flag from `.forge/config.json`
+ * at `collab.fallback_jaccard`. Returns boolean or null when unset.
+ *
+ * Spec-collab-fix R007 AC 4.
+ */
+function _readFallbackJaccardFromConfig(forgeDir) {
+  try {
+    if (!forgeDir) return null;
+    const p = path.join(forgeDir, 'config.json');
+    if (!fs.existsSync(p)) return null;
+    const raw = fs.readFileSync(p, 'utf8');
+    const cfg = JSON.parse(raw);
+    const v = cfg && cfg.collab && cfg.collab.fallback_jaccard;
+    if (typeof v === 'boolean') return v;
+  } catch (_) { /* fall through to null */ }
+  return null;
+}
+
+/**
+ * Resolve which scorer to use given the layered options. Precedence:
+ *   1. opts.scorer (function) -- explicit injection wins
+ *   2. collab.scorer in .forge/config.json (when forgeDir provided)
+ *   3. Jaccard heuristic, ONLY when opts.fallback_jaccard === true or
+ *      collab.fallback_jaccard === true in config
+ *
+ * Returns { scorer, source } on success or { error } when nothing is wired
+ * and Jaccard fallback is not explicitly enabled. Callers surface `error`
+ * via a thrown Error so misrouting can never happen silently
+ * (spec-collab-fix R007 AC 1).
+ */
+function _resolveScorer(opts) {
+  opts = opts || {};
+  if (typeof opts.scorer === 'function') {
+    return { scorer: opts.scorer, source: 'opts.scorer' };
+  }
+  if (opts.forgeDir) {
+    const fromCfg = _readScorerFromConfig(opts.forgeDir);
+    if (typeof fromCfg === 'function') {
+      return { scorer: fromCfg, source: 'config.collab.scorer' };
+    }
+  }
+  // Explicit Jaccard fallback: opts wins, then config, then no.
+  let fallback = null;
+  if (typeof opts.fallback_jaccard === 'boolean') {
+    fallback = opts.fallback_jaccard;
+  } else if (opts.forgeDir) {
+    fallback = _readFallbackJaccardFromConfig(opts.forgeDir);
+  }
+  if (fallback === true) {
+    return { scorer: _heuristicScorer, source: 'fallback_jaccard' };
+  }
+  return {
+    error: 'forge:collab routing requires a scorer; set collab.scorer in .forge/config.json or pass opts.scorer'
+  };
+}
+
 function _tokenSet(text) {
   if (text == null) return new Set();
   return new Set(
@@ -133,25 +280,58 @@ function _heuristicScorer(targetText, contributions) {
 }
 
 /**
+ * Clamp raw scorer output to [0, 1]. Non-numbers and NaN collapse to 0.
+ * Extracted so both sync and async code paths apply identical shaping.
+ */
+function _clampScore(raw) {
+  if (typeof raw !== 'number' || Number.isNaN(raw)) return 0;
+  if (raw < 0) return 0;
+  if (raw > 1) return 1;
+  return raw;
+}
+
+/**
  * Score a single participant's relevance to `targetText`.
  *
- * Returns a number in [0, 1]. Participants with no contributions score
+ * Returns a number in [0, 1], OR a Promise<number> when the resolved scorer
+ * is async (e.g., LLM-backed). Participants with no contributions score
  * exactly 0 per spec-collab R005 AC. Unrecognized or non-numeric scorer
- * output also clamps to 0.
+ * output clamps to 0.
  *
- * opts.scorer: (targetText, contributions, participant) => number in [0,1]
- *              Inject to swap the default Jaccard heuristic for an LLM call.
+ * Scorer resolution (spec-collab-fix R007):
+ *   1. opts.scorer if provided
+ *   2. config.collab.scorer (via opts.forgeDir)
+ *   3. Jaccard heuristic ONLY when opts.fallback_jaccard === true or
+ *      config.collab.fallback_jaccard === true
+ *   4. Otherwise throws with a clear error
+ *
+ * opts.scorer: (targetText, contributions, participant) => number | Promise<number>
  */
 function scoreParticipant(targetText, participant, opts) {
   opts = opts || {};
   const contrib = (participant && participant.contributions) || '';
   if (!contrib || !String(contrib).trim()) return 0;
-  const scorer = typeof opts.scorer === 'function' ? opts.scorer : _heuristicScorer;
-  const raw = scorer(targetText, contrib, participant);
-  if (typeof raw !== 'number' || Number.isNaN(raw)) return 0;
-  if (raw < 0) return 0;
-  if (raw > 1) return 1;
-  return raw;
+
+  const resolved = _resolveScorer(opts);
+  if (resolved.error) throw new Error(resolved.error);
+  const scorer = resolved.scorer;
+
+  let raw;
+  try {
+    raw = scorer(targetText, contrib, participant);
+  } catch (err) {
+    // Surface errors rather than silently misroute. AC: scorer errors
+    // propagate with clear messages, not a silent 0.
+    throw new Error('forge:collab scorer threw: ' + (err && err.message ? err.message : String(err)));
+  }
+
+  // Async scorer -- return a promise that clamps and rethrows.
+  if (raw && typeof raw.then === 'function') {
+    return raw.then(_clampScore, err => {
+      throw new Error('forge:collab scorer rejected: ' + (err && err.message ? err.message : String(err)));
+    });
+  }
+  return _clampScore(raw);
 }
 
 /**
@@ -162,8 +342,14 @@ function scoreParticipant(targetText, participant, opts) {
  * combined scores tie within epsilon (default 0.05, overridable via opts or
  * via `collab.route.epsilon` in `.forge/config.json`).
  *
+ * Returns Promise<string> when any resolved scorer is async; returns a
+ * plain string for sync scorers (backward-compat per T027 task note).
+ *
  * Participants are expected to shape as { handle, contributions, active_tasks? }.
  * Deterministic tiebreak on handle string order avoids per-run drift.
+ *
+ * Throws when no scorer is wired and fallback_jaccard is not enabled
+ * (spec-collab-fix R007 AC 1).
  */
 function routeToParticipant(targetText, participants, opts) {
   opts = opts || {};
@@ -177,25 +363,47 @@ function routeToParticipant(targetText, participants, opts) {
     if (fromCfg !== null) epsilon = fromCfg;
   }
 
+  // Resolve the scorer once so all participants score through the same
+  // function and any "no scorer wired" error throws before we kick off
+  // per-participant work.
+  const resolved = _resolveScorer(opts);
+  if (resolved.error) throw new Error(resolved.error);
+
+  // Score every participant. scoreParticipant will reuse the same
+  // resolution logic internally; passing opts unchanged keeps semantics
+  // aligned when a user invokes scoreParticipant directly.
   const scored = participants.map(p => {
     const sim = scoreParticipant(targetText, p, opts);
     const active = Number(p && p.active_tasks) || 0;
     const loadPenalty = 1 / (1 + active);
-    return { handle: p.handle, combined: sim * loadPenalty, sim };
+    return { handle: p.handle, sim, active, loadPenalty };
   });
 
-  scored.sort((a, b) => {
-    if (b.combined !== a.combined) return b.combined - a.combined;
-    if (a.handle < b.handle) return -1;
-    if (a.handle > b.handle) return 1;
-    return 0;
-  });
+  const anyAsync = scored.some(s => s.sim && typeof s.sim.then === 'function');
 
-  const top = scored[0];
-  if (!top || top.combined === 0) return 'broadcast';
-  const second = scored[1];
-  if (second && (top.combined - second.combined) <= epsilon) return 'broadcast';
-  return top.handle;
+  function finalize(resolvedSims) {
+    const rows = resolvedSims.map((sim, i) => ({
+      handle: scored[i].handle,
+      combined: sim * scored[i].loadPenalty,
+      sim
+    }));
+    rows.sort((a, b) => {
+      if (b.combined !== a.combined) return b.combined - a.combined;
+      if (a.handle < b.handle) return -1;
+      if (a.handle > b.handle) return 1;
+      return 0;
+    });
+    const top = rows[0];
+    if (!top || top.combined === 0) return 'broadcast';
+    const second = rows[1];
+    if (second && (top.combined - second.combined) <= epsilon) return 'broadcast';
+    return top.handle;
+  }
+
+  if (anyAsync) {
+    return Promise.all(scored.map(s => Promise.resolve(s.sim))).then(finalize);
+  }
+  return finalize(scored.map(s => s.sim));
 }
 
 // ======================================================================
@@ -226,9 +434,23 @@ function _nowMs(opts) {
  *   list() -> lease[]
  *
  * A lease object is shaped { name, claimant, acquiredAt, expiresAt }.
+ *
+ * Also exposes the messaging surface (publish/subscribe/sendTargeted) so
+ * tests can exercise the same interface as the polling and ably backends.
+ * When two `createMemoryTransport` instances need to see each other's
+ * messages, pass the same `opts.bus` object (created via `createMemoryBus()`)
+ * to both. Each instance keeps its own `clientId` and filters subscription
+ * callbacks by the envelope `target` field per R004.
  */
-function createMemoryTransport() {
+function createMemoryBus() {
+  return { subs: [] }; // flat list of { event, cb, clientId }
+}
+
+function createMemoryTransport(opts) {
+  opts = opts || {};
   const store = new Map();
+  const bus = opts.bus || createMemoryBus();
+  const factoryClientId = opts.clientId || 'unknown';
   function read(name) {
     return store.has(name) ? Object.assign({}, store.get(name)) : null;
   }
@@ -257,7 +479,43 @@ function createMemoryTransport() {
   function list() {
     return Array.from(store.values()).map(v => Object.assign({}, v));
   }
-  return { read, cas, del, list };
+  async function publish(event, data) {
+    const envelope = { event, data: data || {}, from: factoryClientId };
+    // Deliver synchronously to every subscriber whose filter matches.
+    // Transport-layer filter (R004): when data.target is set and the
+    // subscriber's clientId differs, cb is never invoked.
+    const snapshot = bus.subs.slice();
+    for (const s of snapshot) {
+      if (s.event !== event) continue;
+      if (!_targetAllowsDelivery(envelope.data, s.clientId)) continue;
+      try { s.cb(envelope); } catch (_) {}
+    }
+  }
+  function subscribe(event, cb, subOpts) {
+    subOpts = subOpts || {};
+    const clientId = subOpts.clientId || factoryClientId;
+    bus.subs.push({ event, cb, clientId });
+  }
+  async function sendTargeted(handle, event, data) {
+    await publish(event, Object.assign({ target: handle }, data || {}));
+  }
+  return {
+    read, cas, del, list,
+    publish, subscribe, sendTargeted,
+    _internal: { get bus() { return bus; } }
+  };
+}
+
+/**
+ * R004 transport-layer scoping predicate. Broadcast messages (target
+ * undefined/null) are delivered to every subscriber. Targeted messages are
+ * only delivered to the subscriber whose clientId matches `data.target`.
+ * Non-target subscribers must see zero invocations of their cb per spec
+ * R015 + R004 ACs.
+ */
+function _targetAllowsDelivery(data, subscriberClientId) {
+  if (!data || data.target === undefined || data.target === null) return true;
+  return data.target === subscriberClientId;
 }
 
 function _isExpired(lease, now) {
@@ -275,7 +533,13 @@ function _isExpired(lease, now) {
  *               to 30s for consolidation or other short-lived leases)
  *   now         optional override for deterministic tests (ms since epoch)
  */
-function tryAcquireLease(transport, name, claimant, opts) {
+// forge-self-fixes-2 R010: await cas/del so the Ably publish-ack CAS
+// result propagates to the caller. The memory transport returns a sync
+// boolean from cas/del; `await` on a non-Promise resolves to the value
+// itself, so memory-transport callers are byte-for-byte unchanged.
+// Before this fix, `const ok = transport.cas(...)` bound `ok` to a
+// Promise in Ably mode and every claim returned acquired:true.
+async function tryAcquireLease(transport, name, claimant, opts) {
   opts = opts || {};
   if (!transport || typeof transport.read !== 'function') {
     throw new Error('tryAcquireLease requires a transport object');
@@ -298,7 +562,7 @@ function tryAcquireLease(transport, name, claimant, opts) {
   }
 
   // Either fresh, stale, or already ours -> take/refresh.
-  const ok = transport.cas(name, current, next);
+  const ok = await transport.cas(name, current, next);
   if (!ok) {
     const nowHolder = transport.read(name);
     return {
@@ -313,7 +577,7 @@ function tryAcquireLease(transport, name, claimant, opts) {
 /**
  * Refresh the lease `name`. Succeeds only if `claimant` currently holds it.
  */
-function refreshLease(transport, name, claimant, opts) {
+async function refreshLease(transport, name, claimant, opts) {
   opts = opts || {};
   const ttl = typeof opts.ttlSeconds === 'number' ? opts.ttlSeconds : DEFAULT_CLAIM_TTL_SECONDS;
   const now = _nowMs(opts);
@@ -325,7 +589,7 @@ function refreshLease(transport, name, claimant, opts) {
   const next = Object.assign({}, current, {
     expiresAt: new Date(now + ttl * 1000).toISOString()
   });
-  const ok = transport.cas(name, current, next);
+  const ok = await transport.cas(name, current, next);
   if (!ok) return { refreshed: false, reason: 'lost_race' };
   return { refreshed: true, lease: next };
 }
@@ -335,13 +599,13 @@ function refreshLease(transport, name, claimant, opts) {
  * on a lease you do not hold returns { released: true, noop: true } rather
  * than throwing -- this matches the existing Forge lock semantics.
  */
-function releaseLease(transport, name, claimant) {
+async function releaseLease(transport, name, claimant) {
   const current = transport.read(name);
   if (!current) return { released: true, noop: true };
   if (current.claimant !== claimant) {
     return { released: false, reason: 'held_by_other', holder: current };
   }
-  const ok = transport.del(name, current);
+  const ok = await transport.del(name, current);
   if (!ok) return { released: false, reason: 'lost_race' };
   return { released: true };
 }
@@ -360,13 +624,13 @@ function readLease(transport, name, opts) {
  */
 async function withLease(transport, name, claimant, opts, fn) {
   if (typeof fn !== 'function') throw new Error('withLease requires a function as last arg');
-  const acq = tryAcquireLease(transport, name, claimant, opts);
+  const acq = await tryAcquireLease(transport, name, claimant, opts);
   if (!acq.acquired) return { held: false, reason: acq.reason, holder: acq.holder };
   try {
     const result = await fn(acq.lease);
     return { held: true, result, lease: acq.lease };
   } finally {
-    releaseLease(transport, name, claimant);
+    await releaseLease(transport, name, claimant);
   }
 }
 
@@ -465,6 +729,13 @@ function createAblyTransport(opts) {
   }
   const channelName = opts.channel || 'forge-collab';
   const clientId = opts.clientId || 'unknown';
+  // T024 (spec-collab-fix R005): tunables for the CAS publish-ack handshake.
+  // `casTimeoutMs` is the wall-clock budget for a single cas() call; the spec
+  // pins this at 500 ms. `casElectionMs` is how long each node waits after
+  // seeing a cas_propose before evaluating the winner rule, so contemporaneous
+  // proposals under simulated latency can all arrive before the echoer decides.
+  const casTimeoutMs = Number.isFinite(opts.casTimeoutMs) ? opts.casTimeoutMs : 500;
+  const casElectionMs = Number.isFinite(opts.casElectionMs) ? opts.casElectionMs : 150;
   let client = null;
   let channel = null;
   let connected = false;
@@ -478,12 +749,40 @@ function createAblyTransport(opts) {
     });
     channel = client.channels.get(channelName);
     connected = true;
+    // T024 (R005): every client subscribes to the three authoritative CAS
+    // channel events on connect. This is backbone plumbing, not a userland
+    // subscription, so it bypasses subscribe() and the R004 target filter —
+    // cas_propose / cas_won / lease-update are always broadcast and always
+    // consumed by every participant.
+    channel.subscribe('cas_propose', _onCasPropose);
+    channel.subscribe('cas_won', _onCasWon);
+    channel.subscribe('lease-update', _onLeaseUpdate);
   }
 
   async function disconnect() {
     if (!client) return;
-    await client.close();
     connected = false;
+    // forge-self-fixes-2 R012: brief grace period so queued publishes
+    // have a chance to flush before the connection closes. Without this,
+    // parallel disconnect() calls on two transports hit Ably's
+    // ConnectionManager.failQueuedMessages path and throw err 80017.
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      await client.close();
+    } catch (e) {
+      // Swallow the well-known "Connection closed" race that surfaces when
+      // two transports tear down in quick succession. The connection is
+      // going away either way; any state we cared about was already
+      // flushed by the grace period above. Anything else bubbles up.
+      const msg = (e && e.message) || '';
+      const code = e && e.code;
+      if (code === 80017 || /Connection closed/i.test(msg)) {
+        // no-op
+      } else {
+        throw e;
+      }
+    }
+    client = null;
   }
 
   async function publish(event, data) {
@@ -491,9 +790,17 @@ function createAblyTransport(opts) {
     await channel.publish(event, data);
   }
 
-  function subscribe(event, cb) {
+  function subscribe(event, cb, subOpts) {
     if (!connected) throw new Error('ably transport not connected');
-    channel.subscribe(event, (msg) => cb({ event: msg.name, data: msg.data, from: msg.clientId }));
+    subOpts = subOpts || {};
+    const scopedClientId = subOpts.clientId || clientId;
+    channel.subscribe(event, (msg) => {
+      // R004: transport-layer target filter. If the envelope carries a
+      // `target` that is not this subscriber's clientId, drop the message
+      // before invoking the callback.
+      if (!_targetAllowsDelivery(msg.data, scopedClientId)) return;
+      cb({ event: msg.name, data: msg.data, from: msg.clientId });
+    });
   }
 
   async function sendTargeted(handle, event, data) {
@@ -505,27 +812,206 @@ function createAblyTransport(opts) {
     await publish(event, Object.assign({ target: handle }, data || {}));
   }
 
-  // Lease store interface (read/cas/del/list). For Ably we use channel
-  // state as a logical key-value store: a lease is represented as a
-  // persisted message on a per-lease subchannel. The in-memory map below
-  // acts as a local cache refreshed by subscribing to the lease event.
+  // ====================================================================
+  // T024 (spec-collab-fix R005): authoritative CAS via publish-ack.
+  //
+  // The old cas() mutated a local Map and fire-and-forgot a lease-update
+  // broadcast, so two Ably clients racing null -> lease each saw their own
+  // check against an empty local cache and both returned true. The fix
+  // moves the "who won?" decision onto the wire:
+  //
+  //   1. Proposer publishes   cas_propose { name, expected, next, reqId,
+  //                                         from, ts }
+  //   2. Every receiver records the proposal in a per-lease queue.
+  //   3. After a brief election window (casElectionMs), the authoritative
+  //      echoer evaluates the queue and publishes exactly one cas_won
+  //      { reqId, winner } with the winning proposer's clientId.
+  //      - If someone currently holds the lease, the HOLDER is the echoer.
+  //        The holder admits only proposals whose `expected` matches the
+  //        current lease state, ordered by (ts asc, from asc); first wins.
+  //      - If nobody holds the lease, the participant with the lowest
+  //        known clientId is the echoer, using the same ordering rule on
+  //        null-expected proposals.
+  //   4. Every proposer resolves its pending promise when it sees the
+  //      matching cas_won (true if winner === own clientId, else false).
+  //      A 500 ms timeout returns false with reason "cas_timeout" so a
+  //      dropped echo cannot stall the caller.
+  //
+  // Local lease state is kept authoritative through the cas_won path: the
+  // winning echoer applies the mutation locally AND publishes a
+  // lease-update so late joiners converge via _onLeaseUpdate. Losing
+  // proposers never mutate local state -- they simply observe the winner.
+  // ====================================================================
+
   const localLeases = new Map();
-  function read(name) {
-    return localLeases.has(name) ? Object.assign({}, localLeases.get(name)) : null;
-  }
+  // reqId -> { resolve, timer, next, name, expected, from, ts }
+  const pendingProposals = new Map();
+  // name -> Array<{ reqId, expected, next, from, ts }>
+  const proposalQueue = new Map();
+  // reqIds this node has already echoed a cas_won for (prevents duplicates
+  // when an election window fires more than once for the same request).
+  const echoedReqs = new Set();
+  // reqIds this node has already resolved from a cas_won observation.
+  const resolvedReqs = new Set();
+  // Known participant clientIds, seeded with our own; learned from every
+  // cas_propose `from` field. Used for the no-holder lowest-id tiebreak.
+  const participants = new Set([clientId]);
+  // Debug hook: the most recent cas() result on this transport. Exposed via
+  // _internal so tests can assert on `reason: "cas_timeout"` without forcing
+  // a richer object return type than the spec contract (Promise<boolean>).
+  let lastCasResult = null;
+
   function _same(a, b) {
     if (a === b) return true; if (!a || !b) return false;
     return a.claimant === b.claimant && a.acquiredAt === b.acquiredAt;
   }
+  function _matchesExpected(expected, current) {
+    if (expected === null || expected === undefined) return current === null || current === undefined;
+    return _same(expected, current);
+  }
+
+  // Compare two proposals for the "first valid" rule: lower ts wins; if tied,
+  // lower clientId wins. Strings compare lexicographically which is the
+  // deterministic behavior R005 requires for the no-holder tiebreak.
+  function _proposalOrder(a, b) {
+    if (a.ts !== b.ts) return a.ts - b.ts;
+    if (a.from < b.from) return -1;
+    if (a.from > b.from) return 1;
+    return 0;
+  }
+
+  // Run the winner-election for a given lease name. This is idempotent and
+  // safe to call multiple times: _publishCasWon guards on echoedReqs.
+  function _electAndEcho(name) {
+    const queue = proposalQueue.get(name) || [];
+    if (queue.length === 0) return;
+    const current = localLeases.has(name) ? localLeases.get(name) : null;
+    // Determine who is authorized to echo for this lease.
+    // Holder-of-record path: the current lease holder echoes. Their identity
+    // is the lease `claimant` (which must equal some participant's clientId).
+    let authorizedEchoer;
+    if (current && current.claimant) {
+      authorizedEchoer = current.claimant;
+    } else {
+      // No holder: pick the lowest clientId among known participants.
+      const sorted = Array.from(participants).sort();
+      authorizedEchoer = sorted[0];
+    }
+    if (authorizedEchoer !== clientId) return;
+    // We are the echoer. Evaluate proposals whose `expected` matches the
+    // current lease state, ordered by ts asc then clientId asc.
+    const valid = queue
+      .filter(p => _matchesExpected(p.expected, current))
+      .sort(_proposalOrder);
+    if (valid.length === 0) return;
+    const winner = valid[0];
+    if (echoedReqs.has(winner.reqId)) return;
+    echoedReqs.add(winner.reqId);
+    // Apply the mutation locally before broadcasting the ack, so subsequent
+    // elections in this process see the updated holder.
+    if (winner.next === null || winner.next === undefined) {
+      localLeases.delete(name);
+    } else {
+      localLeases.set(name, Object.assign({}, winner.next));
+    }
+    // Publish cas_won and a companion lease-update. Fire-and-forget: the
+    // proposer also owns its own timeout so a dropped message is safe.
+    if (connected) {
+      channel.publish('cas_won', { reqId: winner.reqId, winner: winner.from, name, next: winner.next });
+      channel.publish('lease-update', { name, next: winner.next });
+    }
+  }
+
+  function _onCasPropose(msg) {
+    const d = msg && msg.data;
+    if (!d || typeof d.reqId !== 'string' || typeof d.name !== 'string') return;
+    if (typeof d.from === 'string') participants.add(d.from);
+    const queue = proposalQueue.get(d.name) || [];
+    // Idempotency: if we've already enqueued this reqId, skip. Prevents
+    // double-counting if the channel redelivers (ably does not normally do
+    // that, but the mock might under custom delays).
+    if (queue.some(p => p.reqId === d.reqId)) return;
+    queue.push({
+      reqId: d.reqId,
+      name: d.name,
+      expected: d.expected === undefined ? null : d.expected,
+      next: d.next === undefined ? null : d.next,
+      from: d.from,
+      ts: Number(d.ts) || Date.now()
+    });
+    proposalQueue.set(d.name, queue);
+    // Defer the election until casElectionMs has passed so contemporaneous
+    // proposals from other nodes can also arrive. This timer is NOT unref'd:
+    // a proposer awaiting on cas() is blocked on the eventual cas_won, and
+    // the cas_won can only be produced after this election fires. Unref
+    // would allow node to exit before resolving the outer promise.
+    setTimeout(() => _electAndEcho(d.name), casElectionMs);
+  }
+
+  function _onCasWon(msg) {
+    const d = msg && msg.data;
+    if (!d || typeof d.reqId !== 'string') return;
+    if (resolvedReqs.has(d.reqId)) return;
+    const pending = pendingProposals.get(d.reqId);
+    if (!pending) {
+      // Not our proposal; still mark resolved so late duplicate echoes are
+      // ignored by this node's bookkeeping.
+      resolvedReqs.add(d.reqId);
+      return;
+    }
+    resolvedReqs.add(d.reqId);
+    pendingProposals.delete(d.reqId);
+    if (pending.timer) clearTimeout(pending.timer);
+    const won = d.winner === clientId;
+    lastCasResult = { ok: won, reason: won ? 'cas_ack' : 'cas_lost', reqId: d.reqId };
+    pending.resolve(won);
+  }
+
+  function _onLeaseUpdate(msg) {
+    const d = msg && msg.data;
+    if (!d || typeof d.name !== 'string') return;
+    if (d.next === null || d.next === undefined) {
+      localLeases.delete(d.name);
+    } else {
+      localLeases.set(d.name, Object.assign({}, d.next));
+    }
+  }
+
+  function read(name) {
+    return localLeases.has(name) ? Object.assign({}, localLeases.get(name)) : null;
+  }
+
   function cas(name, expected, next) {
-    const cur = localLeases.has(name) ? localLeases.get(name) : null;
-    if (expected === null && cur !== null) return false;
-    if (expected !== null && !_same(cur, expected)) return false;
-    if (next === null) localLeases.delete(name);
-    else localLeases.set(name, Object.assign({}, next));
-    // Fire-and-forget broadcast so peers converge.
-    if (connected) publish('lease-update', { name, next }).catch(() => {});
-    return true;
+    if (!connected) {
+      // Cannot publish-ack without a connection; mirror the old behavior's
+      // error surface by resolving false with an explanatory reason.
+      lastCasResult = { ok: false, reason: 'cas_disconnected' };
+      return Promise.resolve(false);
+    }
+    const reqId = crypto.randomUUID();
+    const ts = Date.now();
+    return new Promise((resolve) => {
+      // Register pending BEFORE publishing so an instantaneous echo (same
+      // process, zero-latency mock) is not dropped on the floor.
+      //
+      // The timeout timer is NOT unref'd: the caller is awaiting this
+      // promise and the event loop must stay alive until the timer fires
+      // or a cas_won arrives. If every timer on the loop were unref'd the
+      // process could exit before resolving. Backpressure is bounded by
+      // casTimeoutMs regardless.
+      const timer = setTimeout(() => {
+        if (!pendingProposals.has(reqId)) return;
+        pendingProposals.delete(reqId);
+        resolvedReqs.add(reqId);
+        lastCasResult = { ok: false, reason: 'cas_timeout', reqId };
+        resolve(false);
+      }, casTimeoutMs);
+      pendingProposals.set(reqId, { resolve, timer, name, expected, next, from: clientId, ts });
+      // Fire the proposal. A publish failure does not short-circuit the
+      // pending promise: the timeout path will still resolve eventually so
+      // the caller never hangs.
+      channel.publish('cas_propose', { name, expected, next, reqId, from: clientId, ts });
+    });
   }
   function del(name, expected) { return cas(name, expected, null); }
   function list() { return Array.from(localLeases.values()).map(v => Object.assign({}, v)); }
@@ -535,7 +1021,13 @@ function createAblyTransport(opts) {
     connect, disconnect,
     publish, subscribe, sendTargeted,
     read, cas, del, list,
-    _internal: { get client() { return client; }, get channel() { return channel; } }
+    _internal: {
+      get client() { return client; },
+      get channel() { return channel; },
+      get lastCasResult() { return lastCasResult; },
+      get participants() { return new Set(participants); },
+      get proposalQueue() { return proposalQueue; }
+    }
   };
 }
 
@@ -553,12 +1045,26 @@ function createPollingTransport(opts) {
   opts = opts || {};
   const branch = opts.branch || POLLING_BRANCH_DEFAULT;
   const intervalMs = Number(opts.intervalMs) || POLLING_INTERVAL_MS_DEFAULT;
-  const io = opts.ioAdapter || _defaultPollingIo();
+  const io = opts.ioAdapter || _defaultPollingIo({
+    cwd: opts.cwd,
+    forgeDir: opts.forgeDir,
+    autoPush: opts.autoPush,
+    runner: opts.runner,
+    prompter: opts.prompter,
+    ttlSeconds: opts.ttlSeconds,
+    retries: opts.retries,
+    backoffMs: opts.backoffMs,
+    now: opts.now
+  });
   let connected = false;
   let poller = null;
   const localLeases = new Map();
   const pendingMessages = [];
   const subscribers = new Map(); // event -> [cb...]
+  // T019 (R003): per-process seen-ids set. Messages previously delivered to
+  // any subscriber of this transport instance are never fanned out twice,
+  // even when _refresh() re-reads the same state.json across polls.
+  const seenIds = new Set();
 
   async function connect() {
     if (connected) return;
@@ -583,11 +1089,21 @@ function createPollingTransport(opts) {
     }
     const messages = snapshot && Array.isArray(snapshot.messages) ? snapshot.messages : [];
     for (const m of messages) {
-      if (pendingMessages.find(pm => pm.id === m.id)) continue;
+      if (!m || !m.id) continue;
+      // T019 (R003): seenIds is the per-process dedup contract. pendingMessages
+      // is retained for _internal inspection in tests but no longer drives dedup
+      // (it previously grew unbounded across polls).
+      if (seenIds.has(m.id)) continue;
+      seenIds.add(m.id);
       pendingMessages.push(m);
       const subs = subscribers.get(m.event) || [];
-      for (const cb of subs) {
-        try { cb({ event: m.event, data: m.data, from: m.from }); } catch (_) {}
+      for (const s of subs) {
+        // R004: transport-layer target filter. If the envelope carries a
+        // `target` field that is not this subscriber's clientId, the
+        // callback is never invoked. Broadcast messages (no target) fire
+        // on every subscriber.
+        if (!_targetAllowsDelivery(m.data, s.clientId)) continue;
+        try { s.cb({ event: m.event, data: m.data, from: m.from }); } catch (_) {}
       }
     }
   }
@@ -603,9 +1119,14 @@ function createPollingTransport(opts) {
     await io.appendMessage(branch, msg);
   }
 
-  function subscribe(event, cb) {
+  function subscribe(event, cb, subOpts) {
+    subOpts = subOpts || {};
+    // R004: resolve the clientId the transport should use for target
+    // filtering. Per-call opts.clientId wins over the factory clientId so
+    // a single process can multiplex distinct logical clients during tests.
+    const scopedClientId = subOpts.clientId || opts.clientId || 'unknown';
     const arr = subscribers.get(event) || [];
-    arr.push(cb);
+    arr.push({ cb, clientId: scopedClientId });
     subscribers.set(event, arr);
   }
 
@@ -640,43 +1161,357 @@ function createPollingTransport(opts) {
     connect, disconnect,
     publish, subscribe, sendTargeted,
     read, cas, del, list,
-    _internal: { _refresh, get pendingMessages() { return pendingMessages.slice(); } }
+    _internal: {
+      _refresh,
+      get pendingMessages() { return pendingMessages.slice(); },
+      get seenIds() { return new Set(seenIds); },
+      get io() { return io; },
+      get branch() { return branch; }
+    }
   };
 }
 
-function _defaultPollingIo() {
-  // Default io adapter uses the real git CLI. Tests override with a stub.
-  function gitCmd(cwd, args) {
+/**
+ * Default polling-transport IO adapter. Uses real git plumbing so the
+ * `forge/collab-state` branch on origin always holds exactly one commit
+ * whose `state.json` blob is the authoritative `{ leases, messages }`
+ * document. Every mutation is:
+ *
+ *   1. fetch origin branch + read current state + read current sha (CAS
+ *      expected value for force-with-lease)
+ *   2. mutate state in memory
+ *   3. synthesize a new rootless commit via `git hash-object` +
+ *      `git mktree` + `git commit-tree` (no parent -> exactly one commit
+ *      on the ref after every push)
+ *   4. `git push --force-with-lease=refs/heads/<branch>:<sha-read>` via
+ *      gatedPush so the user's auto_push preference is honored.
+ *   5. on rejection, re-read and retry up to 3 times with 100ms linear
+ *      backoff; the 4th rejection returns `{ ok:false, reason:'cas_exhausted' }`.
+ *
+ * A `writeLease` call may also pass `{ expected }` so the caller gets
+ * `{ ok:false, reason:'cas_race_lost' }` when a peer claimed the slot
+ * first at the semantic level (lease already held by someone else).
+ *
+ * Tests inject a pure in-memory stub via `opts.ioAdapter`; this default
+ * is what runs when no stub is provided.
+ *
+ * opts:
+ *   cwd       repo dir (defaults to process.cwd())
+ *   forgeDir  path to .forge/ so readAutoPushConfig can gate pushes
+ *   autoPush  explicit boolean override; skips config lookup
+ *   runner    injectable (args, {cwd}) -> stdout runner for tests
+ *   ttlSeconds  message TTL for appendMessage compaction (default 300)
+ *   retries   push-retry count before cas_exhausted (default 3)
+ *   backoffMs linear backoff base in ms (default 100)
+ */
+function _defaultPollingIo(opts) {
+  opts = opts || {};
+  const cwd = opts.cwd || process.cwd();
+  const forgeDir = opts.forgeDir || path.join(cwd, '.forge');
+  const ttlSeconds = Number(opts.ttlSeconds) || 300;
+  const retries = Number.isFinite(opts.retries) ? Number(opts.retries) : 3;
+  const backoffMs = Number.isFinite(opts.backoffMs) ? Number(opts.backoffMs) : 100;
+  const runner = typeof opts.runner === 'function' ? opts.runner : null;
+
+  function run(args, runOpts) {
+    runOpts = runOpts || {};
+    if (runner) return runner(args, { cwd: runOpts.cwd || cwd, input: runOpts.input });
+    // When input is provided, stdin must be a pipe (not 'ignore') so the
+    // caller's payload actually reaches the git subprocess. Otherwise
+    // `git hash-object -w --stdin` hashes empty input, producing the tree
+    // with no state.json entry -- a silent wrong answer.
+    const spawnOpts = {
+      cwd: runOpts.cwd || cwd,
+      encoding: 'utf8',
+      stdio: runOpts.input != null ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe']
+    };
+    if (runOpts.input != null) spawnOpts.input = runOpts.input;
     try {
-      return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      return execFileSync('git', args, spawnOpts);
     } catch (e) {
-      const err = new Error('git ' + args.join(' ') + ' failed: ' + (e.stderr ? e.stderr.toString() : e.message));
+      const err = new Error('git ' + args.join(' ') + ' failed: ' +
+        (e.stderr ? e.stderr.toString() : e.message));
+      err.stderr = e.stderr ? e.stderr.toString() : '';
+      err.stdout = e.stdout ? e.stdout.toString() : '';
       err.cause = e;
       throw err;
     }
   }
+
+  function tryRun(args, runOpts) {
+    try { return { ok: true, out: run(args, runOpts) }; }
+    catch (e) { return { ok: false, err: e }; }
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function _fetchBranch(branch) {
+    // Force-update the local remote-tracking ref so re-reads after a
+    // rejected push see the winner's commit, even when our own earlier
+    // push advanced the local tracking ref past the current origin tip.
+    // The '+' prefix on the refspec permits non-fast-forward updates.
+    return tryRun(['fetch', 'origin', '+' + branch + ':refs/remotes/origin/' + branch]);
+  }
+
+  function _lsRemoteSha(branch) {
+    const res = tryRun(['ls-remote', 'origin', 'refs/heads/' + branch]);
+    if (!res.ok) return null;
+    const line = (res.out || '').split(/\r?\n/).find(l => l.trim());
+    if (!line) return null;
+    return line.split(/\s+/)[0] || null;
+  }
+
+  function _readStateAndSha(branch) {
+    // Returns { sha, state } with sha=null when origin has no such branch yet.
+    // We prefer the *remote* sha via ls-remote because a prior rejected push
+    // could have left our local tracking ref stale; ls-remote is the source
+    // of truth for the force-with-lease expected value.
+    const remoteSha = _lsRemoteSha(branch);
+    if (!remoteSha) return { sha: null, state: { leases: {}, messages: [] } };
+    // Ensure the object is local so `git show` can read it.
+    tryRun(['fetch', 'origin', '+' + remoteSha + ':refs/remotes/origin/' + branch]);
+    const show = tryRun(['show', remoteSha + ':state.json']);
+    if (!show.ok) return { sha: remoteSha, state: { leases: {}, messages: [] } };
+    let state;
+    try { state = JSON.parse(show.out); }
+    catch (_) { state = { leases: {}, messages: [] }; }
+    if (!state || typeof state !== 'object') state = { leases: {}, messages: [] };
+    if (!state.leases || typeof state.leases !== 'object') state.leases = {};
+    if (!Array.isArray(state.messages)) state.messages = [];
+    // T019 (R003): schema validate on read. Log a warning on any violation
+    // and return the (coerced) state anyway -- older readers must keep
+    // working when a newer writer adds unknown keys.
+    const check = _validateStateShape(state);
+    if (!check.valid) {
+      try {
+        // eslint-disable-next-line no-console
+        console.warn(
+          'forge:collab state.json schema violation on read: ' + check.errors.join('; ')
+        );
+      } catch (_) { /* best effort */ }
+    }
+    return { sha: remoteSha, state };
+  }
+
+  function _buildCommit(state) {
+    // Serialize state deterministically (keys sorted at the top level) so
+    // two clients producing the same logical state land on the same blob
+    // and the same tree SHA, making no-op writes a true no-op.
+    const canonical = JSON.stringify({
+      leases: state.leases || {},
+      messages: state.messages || []
+    }, null, 2) + '\n';
+    const blobOut = run(['hash-object', '-w', '--stdin'], { input: canonical });
+    const blobSha = blobOut.trim();
+    const treeInput = '100644 blob ' + blobSha + '\tstate.json\n';
+    const treeOut = run(['mktree'], { input: treeInput });
+    const treeSha = treeOut.trim();
+    // No parent -> every mutation replaces the ref with a single-commit history.
+    const commitOut = run(
+      ['commit-tree', treeSha, '-m', 'forge-collab: update state.json'],
+      {}
+    );
+    return commitOut.trim();
+  }
+
+  function _isNonFastForward(err) {
+    const s = ((err && err.stderr) || (err && err.message) || '') + '';
+    return /stale info|non-fast-forward|rejected|force-with-lease|cannot lock ref/i.test(s);
+  }
+
+  async function _pushWithLease(branch, commitSha, expectedSha) {
+    const lease = expectedSha
+      ? 'refs/heads/' + branch + ':' + expectedSha
+      : 'refs/heads/' + branch;
+    const args = [
+      'push',
+      '--force-with-lease=' + lease,
+      'origin',
+      commitSha + ':refs/heads/' + branch
+    ];
+    // Gate through the user's auto_push preference. T012 semantics:
+    // auto_push=false + no prompter -> returns pushed:false, reason:'auto_push_disabled_no_prompter'.
+    const result = await gatedPush(args, {
+      cwd,
+      forgeDir,
+      autoPush: typeof opts.autoPush === 'boolean' ? opts.autoPush : undefined,
+      runner: runner ? (a, o) => runner(a, o || {}) : undefined,
+      prompter: opts.prompter
+    });
+    return result;
+  }
+
+  async function _mutate(branch, mutator) {
+    // mutator: (state) -> { state, abort?: { ok:false, reason:string } }
+    // Returns { ok:true, sha } on success, or the abort object, or
+    // { ok:false, reason:'cas_exhausted' } after retries are exhausted.
+    let attempt = 0;
+    let lastErr = null;
+    while (attempt <= retries) {
+      _fetchBranch(branch);
+      const read = _readStateAndSha(branch);
+      let mutated;
+      try { mutated = mutator(JSON.parse(JSON.stringify(read.state))); }
+      catch (e) { return { ok: false, reason: 'mutator_threw', error: e.message }; }
+      if (mutated && mutated.abort) return mutated.abort;
+      const nextState = mutated && mutated.state ? mutated.state : read.state;
+      // T019 (R003): schema validate on write. Warn but never throw -- we
+      // still land the commit because the shape checks are load-bearing for
+      // the current schema version, not for forward-compat additions.
+      const writeCheck = _validateStateShape(nextState);
+      if (!writeCheck.valid) {
+        try {
+          // eslint-disable-next-line no-console
+          console.warn(
+            'forge:collab state.json schema violation on write: ' + writeCheck.errors.join('; ')
+          );
+        } catch (_) { /* best effort */ }
+      }
+      const commitSha = _buildCommit(nextState);
+      let pushResult;
+      try {
+        pushResult = await _pushWithLease(branch, commitSha, read.sha);
+      } catch (e) {
+        lastErr = e;
+        if (_isNonFastForward(e)) {
+          attempt += 1;
+          if (attempt > retries) break;
+          await sleep(attempt * backoffMs);
+          continue;
+        }
+        throw e;
+      }
+      if (pushResult && pushResult.pushed === false) {
+        // auto_push disabled and prompter refused (or absent).
+        return {
+          ok: false,
+          reason: pushResult.reason || 'push_gated',
+          pushResult
+        };
+      }
+      return { ok: true, sha: commitSha };
+    }
+    return {
+      ok: false,
+      reason: 'cas_exhausted',
+      error: lastErr ? (lastErr.message || String(lastErr)) : 'unknown'
+    };
+  }
+
+  function _pruneMessages(messages, now) {
+    const cutoff = (now || Date.now()) - ttlSeconds * 1000;
+    const seen = new Set();
+    const kept = [];
+    for (const m of messages) {
+      if (!m || typeof m !== 'object') continue;
+      const tsMs = m.ts ? Date.parse(m.ts) : NaN;
+      if (Number.isFinite(tsMs) && tsMs < cutoff) continue;
+      if (m.id && seen.has(m.id)) continue;
+      if (m.id) seen.add(m.id);
+      kept.push(m);
+    }
+    return kept;
+  }
+
+  function _leasesEqual(a, b) {
+    if (a === b) return true;
+    if (a == null && b == null) return true;
+    if (a == null || b == null) return false;
+    return a.claimant === b.claimant && a.acquiredAt === b.acquiredAt;
+  }
+
   return {
     async ensureBranch(branch) {
-      // Create local branch from origin if missing; harmless if it already exists.
-      try { gitCmd(process.cwd(), ['fetch', 'origin', branch]); } catch (_) {}
-      return true;
-    },
-    async readBranch(branch) {
-      try {
-        const raw = gitCmd(process.cwd(), ['show', 'origin/' + branch + ':state.json']);
-        return JSON.parse(raw);
-      } catch (_) {
-        return { leases: {}, messages: [] };
+      _fetchBranch(branch);
+      const read = _readStateAndSha(branch);
+      if (read.sha) return true;
+      // Branch missing on origin -> seed it with an empty state document so
+      // later reads/writes always have a ref to force-with-lease against.
+      const seed = { leases: {}, messages: [] };
+      const commitSha = _buildCommit(seed);
+      // Use an empty expected-sha to mean "ref must not exist yet"; if two
+      // clients race to create, whoever lands first wins and the loser's
+      // push is rejected -> we re-fetch and discover the ref.
+      const pushResult = await gatedPush(
+        [
+          'push',
+          '--force-with-lease=refs/heads/' + branch + ':',
+          'origin',
+          commitSha + ':refs/heads/' + branch
+        ],
+        {
+          cwd,
+          forgeDir,
+          autoPush: typeof opts.autoPush === 'boolean' ? opts.autoPush : undefined,
+          runner: runner ? (a, o) => runner(a, o || {}) : undefined,
+          prompter: opts.prompter
+        }
+      ).catch(() => ({ pushed: false, reason: 'seed_push_rejected' }));
+      if (pushResult && pushResult.pushed === false) {
+        // Either auto_push was gated off, or a peer beat us to the seed.
+        // Re-fetch so subsequent reads see their commit.
+        _fetchBranch(branch);
       }
-    },
-    async writeLease(/* branch, name, lease */) {
-      // Real implementation would commit + push; shipped as a stub here so
-      // the connect/publish/subscribe loop is testable. T012 push-config
-      // task will wire auto-push vs prompted-push here.
       return true;
     },
-    async appendMessage(/* branch, msg */) {
-      return true;
+
+    async readBranch(branch) {
+      _fetchBranch(branch);
+      return _readStateAndSha(branch).state;
+    },
+
+    async writeLease(branch, name, next, writeOpts) {
+      writeOpts = writeOpts || {};
+      const hasExpected = Object.prototype.hasOwnProperty.call(writeOpts, 'expected');
+      return _mutate(branch, (state) => {
+        if (hasExpected) {
+          const cur = state.leases[name] != null ? state.leases[name] : null;
+          if (!_leasesEqual(cur, writeOpts.expected)) {
+            return { abort: { ok: false, reason: 'cas_race_lost', current: cur } };
+          }
+        }
+        if (next === null || next === undefined) delete state.leases[name];
+        else state.leases[name] = next;
+        return { state };
+      });
+    },
+
+    async appendMessage(branch, msg) {
+      return _mutate(branch, (state) => {
+        // T019 (R003): ordering is load-bearing. TTL pruning first removes
+        // stale entries; the 500-cap then evicts the oldest *non-stale*
+        // messages if the queue is still over the ceiling after append.
+        state.messages = _pruneMessages(state.messages, opts.now);
+        const withTs = Object.assign({ ts: new Date().toISOString() }, msg || {});
+        // Dedupe by id when the caller already assigned one.
+        if (!withTs.id || !state.messages.find(m => m.id === withTs.id)) {
+          state.messages.push(withTs);
+        }
+        if (state.messages.length > MESSAGE_QUEUE_CAP) {
+          const evictCount = state.messages.length - MESSAGE_QUEUE_CAP;
+          // Oldest-first eviction: state.messages is append-ordered, so
+          // the earliest entries are the oldest.
+          state.messages = state.messages.slice(evictCount);
+          try {
+            // eslint-disable-next-line no-console
+            console.warn(
+              'forge:collab message queue at cap, evicting ' + evictCount + ' oldest'
+            );
+          } catch (_) { /* best effort */ }
+        }
+        return { state };
+      });
+    },
+
+    // Exposed for the cross-process wire test + future introspection.
+    _internal: {
+      _readStateAndSha,
+      _buildCommit,
+      _pruneMessages,
+      get ttlSeconds() { return ttlSeconds; },
+      get retries() { return retries; },
+      get backoffMs() { return backoffMs; },
+      get messageQueueCap() { return MESSAGE_QUEUE_CAP; }
     }
   };
 }
@@ -694,7 +1529,7 @@ function createTransport(opts) {
   if (mode === 'setup-required') {
     return { mode, guide: renderSetupGuide() };
   }
-  if (mode === 'memory') return Object.assign(createMemoryTransport(), { mode: 'memory' });
+  if (mode === 'memory') return Object.assign(createMemoryTransport(opts), { mode: 'memory' });
   if (mode === 'ably') return createAblyTransport(opts);
   if (mode === 'polling') return createPollingTransport(opts);
   throw new Error('unknown transport mode: ' + mode);
@@ -1002,7 +1837,9 @@ async function routeClarifyingQuestion(transport, collabDir, participants, quest
   fs.mkdirSync(qDir, { recursive: true });
   const id = opts.id || generateFlagId();
   const qPath = path.join(qDir, id + '.md');
-  const target = routeToParticipant(
+  // routeToParticipant may return a Promise when the resolved scorer is
+  // async (e.g., the LLM default); `await` handles both cases.
+  const target = await routeToParticipant(
     String(question.text || '') + '\n' + String(question.source_section || ''),
     participants,
     opts
@@ -1420,7 +2257,9 @@ async function writeForwardMotionFlag(opts) {
       !opts.source_contributors || (opts.source_contributors || []).includes(p.handle)
     );
     const pool = candidates.length > 0 ? candidates : opts.participants;
-    const target = routeToParticipant(
+    // routeToParticipant may return a Promise when the resolved scorer is
+    // async (e.g., the LLM default); `await` handles both cases.
+    const target = await routeToParticipant(
       String(flag.decision) + '\n' + String(flag.rationale || ''),
       pool,
       opts
@@ -1559,7 +2398,9 @@ async function squashMergeAndPush(opts) {
     : (ms) => new Promise(r => setTimeout(r, ms));
   const retries = typeof opts.retries === 'number' ? opts.retries : DEFAULT_MERGE_RETRIES;
   const backoffMs = typeof opts.backoffMs === 'number' ? opts.backoffMs : DEFAULT_MERGE_BACKOFF_MS;
-  const main = opts.mainBranch || 'main';
+  // forge-self-fixes-2 R011: resolve the repo's actual default branch when
+  // caller didn't pin opts.mainBranch. Falls back to 'main' on any failure.
+  const main = opts.mainBranch || _resolvePollingBranch({ cwd: opts.cwd, runner });
   const remote = opts.remote || 'origin';
   const branch = taskBranchName(opts.taskId);
   const msg = opts.commitMessage || ('forge(collab): squash ' + opts.taskId);
@@ -1707,12 +2548,47 @@ function filterClaimableForLateJoin(transport, unblockedTaskIds, opts) {
  *   branch            default "main".
  *   skipGitPull       when true, skip the pull step (for tests).
  */
+// forge-self-fixes-2 R011: resolve the repo's actual upstream branch so
+// lateJoinBootstrap / squashMergeAndPush don't hardcode `main`. Order of
+// preference:
+//   1. explicit opts.branch (caller override)
+//   2. git symbolic-ref refs/remotes/origin/HEAD -> origin/<branch>
+//   3. git rev-parse --abbrev-ref HEAD@{upstream} -> <remote>/<branch>
+//   4. git rev-parse --abbrev-ref HEAD -> <branch>
+//   5. fallback literal 'main'
+// A custom runner is accepted so tests can stub git without shelling out.
+function _resolvePollingBranch(opts) {
+  if (opts && opts.branch) return opts.branch;
+  const runner = (opts && typeof opts.runner === 'function')
+    ? opts.runner
+    : _defaultGitRunner();
+  const cwd = opts && opts.cwd;
+  const tries = [
+    ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'],
+    ['rev-parse', '--abbrev-ref', 'HEAD@{upstream}'],
+    ['rev-parse', '--abbrev-ref', 'HEAD']
+  ];
+  for (const args of tries) {
+    try {
+      const out = runner(args, { cwd });
+      if (!out) continue;
+      const name = String(out).trim();
+      if (!name) continue;
+      // Strip 'origin/' prefix from the symbolic-ref and upstream forms so
+      // callers can use the value directly in `git push origin <branch>`.
+      return name.replace(/^origin\//, '');
+    } catch (_) { /* try next */ }
+  }
+  return 'main';
+}
+
 async function lateJoinBootstrap(opts) {
   opts = opts || {};
   const runner = typeof opts.runner === 'function' ? opts.runner : _defaultGitRunner();
   if (!opts.skipGitPull) {
+    const branch = _resolvePollingBranch({ cwd: opts.cwd, branch: opts.branch, runner });
     try {
-      runner(['pull', opts.remote || 'origin', opts.branch || 'main'], { cwd: opts.cwd });
+      runner(['pull', opts.remote || 'origin', branch], { cwd: opts.cwd });
     } catch (e) {
       return { joined: false, reason: 'git_pull_failed', error: (e && e.message) || String(e) };
     }
@@ -1760,6 +2636,402 @@ function listActiveTaskClaims(transport, opts) {
     .map(l => Object.assign({}, l, { task_id: l.name.slice(CLAIM_PREFIX.length) }));
 }
 
+// ======================================================================
+// .gitignore migration helper (R001).
+//
+// Existing checkouts initialized before the collab carve-out landed have a
+// plain `.forge/` line in .gitignore that silently drops every collab
+// artifact the skill instructs git to add. These helpers detect that case
+// and patch the rules in-place so /forge:collaborate start can prompt the
+// user before the first brainstorm dump is swallowed.
+// ======================================================================
+
+const GITIGNORE_CARVE_OUT_MARKER = '# forge: collab carve-out';
+// Anchored `/.forge/*` plus un-ignore re-entry rules. The glob form (not a
+// bare `.forge/`) is required so git will descend into the collab subdir;
+// git refuses to re-include files under an ignored parent directory.
+const GITIGNORE_CARVE_OUT_BLOCK =
+  GITIGNORE_CARVE_OUT_MARKER + '\n' +
+  '/.forge/*\n' +
+  '!/.forge/collab/\n' +
+  '!/.forge/collab/**\n';
+
+const COLLAB_NESTED_GITIGNORE =
+  '# forge: collab per-machine state (re-ignored under the repo carve-out)\n' +
+  'participant.json\n' +
+  'flag-emit-log-*.jsonl\n' +
+  '.enabled\n';
+
+/**
+ * Classify the state of .gitignore in the repo at `cwd` relative to the
+ * collab carve-out rules. Pure: no filesystem writes.
+ *
+ * Returns:
+ *   { status: 'missing_gitignore',         needsPatching: true }
+ *   { status: 'missing_forge_rule',        needsPatching: true }
+ *   { status: 'legacy_rule_no_carve_out',  needsPatching: true }
+ *   { status: 'missing_nested_gitignore',  needsPatching: true }
+ *   { status: 'ok',                        needsPatching: false }
+ *
+ * `reason` is a human-readable string suitable for surfacing in the
+ * collaborate command's preflight output.
+ */
+function detectLegacyGitignore(opts) {
+  opts = opts || {};
+  const cwd = opts.cwd || process.cwd();
+  const gitignorePath = path.join(cwd, '.gitignore');
+  const nestedPath = path.join(cwd, '.forge', 'collab', '.gitignore');
+
+  if (!fs.existsSync(gitignorePath)) {
+    return {
+      status: 'missing_gitignore',
+      needsPatching: true,
+      reason: 'No .gitignore exists. Collab needs carve-out rules so shared artifacts propagate via git.',
+      gitignorePath,
+      nestedPath
+    };
+  }
+
+  const contents = fs.readFileSync(gitignorePath, 'utf8');
+  const hasCarveOut = contents.includes(GITIGNORE_CARVE_OUT_MARKER);
+  const hasLegacyRule = /^\.forge\/?\s*$/m.test(contents);
+  const nestedExists = fs.existsSync(nestedPath);
+
+  if (hasCarveOut && nestedExists) {
+    return { status: 'ok', needsPatching: false, reason: 'Carve-out rules already present.', gitignorePath, nestedPath };
+  }
+
+  if (hasCarveOut && !nestedExists) {
+    return {
+      status: 'missing_nested_gitignore',
+      needsPatching: true,
+      reason: 'Root carve-out present but .forge/collab/.gitignore is missing. Per-machine state would leak.',
+      gitignorePath,
+      nestedPath
+    };
+  }
+
+  if (hasLegacyRule) {
+    return {
+      status: 'legacy_rule_no_carve_out',
+      needsPatching: true,
+      reason: 'Legacy `.forge/` rule ignores all collab artifacts. Run the migration helper to add the carve-out.',
+      gitignorePath,
+      nestedPath
+    };
+  }
+
+  return {
+    status: 'missing_forge_rule',
+    needsPatching: true,
+    reason: 'No .forge/ rule in .gitignore. Adding the carve-out block.',
+    gitignorePath,
+    nestedPath
+  };
+}
+
+/**
+ * Patch .gitignore and create .forge/collab/.gitignore so that collab
+ * artifacts are tracked while per-machine state stays local.
+ *
+ * Idempotent: running twice is a no-op. Returns a summary of what changed.
+ */
+function patchGitignore(opts) {
+  opts = opts || {};
+  const cwd = opts.cwd || process.cwd();
+  const detection = detectLegacyGitignore({ cwd });
+  const actions = [];
+
+  const gitignorePath = detection.gitignorePath;
+  const nestedPath = detection.nestedPath;
+  const nestedDir = path.dirname(nestedPath);
+
+  if (detection.status === 'ok') {
+    return { patched: false, actions, detection };
+  }
+
+  // Root .gitignore handling.
+  if (detection.status === 'missing_gitignore') {
+    fs.writeFileSync(gitignorePath, GITIGNORE_CARVE_OUT_BLOCK);
+    actions.push('created_gitignore');
+  } else if (detection.status === 'legacy_rule_no_carve_out') {
+    // Replace the first bare `.forge/` line with the full carve-out block,
+    // preserving surrounding rules so we don't clobber other user entries.
+    const original = fs.readFileSync(gitignorePath, 'utf8');
+    const lines = original.split(/\r?\n/);
+    const newLines = [];
+    let replaced = false;
+    for (const line of lines) {
+      if (!replaced && /^\.forge\/?\s*$/.test(line)) {
+        newLines.push(GITIGNORE_CARVE_OUT_BLOCK.trimEnd());
+        replaced = true;
+      } else {
+        newLines.push(line);
+      }
+    }
+    fs.writeFileSync(gitignorePath, newLines.join('\n'));
+    actions.push('replaced_legacy_forge_rule');
+  } else if (detection.status === 'missing_forge_rule') {
+    const original = fs.readFileSync(gitignorePath, 'utf8');
+    const sep = original.endsWith('\n') ? '' : '\n';
+    fs.appendFileSync(gitignorePath, sep + '\n' + GITIGNORE_CARVE_OUT_BLOCK);
+    actions.push('appended_carve_out_block');
+  }
+
+  // Nested .forge/collab/.gitignore handling.
+  if (!fs.existsSync(nestedPath)) {
+    fs.mkdirSync(nestedDir, { recursive: true });
+    fs.writeFileSync(nestedPath, COLLAB_NESTED_GITIGNORE);
+    actions.push('created_nested_gitignore');
+  }
+
+  return { patched: true, actions, detection };
+}
+
+// ======================================================================
+// Explicit `.enabled` marker for collab-mode lifecycle (T028, R008)
+// ======================================================================
+// Rationale: detecting collab mode solely by `participant.json` existence
+// leaves a half-off state whenever `leave` crashes mid-cleanup. Adding an
+// explicit marker that `start` writes atomically *after* `participant.json`
+// and `leave` deletes *before* anything else gives us a single bit that is
+// either fully on or fully off. Crash-recovery can detect mismatches and
+// offer to repair or reset. The invariants:
+//
+//   /forge:collaborate start -> participant.json FIRST, then .enabled LAST.
+//   /forge:collaborate leave -> .enabled FIRST, then everything else, then
+//                               participant.json LAST.
+//
+// Callers that need to check collab-mode should use `collabModeEnabled`
+// (which tests for `.enabled`, not `participant.json`). The CLI bridge in
+// scripts/forge-tools.cjs delegates to this helper and also performs a
+// silent forward-compat migration: when `participant.json` exists but
+// `.enabled` does not (pre-T028 session lingering after upgrade), the CLI
+// writes `.enabled` in place so the existing session keeps working.
+
+function _collabDir(forgeDir) {
+  return path.join(forgeDir || '.forge', 'collab');
+}
+
+/** Absolute path of the `.enabled` marker for a given forgeDir. */
+function enabledMarkerPath(forgeDir) {
+  return path.join(_collabDir(forgeDir), '.enabled');
+}
+
+/** Absolute path of the `participant.json` for a given forgeDir. */
+function participantJsonPath(forgeDir) {
+  return path.join(_collabDir(forgeDir), 'participant.json');
+}
+
+/**
+ * Atomically drop the `.enabled` marker. Callers must have already written
+ * `participant.json` -- this is the final step of `/forge:collaborate start`.
+ * Idempotent: writing over an existing marker is a no-op.
+ */
+function writeEnabledMarker(forgeDir) {
+  const p = enabledMarkerPath(forgeDir);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, '');
+  return p;
+}
+
+/**
+ * Remove the `.enabled` marker. MUST be called as the first step of
+ * `/forge:collaborate leave` so crash recovery between the marker delete
+ * and the participant.json delete still classifies the session as off.
+ * Returns true if a marker was deleted, false if none existed.
+ */
+function removeEnabledMarker(forgeDir) {
+  const p = enabledMarkerPath(forgeDir);
+  if (!fs.existsSync(p)) return false;
+  fs.rmSync(p, { force: true });
+  return true;
+}
+
+/**
+ * Authoritative check: is collab mode currently on? Tests for `.enabled`
+ * only. `participant.json` alone is NOT enough -- that is a half-off state
+ * and `recoverCollabState` should be invoked to clean it up.
+ */
+function collabModeEnabled(forgeDir) {
+  return fs.existsSync(enabledMarkerPath(forgeDir));
+}
+
+/**
+ * Classify the state of the two markers. Pure: no filesystem writes.
+ *
+ * Returns one of:
+ *   { status: 'inactive',            actionable: false }  // both absent -- never started, nothing to do
+ *   { status: 'healthy',             actionable: false }  // both present -- session running normally
+ *   { status: 'stale_participant',   actionable: true,  remedy: 'reset'   }  // participant.json only -- crash before .enabled landed
+ *   { status: 'stale_enabled',       actionable: true,  remedy: 'repair'  }  // .enabled only -- crash after participant.json was deleted
+ *   { status: 'session_mismatch',    actionable: true,  remedy: 'migrate' }  // both present but participant.session_id != current origin
+ *
+ * `reason` is a human-readable string for command output.
+ */
+function classifyCollabState(forgeDir, opts) {
+  opts = opts || {};
+  const enabled = collabModeEnabled(forgeDir);
+  const pPath = participantJsonPath(forgeDir);
+  const hasParticipant = fs.existsSync(pPath);
+
+  if (!enabled && !hasParticipant) {
+    return { status: 'inactive', actionable: false, reason: 'No collab session in progress.' };
+  }
+
+  if (enabled && !hasParticipant) {
+    return {
+      status: 'stale_enabled',
+      actionable: true,
+      remedy: 'repair',
+      reason: '.forge/collab/.enabled exists but participant.json is missing. Likely a crash after partial cleanup; repair re-derives the participant from git.'
+    };
+  }
+
+  if (!enabled && hasParticipant) {
+    return {
+      status: 'stale_participant',
+      actionable: true,
+      remedy: 'reset',
+      reason: '.forge/collab/participant.json exists but .enabled is missing. Likely a crash before the previous start completed; reset cleans up.'
+    };
+  }
+
+  // Both present. Check session-id vs current origin.
+  let participant;
+  try {
+    participant = JSON.parse(fs.readFileSync(pPath, 'utf8'));
+  } catch (e) {
+    return {
+      status: 'stale_participant',
+      actionable: true,
+      remedy: 'reset',
+      reason: 'participant.json is unreadable (' + e.message + '). Reset recommended.'
+    };
+  }
+
+  let currentSessionId = null;
+  try {
+    if (typeof opts.sessionIdResolver === 'function') {
+      currentSessionId = opts.sessionIdResolver();
+    } else {
+      currentSessionId = sessionIdFromOrigin({ cwd: opts.cwd });
+    }
+  } catch (_) {
+    // Cannot resolve origin in this context; skip the mismatch check.
+    currentSessionId = null;
+  }
+
+  if (currentSessionId && participant.session_id && currentSessionId !== participant.session_id) {
+    return {
+      status: 'session_mismatch',
+      actionable: true,
+      remedy: 'migrate',
+      reason: 'participant.json references session ' + String(participant.session_id).slice(0, 8) +
+              ' but current origin resolves to ' + String(currentSessionId).slice(0, 8) +
+              '. The repo was re-pointed since start; migrate rewrites the participant.',
+      current_session_id: currentSessionId,
+      participant_session_id: participant.session_id
+    };
+  }
+
+  return { status: 'healthy', actionable: false, reason: 'Collab session is running normally.' };
+}
+
+/**
+ * Scan collab state and offer the right remedy for each stale configuration.
+ * This is the programmatic surface behind `/forge:collaborate recover`; the
+ * command layer is expected to prompt the user before invoking the remedy.
+ *
+ * Remedies (pure unless opts.apply === true):
+ *   reset    -> delete participant.json (and .enabled if present)
+ *   repair   -> re-derive participant from git config + session id, then
+ *               rewrite participant.json
+ *   migrate  -> rewrite participant.session_id to the current origin-derived id
+ *
+ * When opts.apply is falsy, returns the proposed actions without touching
+ * the filesystem. When truthy, performs the action and reports the result.
+ */
+function recoverCollabState(forgeDir, opts) {
+  opts = opts || {};
+  const cls = classifyCollabState(forgeDir, opts);
+  const apply = !!opts.apply;
+
+  // Nothing to do.
+  if (!cls.actionable) {
+    return { status: cls.status, applied: false, reason: cls.reason };
+  }
+
+  // Dry-run: just describe what would happen.
+  if (!apply) {
+    return {
+      status: cls.status,
+      remedy: cls.remedy,
+      applied: false,
+      reason: cls.reason
+    };
+  }
+
+  const pPath = participantJsonPath(forgeDir);
+  const ePath = enabledMarkerPath(forgeDir);
+
+  if (cls.remedy === 'reset') {
+    const actions = [];
+    if (fs.existsSync(ePath)) { fs.rmSync(ePath, { force: true }); actions.push('removed_enabled'); }
+    if (fs.existsSync(pPath)) { fs.rmSync(pPath, { force: true }); actions.push('removed_participant'); }
+    return { status: cls.status, remedy: 'reset', applied: true, actions, reason: cls.reason };
+  }
+
+  if (cls.remedy === 'repair') {
+    // .enabled exists but participant.json is gone. Rebuild participant
+    // from git config and current session id, then leave both in place.
+    const handle = (opts.handleResolver && opts.handleResolver()) || _resolveHandleFromGit(opts) || 'unknown';
+    let sessionId = null;
+    try {
+      sessionId = (opts.sessionIdResolver && opts.sessionIdResolver()) || sessionIdFromOrigin({ cwd: opts.cwd });
+    } catch (_) {
+      // No origin available; recovery cannot reconstruct the session id.
+      return {
+        status: cls.status,
+        remedy: 'repair',
+        applied: false,
+        reason: 'Cannot derive session id from origin; configure a git remote and retry.'
+      };
+    }
+    const participant = { handle, session_id: sessionId, started: new Date().toISOString(), recovered: true };
+    fs.mkdirSync(path.dirname(pPath), { recursive: true });
+    fs.writeFileSync(pPath, JSON.stringify(participant, null, 2));
+    return { status: cls.status, remedy: 'repair', applied: true, actions: ['wrote_participant'], participant, reason: cls.reason };
+  }
+
+  if (cls.remedy === 'migrate') {
+    const raw = JSON.parse(fs.readFileSync(pPath, 'utf8'));
+    raw.session_id = cls.current_session_id;
+    raw.migrated_from = cls.participant_session_id;
+    raw.migrated_at = new Date().toISOString();
+    fs.writeFileSync(pPath, JSON.stringify(raw, null, 2));
+    return { status: cls.status, remedy: 'migrate', applied: true, actions: ['rewrote_session_id'], participant: raw, reason: cls.reason };
+  }
+
+  return { status: cls.status, applied: false, reason: 'unknown remedy: ' + cls.remedy };
+}
+
+/** Best-effort handle derivation for recovery; falls back to $USER. */
+function _resolveHandleFromGit(opts) {
+  opts = opts || {};
+  try {
+    const { execFileSync } = require('node:child_process');
+    const out = execFileSync('git', ['config', 'user.email'], {
+      cwd: opts.cwd,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+      timeout: 3000
+    }).trim();
+    if (out) return out.split('@')[0];
+  } catch (_) { /* fall through */ }
+  return process.env.USER || process.env.USERNAME || null;
+}
+
 module.exports = {
   sessionIdFromOrigin,
   scoreParticipant,
@@ -1769,6 +3041,7 @@ module.exports = {
   DEFAULT_HEARTBEAT_SECONDS,
   DEFAULT_CONSOLIDATION_TTL_SECONDS,
   createMemoryTransport,
+  createMemoryBus,
   tryAcquireLease,
   refreshLease,
   releaseLease,
@@ -1788,6 +3061,7 @@ module.exports = {
   createTransport,
   createAblyTransport,
   createPollingTransport,
+  _resolvePollingBranch,
   POLLING_BRANCH_DEFAULT,
   POLLING_INTERVAL_MS_DEFAULT,
   brainstormDump,
@@ -1818,11 +3092,30 @@ module.exports = {
   gatedPush,
   filterClaimableForLateJoin,
   lateJoinBootstrap,
+  detectLegacyGitignore,
+  patchGitignore,
+  GITIGNORE_CARVE_OUT_MARKER,
+  GITIGNORE_CARVE_OUT_BLOCK,
+  COLLAB_NESTED_GITIGNORE,
+  enabledMarkerPath,
+  participantJsonPath,
+  writeEnabledMarker,
+  removeEnabledMarker,
+  collabModeEnabled,
+  classifyCollabState,
+  recoverCollabState,
   // Exposed for tests and future-task extension points:
   _internal: {
     readOriginUrl, _heuristicScorer, _readEpsilonFromConfig, _tokenSet,
+    _readScorerFromConfig, _readFallbackJaccardFromConfig, _resolveScorer,
+    _clampScore,
     _isExpired, _claimName, _safeHandle, _safeKind,
     _parseFrontmatter, _extractSections, _defaultClassifier, _defaultContradictionDetector,
-    _inputsPath, _consolidatedPath, _categoriesPath, _questionsDir
+    _inputsPath, _consolidatedPath, _categoriesPath, _questionsDir,
+    _defaultPollingIo,
+    _validateStateShape,
+    _targetAllowsDelivery,
+    MESSAGE_QUEUE_CAP,
+    SCHEMA_PATH
   }
 };
