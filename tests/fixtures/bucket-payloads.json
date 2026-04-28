@@ -1,0 +1,462 @@
+{
+  "_doc": "T002 / R002 fixture inputs. Each bucket has >=6 cases. `expected` values are computed via the classifier's chars/4 estimator -- they are exact, not approximations -- so any drift in the estimator will be caught by the tests.",
+
+  "instructions": [
+    {
+      "name": "string system prompt",
+      "input": {
+        "system": "You are a careful coding assistant. Always test before declaring done.",
+        "messages": [],
+        "tools": []
+      },
+      "expected": { "instructions": 18, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 0 }
+    },
+    {
+      "name": "long system prompt with skill body",
+      "input": {
+        "system": "You are forge-executor. Skill: karpathy-guardrails -- think before coding, simplicity first, surgical changes, goal-driven execution. CLAUDE.md says no emojis. Follow repo conventions exactly.",
+        "messages": [],
+        "tools": []
+      },
+      "expected": { "instructions": 48, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 0 }
+    },
+    {
+      "name": "system as array of text blocks",
+      "input": {
+        "system": [
+          { "type": "text", "text": "Block one: agent description." },
+          { "type": "text", "text": "Block two: skill body content here." }
+        ],
+        "messages": [],
+        "tools": []
+      },
+      "expected": { "instructions": 17, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 0 }
+    },
+    {
+      "name": "empty system string",
+      "input": { "system": "", "messages": [], "tools": [] },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 0 }
+    },
+    {
+      "name": "system array with one block",
+      "input": {
+        "system": [{ "type": "text", "text": "single block instruction" }],
+        "messages": [],
+        "tools": []
+      },
+      "expected": { "instructions": 6, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 0 }
+    },
+    {
+      "name": "short system + irrelevant other fields",
+      "input": {
+        "system": "be terse",
+        "messages": [],
+        "tools": []
+      },
+      "expected": { "instructions": 2, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 0 }
+    }
+  ],
+
+  "tool_definitions": [
+    {
+      "name": "single simple tool",
+      "input": {
+        "system": "",
+        "messages": [],
+        "tools": [
+          { "name": "read_file", "description": "Read file", "input_schema": { "type": "object", "properties": { "path": { "type": "string" } } } }
+        ]
+      },
+      "expected_total_only": true
+    },
+    {
+      "name": "two tools",
+      "input": {
+        "system": "",
+        "messages": [],
+        "tools": [
+          { "name": "read_file", "description": "Read", "input_schema": { "type": "object" } },
+          { "name": "write_file", "description": "Write", "input_schema": { "type": "object" } }
+        ]
+      },
+      "expected_total_only": true
+    },
+    {
+      "name": "tool with rich description",
+      "input": {
+        "system": "",
+        "messages": [],
+        "tools": [
+          {
+            "name": "search",
+            "description": "Search the codebase using ripgrep with full regex syntax. Supports content and file modes.",
+            "input_schema": { "type": "object", "properties": { "pattern": { "type": "string" }, "path": { "type": "string" } } }
+          }
+        ]
+      },
+      "expected_total_only": true
+    },
+    {
+      "name": "tool with no input_schema",
+      "input": {
+        "system": "",
+        "messages": [],
+        "tools": [{ "name": "noop", "description": "Does nothing" }]
+      },
+      "expected_total_only": true
+    },
+    {
+      "name": "tool with empty strings",
+      "input": {
+        "system": "",
+        "messages": [],
+        "tools": [{ "name": "", "description": "", "input_schema": {} }]
+      },
+      "expected_total_only": true
+    },
+    {
+      "name": "five tools",
+      "input": {
+        "system": "",
+        "messages": [],
+        "tools": [
+          { "name": "a", "description": "A", "input_schema": {} },
+          { "name": "b", "description": "B", "input_schema": {} },
+          { "name": "c", "description": "C", "input_schema": {} },
+          { "name": "d", "description": "D", "input_schema": {} },
+          { "name": "e", "description": "E", "input_schema": {} }
+        ]
+      },
+      "expected_total_only": true
+    }
+  ],
+
+  "tool_results": [
+    {
+      "name": "single tool_result with plain string content",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              { "type": "tool_result", "tool_use_id": "x", "content": "Command exited with code 0." }
+            ]
+          }
+        ]
+      },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 7, "repo_reads": 0, "prose": 0 }
+    },
+    {
+      "name": "tool_result with array content of text blocks",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "y",
+                "content": [
+                  { "type": "text", "text": "stdout: ok" },
+                  { "type": "text", "text": "stderr: warning" }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 7, "repo_reads": 0, "prose": 0 }
+    },
+    {
+      "name": "two tool_results in sequence",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "a", "content": "first result" }] },
+          { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "b", "content": "second result here" }] }
+        ]
+      },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 8, "repo_reads": 0, "prose": 0 }
+    },
+    {
+      "name": "tool_result containing a number-like string but no tab prefix",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "n", "content": "Result: 42 widgets processed." }] }
+        ]
+      },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 8, "repo_reads": 0, "prose": 0 }
+    },
+    {
+      "name": "tool_result with empty content",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "z", "content": "" }] }
+        ]
+      },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 0 }
+    },
+    {
+      "name": "tool_result followed by assistant prose",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "q", "content": "no matches found" }] },
+          { "role": "assistant", "content": [{ "type": "text", "text": "Then I will look elsewhere." }] }
+        ]
+      },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 4, "repo_reads": 0, "prose": 7 }
+    }
+  ],
+
+  "repo_reads": [
+    {
+      "name": "Read tool result with cat -n line numbers",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "r1",
+                "content": "     1\tconst x = 1;\n     2\tconst y = 2;\n     3\tmodule.exports = { x, y };\n"
+              }
+            ]
+          }
+        ]
+      },
+      "expected_repo_reads_only": true
+    },
+    {
+      "name": "Read tool result with <file> envelope",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "r2",
+                "content": "<file path=\"src/foo.ts\">\nexport const foo = 1;\n</file>"
+              }
+            ]
+          }
+        ]
+      },
+      "expected_repo_reads_only": true
+    },
+    {
+      "name": "Grep result with line-number prefixes",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "g1",
+                "content": "src/a.ts\n    12\tfunction foo() {}\n    18\tfunction bar() {}\nsrc/b.ts\n     4\tfunction baz() {}\n"
+              }
+            ]
+          }
+        ]
+      },
+      "expected_repo_reads_only": true
+    },
+    {
+      "name": "Read result mixed with array content",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "r3",
+                "content": [
+                  { "type": "text", "text": "     1\tline one\n     2\tline two\n" }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "expected_repo_reads_only": true
+    },
+    {
+      "name": "Two reads, both file-content shaped",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "r4", "content": "     1\talpha\n     2\tbeta\n" }] },
+          { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "r5", "content": "<file path=\"x.txt\">hello world</file>" }] }
+        ]
+      },
+      "expected_repo_reads_only": true
+    },
+    {
+      "name": "Long Read result simulating a real source file",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "r6",
+                "content": "     1\t'use strict';\n     2\t\n     3\tconst fs = require('node:fs');\n     4\tconst path = require('node:path');\n     5\t\n     6\tfunction main() {\n     7\t  const cwd = process.cwd();\n     8\t  console.log(cwd);\n     9\t}\n    10\t\n    11\tmodule.exports = { main };\n"
+              }
+            ]
+          }
+        ]
+      },
+      "expected_repo_reads_only": true
+    }
+  ],
+
+  "prose": [
+    {
+      "name": "single assistant text block",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          { "role": "assistant", "content": [{ "type": "text", "text": "Sure, I will read the file first." }] }
+        ]
+      },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 9 }
+    },
+    {
+      "name": "multiple assistant text blocks",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "text", "text": "First, I will inspect the structure." },
+              { "type": "text", "text": "Then I will write the implementation." }
+            ]
+          }
+        ]
+      },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 19 }
+    },
+    {
+      "name": "user prose as plain string content",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          { "role": "user", "content": "Please implement the bucket classifier." }
+        ]
+      },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 10 }
+    },
+    {
+      "name": "user prose as text block",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          { "role": "user", "content": [{ "type": "text", "text": "What does this script do?" }] }
+        ]
+      },
+      "expected": { "instructions": 0, "tool_definitions": 0, "tool_results": 0, "repo_reads": 0, "prose": 7 }
+    },
+    {
+      "name": "tool_use blocks count as prose",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "tool_use", "id": "tu1", "name": "read_file", "input": { "path": "src/foo.ts" } }
+            ]
+          }
+        ]
+      },
+      "expected_prose_only": true
+    },
+    {
+      "name": "mixed assistant text and tool_use",
+      "input": {
+        "system": "",
+        "tools": [],
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "text", "text": "Let me check the file." },
+              { "type": "tool_use", "id": "tu2", "name": "read_file", "input": { "path": "a.txt" } }
+            ]
+          }
+        ]
+      },
+      "expected_prose_only": true
+    }
+  ],
+
+  "real_shape_self_consistency": {
+    "name": "real-shape mixed payload for sum-within-10% check",
+    "input": {
+      "system": "You are forge-executor. Follow karpathy guardrails. Skill body content here, repeated for length: lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
+      "tools": [
+        {
+          "name": "Read",
+          "description": "Read a file from disk and return its contents with line numbers.",
+          "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } }, "required": ["file_path"] }
+        },
+        {
+          "name": "Bash",
+          "description": "Execute a shell command and return stdout/stderr.",
+          "input_schema": { "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] }
+        }
+      ],
+      "messages": [
+        { "role": "user", "content": "Implement T002, the bucket classifier, exactly as the spec says." },
+        { "role": "assistant", "content": [{ "type": "text", "text": "I will start by reading the spec and the existing usage capture module." }] },
+        {
+          "role": "assistant",
+          "content": [{ "type": "tool_use", "id": "tu1", "name": "Read", "input": { "file_path": "scripts/forge-usage-capture.cjs" } }]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "tu1",
+              "content": "     1\t'use strict';\n     2\tconst fs = require('node:fs');\n     3\t// long file body...\n     4\tmodule.exports = {};\n"
+            }
+          ]
+        },
+        { "role": "assistant", "content": [{ "type": "text", "text": "Now I will write the classifier and tests, then run the suite." }] }
+      ]
+    }
+  }
+}
