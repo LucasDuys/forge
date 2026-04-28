@@ -4629,6 +4629,67 @@ function _readLastError(forgeDir, state) {
 // unchanged in name, shape, and semantics.
 const HEADLESS_STATUS_SCHEMA_VERSION = 2;
 
+// Wave 2 / R005 -- aggregateCacheStats(forgeDir)
+//   Reads <forgeDir>/cache-stats.jsonl (rolling log written by
+//   hooks/tool-cache-store.js::recordCacheEvent) and returns the aggregate
+//   counters surfaced under `tokens.cache` on queryHeadlessState.
+//
+//   Returns { hits, misses, savings_estimate_tokens } where:
+//     - hits = count of events with event.hit === true
+//     - misses = count of events with event.hit === false
+//     - savings_estimate_tokens = sum over hits of
+//         min(floor(event.output_bytes / 4), 4000)
+//       (rough chars-to-tokens ratio of 4, capped at 4000 per call.)
+//
+//   Defensive:
+//     - Missing file -> { hits: 0, misses: 0, savings_estimate_tokens: 0 }
+//     - Corrupted / non-JSON / empty lines are silently skipped (the loop
+//       continues over the rest of the log).
+//     - Never throws.
+//
+//   FORGE_TOKEN_OPT=0 short-circuits to all-zero without reading the file.
+//
+//   Perf budget: <= 2ms on a full 1000-line log. Implementation uses a single
+//   readFileSync + split('\n') + per-line JSON.parse with a try/catch around
+//   each parse. No regex, no recursion, no async.
+function aggregateCacheStats(forgeDir) {
+  const empty = { hits: 0, misses: 0, savings_estimate_tokens: 0 };
+  if (process.env.FORGE_TOKEN_OPT === '0') return empty;
+  const dir = forgeDir || '.forge';
+  const target = path.join(dir, 'cache-stats.jsonl');
+  let buf;
+  try {
+    if (!fs.existsSync(target)) return empty;
+    buf = fs.readFileSync(target, 'utf8');
+  } catch (_e) {
+    return empty;
+  }
+  if (!buf) return empty;
+
+  let hits = 0;
+  let misses = 0;
+  let savings = 0;
+  // split('\n') preserves a trailing empty entry if the file ends with \n;
+  // the empty-line guard inside the loop handles it without an explicit pop.
+  const lines = buf.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    let ev;
+    try { ev = JSON.parse(line); } catch (_e) { continue; }
+    if (!ev || typeof ev !== 'object' || Array.isArray(ev)) continue;
+    if (ev.hit) {
+      hits++;
+      const bytes = Number(ev.output_bytes) || 0;
+      const est = Math.min(Math.floor(bytes / 4), 4000);
+      if (est > 0) savings += est;
+    } else {
+      misses++;
+    }
+  }
+  return { hits, misses, savings_estimate_tokens: savings };
+}
+
 // T004 / R004 -- buildTokensBlock(forgeDir)
 //   Produces the additive `tokens` block surfaced on queryHeadlessState.
 //   Shape:
@@ -4647,8 +4708,12 @@ const HEADLESS_STATUS_SCHEMA_VERSION = 2;
 //       source = "estimate".
 //     - FORGE_TOKEN_OPT=0: schema_version still bumps (code-version), but
 //       actual/buckets are zero-filled and source = "estimate".
-//     - cache.{hits,misses,savings_estimate_tokens} are stubbed to zero in
-//       Wave 1; Wave 2 / R005 wires real cache accounting.
+//     - cache.{hits,misses,savings_estimate_tokens} are populated by
+//       aggregateCacheStats from <forgeDir>/cache-stats.jsonl (Wave 2 / R005).
+//       The cache field is independent of the ledger -- it reflects the
+//       rolling cache-event log regardless of ledger version or session
+//       presence. FORGE_TOKEN_OPT=0 still zero-fills cache (aggregator
+//       short-circuits on the kill-switch).
 //
 //   Defensive: never throws. Returns the canonical shape with safe defaults
 //   on any failure path.
@@ -4658,6 +4723,10 @@ const HEADLESS_STATUS_SCHEMA_VERSION = 2;
 //   same file. Shape: { ledger, was_v1, was_corrupted } as returned by
 //   forge-budget.loadLedger.
 function buildTokensBlock(forgeDir, preloaded) {
+  // Cache field is shared across all return branches below. The aggregator
+  // already honors FORGE_TOKEN_OPT=0 (returns zeros without I/O), so we can
+  // call it unconditionally and rely on its own kill-switch.
+  const cache = aggregateCacheStats(forgeDir);
   const empty = {
     schema_version: 2,
     actual: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
@@ -4668,10 +4737,11 @@ function buildTokensBlock(forgeDir, preloaded) {
       repo_reads: 0,
       prose: 0,
     },
-    cache: { hits: 0, misses: 0, savings_estimate_tokens: 0 },
+    cache,
     source: 'estimate',
   };
   // FORGE_TOKEN_OPT=0: bypass any ledger read; emit the zero-filled shape.
+  // (cache is already zeroed by aggregateCacheStats in this branch.)
   if (process.env.FORGE_TOKEN_OPT === '0') return empty;
 
   let loaded = preloaded;
@@ -4708,7 +4778,7 @@ function buildTokensBlock(forgeDir, preloaded) {
       repo_reads: num(buckets.repo_reads),
       prose: num(buckets.prose),
     },
-    cache: { hits: 0, misses: 0, savings_estimate_tokens: 0 },
+    cache,
     source: session.source === 'transcript' ? 'transcript' : 'estimate',
   };
 }
@@ -7982,6 +8052,7 @@ module.exports = {
   verifyStateConsistency,
   runHeadless, queryHeadlessState, HEADLESS_EXIT, HEADLESS_STATUS_SCHEMA_VERSION,
   buildTokensBlock,
+  aggregateCacheStats,
   performForensicRecovery,
   validateWorkflowPrerequisites,
   truncateGraphOutput,
