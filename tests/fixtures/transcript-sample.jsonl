@@ -1,0 +1,4 @@
+{"type":"user","session_id":"sess-abc123","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"Implement the registration endpoint"}]}}
+{"type":"assistant","session_id":"sess-abc123","uuid":"a1","message":{"id":"msg_01","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"I'll implement the registration endpoint."}],"usage":{"input_tokens":1200,"output_tokens":340,"cache_read_input_tokens":8500,"cache_creation_input_tokens":0}}}
+{"type":"user","session_id":"sess-abc123","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"file written"}]}}
+{"type":"assistant","session_id":"sess-abc123","uuid":"a2","message":{"id":"msg_02","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"Done. Tests pass."}],"usage":{"input_tokens":900,"output_tokens":210,"cache_read_input_tokens":9100,"cache_creation_input_tokens":150}}}
