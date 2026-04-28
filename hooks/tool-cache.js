@@ -43,16 +43,23 @@ try {
 }
 
 // --- R002: tiered TTL classes (defaults, in milliseconds) ---
-// stable:      30 minutes -- version queries, immutable git refs (sha-pinned).
-// volatile:    2 minutes  -- ls/find/git status/git diff/gh views/cat/...
-// head_pinned: 2 minutes  -- STUB matching volatile until T006 wires the
-//                            per-HEAD invalidation check (depends on T001
-//                            HEAD helper). Class boundary is established now
-//                            so T006 only needs to swap the TTL resolver.
+// stable:           30 minutes -- version queries, immutable git refs (sha-pinned).
+// volatile:         2 minutes  -- ls/find/git status/git diff/gh views/cat/...
+// head_pinned:      2 minutes  -- STUB matching volatile until T006 wires the
+//                                 per-HEAD invalidation check (depends on T001
+//                                 HEAD helper). Class boundary is established now
+//                                 so T006 only needs to swap the TTL resolver.
+// read_stat_pinned: 10 minutes -- Read-tool entries keyed on (path, mtime, size).
+//                                 Long TTL is safe because the (mtime, size) tuple
+//                                 in the cache key changes whenever the file
+//                                 changes, naturally invalidating stale entries.
+//                                 R003 (T005). Falls back to 'volatile' (120s)
+//                                 when fs.statSync fails.
 const TTL_BY_CLASS = Object.freeze({
-  stable: 1800000,      // 30 min
-  volatile: 120000,     // 2 min
-  head_pinned: 120000,  // 2 min (stub; T006 → per-HEAD invalidation)
+  stable: 1800000,            // 30 min
+  volatile: 120000,           // 2 min
+  head_pinned: 120000,        // 2 min (stub; T006 → per-HEAD invalidation)
+  read_stat_pinned: 600000,   // 10 min (R003 / T005)
 });
 
 // v1 flat TTL retained for FORGE_TOKEN_OPT=0 parity.
@@ -248,6 +255,60 @@ function hashInput(toolName, toolInput) {
   return crypto.createHash('md5').update(key).digest('hex');
 }
 
+// --- R003: Read-tool mtime+size keying (T005) ---
+//
+// getReadFileStat(filePath)
+//   Cheap stat (≤1ms) for the Read tool's PreToolUse hook. Returns
+//   { mtime_ms, size_bytes } on success; returns { mtime_ms: null,
+//   size_bytes: null } on any error (file not found, permission denied,
+//   non-string path, ...).  MUST NEVER throw -- callers rely on a sentinel
+//   "stat unavailable" return value to fall back to v1 cache-key shape.
+function getReadFileStat(filePath) {
+  if (typeof filePath !== 'string' || filePath.length === 0) {
+    return { mtime_ms: null, size_bytes: null };
+  }
+  try {
+    // Prefer { throwIfNoEntry: false } when available (Node ≥ 14.17). On older
+    // runtimes, the option is silently ignored and ENOENT throws -- handled by
+    // the try/catch.
+    const stat = fs.statSync(filePath, { throwIfNoEntry: false });
+    if (!stat) {
+      return { mtime_ms: null, size_bytes: null };
+    }
+    return { mtime_ms: stat.mtimeMs, size_bytes: stat.size };
+  } catch (e) {
+    return { mtime_ms: null, size_bytes: null };
+  }
+}
+
+// computeReadCacheKey(toolInput, statResult)
+//   Returns a string suitable for use as the cache filename (md5 hex, with an
+//   optional "_mtime_size" suffix when stat is available). Uses underscore as
+//   the separator (not colon) so the resulting filename is valid on Windows.
+//
+//   - When statResult has non-null mtime_ms AND size_bytes, the return is
+//     `<md5(toolName, toolInput)>_<mtime_ms>_<size_bytes>` -- a file change
+//     produces a brand-new key, so the old entry is naturally invalidated
+//     (no entry-side equality check required at read time). The mtime_ms is
+//     floored to integer milliseconds so floating-point dust on some
+//     filesystems doesn't perturb the key for unchanged files. Underscores
+//     in mtime/size are not present (decimals only).
+//   - When stat is unavailable (null fields), returns the v1 shape:
+//     `<md5(toolName, toolInput)>` -- backward-compatible with v1 cache files.
+//
+//   Returned string is safe to use as a filename component on all platforms
+//   (hex digits + decimal digits + underscores; no path separators, no shell
+//   metachars, no Windows-reserved characters).
+function computeReadCacheKey(toolInput, statResult) {
+  const baseHash = hashInput('Read', toolInput);
+  if (statResult && statResult.mtime_ms != null && statResult.size_bytes != null) {
+    const mtime = Math.floor(statResult.mtime_ms);
+    const size = statResult.size_bytes;
+    return baseHash + '_' + mtime + '_' + size;
+  }
+  return baseHash;
+}
+
 function safeRecord(event) {
   try {
     recordCacheEvent(event, { forgeDir: '.forge' });
@@ -288,12 +349,33 @@ function main() {
         }
       }
 
+      // R003 (T005): For Read tool calls in v2 path, compute a stat-keyed
+      // cache filename. The (mtime_ms, size_bytes) tuple is folded into the
+      // filename itself, so a file mutation produces a brand-new key -- old
+      // entries are naturally invalidated without any entry-side check at
+      // read time. Stat errors fall back to v1 hashing + volatile/120s TTL.
+      // FORGE_TOKEN_OPT=0 short-circuits to v1 behavior (no stat call).
+      let cacheFileKey;
+      if (toolName === 'Read' && !killSwitchOff) {
+        const filePath = toolInput && toolInput.file_path;
+        const statResult = getReadFileStat(filePath);
+        if (statResult.mtime_ms != null && statResult.size_bytes != null) {
+          patternClass = 'read_stat_pinned';
+          cacheFileKey = computeReadCacheKey(toolInput, statResult);
+        } else {
+          patternClass = 'volatile';
+          cacheFileKey = hashInput(toolName, toolInput);
+        }
+      } else {
+        cacheFileKey = hashInput(toolName, toolInput);
+      }
+
       const cacheDir = path.join(os.tmpdir(), `forge-tool-cache-${sessionId}`);
       if (!fs.existsSync(cacheDir)) {
         fs.mkdirSync(cacheDir, { recursive: true });
       }
 
-      const hash = hashInput(toolName, toolInput);
+      const hash = cacheFileKey;
       const cachePath = path.join(cacheDir, `${hash}.json`);
 
       // Resolve TTL: kill-switch → flat v1 120s; otherwise per-class with
@@ -373,6 +455,9 @@ module.exports = {
   classifyPattern,
   loadCacheConfig,
   getTtl,
+  hashInput,
+  getReadFileStat,
+  computeReadCacheKey,
   _resetCacheConfig,
 };
 

@@ -32,6 +32,20 @@ function _getClassifyPattern() {
   }
 }
 
+// R003 (T005): Lazy resolver for the Read-tool stat helpers. Same circular-
+// dependency reasoning as _getClassifyPattern above.
+function _getReadStatHelpers() {
+  try {
+    const mod = require('./tool-cache.js');
+    return {
+      getReadFileStat: typeof mod.getReadFileStat === 'function' ? mod.getReadFileStat : null,
+      computeReadCacheKey: typeof mod.computeReadCacheKey === 'function' ? mod.computeReadCacheKey : null,
+    };
+  } catch (e) {
+    return { getReadFileStat: null, computeReadCacheKey: null };
+  }
+}
+
 const MAX_CACHED_OUTPUT = 8000;
 
 // Rolling-log retention: target last N lines. We append on every event and
@@ -139,7 +153,6 @@ if (require.main === module) {
       const cacheDir = path.join(os.tmpdir(), `forge-tool-cache-${sessionId}`);
       if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
 
-      const hash = hashInput(toolName, toolInput);
       // R002: classify the command so the PreToolUse hook can resolve the
       // correct TTL on read. Only Bash commands are classified (Grep/Glob/
       // Read default to volatile). When FORGE_TOKEN_OPT=0, force volatile so
@@ -153,6 +166,24 @@ if (require.main === module) {
           } catch (_) { cls = 'volatile'; }
         }
       }
+
+      // R003 (T005): For Read tool calls in v2 path, mirror the PreToolUse
+      // hook's stat-keyed filename so writer and reader agree on the key.
+      // FORGE_TOKEN_OPT=0 short-circuits to v1 hashing.
+      let hash = hashInput(toolName, toolInput);
+      if (toolName === 'Read' && process.env.FORGE_TOKEN_OPT !== '0') {
+        const { getReadFileStat, computeReadCacheKey } = _getReadStatHelpers();
+        if (typeof getReadFileStat === 'function' && typeof computeReadCacheKey === 'function') {
+          const filePath = toolInput && toolInput.file_path;
+          let statResult = { mtime_ms: null, size_bytes: null };
+          try { statResult = getReadFileStat(filePath); } catch (_) {}
+          if (statResult.mtime_ms != null && statResult.size_bytes != null) {
+            cls = 'read_stat_pinned';
+            hash = computeReadCacheKey(toolInput, statResult);
+          }
+        }
+      }
+
       fs.writeFileSync(
         path.join(cacheDir, `${hash}.json`),
         JSON.stringify({ timestamp: Date.now(), output, class: cls })
