@@ -27,6 +27,28 @@ suite('HEADLESS_EXIT constants', () => {
   });
 });
 
+// T004 / R004 -- explicit list of all v1 top-level fields. Any rename or
+// removal is a backward-incompatible break the regression test below catches.
+const V1_TOP_LEVEL_FIELDS = [
+  'schema_version',
+  'queried_at',
+  'phase',
+  'spec_domain',
+  'tier',
+  'autonomy',
+  'depth',
+  'current_task',
+  'completed_tasks',
+  'remaining_tasks',
+  'token_budget_used',
+  'token_budget_remaining',
+  'tool_count',
+  'last_error',
+  'lock_status',
+  'last_heartbeat',
+  'active_checkpoints',
+];
+
 suite('queryHeadlessState', () => {
   test('returns all 9 required fields', () => {
     const { forgeDir } = makeTempForgeDir();
@@ -34,6 +56,30 @@ suite('queryHeadlessState', () => {
     for (const field of REQUIRED_FIELDS) {
       assert.ok(field in snap, `missing field: ${field}`);
     }
+  });
+
+  // T004 / R004 -- regression: snapshot of every v1 top-level key.
+  test('preserves all 17 v1 top-level fields after the schema_version 1->2 bump', () => {
+    const { forgeDir } = makeTempForgeDir();
+    const snap = queryHeadlessState(forgeDir);
+    for (const field of V1_TOP_LEVEL_FIELDS) {
+      assert.ok(field in snap, `v1 field missing post-bump: ${field}`);
+    }
+  });
+
+  test('adds additive top-level `tokens` block (T004 / R004)', () => {
+    const { forgeDir } = makeTempForgeDir();
+    const snap = queryHeadlessState(forgeDir);
+    assert.ok('tokens' in snap, 'tokens block missing from headless snapshot');
+    assert.strictEqual(typeof snap.tokens, 'object');
+    assert.notStrictEqual(snap.tokens, null);
+    assert.strictEqual(snap.tokens.schema_version, 2);
+  });
+
+  test('top-level schema_version bumps from 1 to 2 (T004 / R004)', () => {
+    const { forgeDir } = makeTempForgeDir();
+    const snap = queryHeadlessState(forgeDir);
+    assert.strictEqual(snap.schema_version, 2);
   });
 
   test('completes in under 100ms on a fresh forge dir', () => {
