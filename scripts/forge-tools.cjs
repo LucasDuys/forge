@@ -1509,6 +1509,9 @@ function updateTokenLedger(forgeDir, iterationTokens, lastTranscriptTokens) {
   if (lastTranscriptTokens !== undefined) {
     ledger.last_transcript_tokens = lastTranscriptTokens;
   }
+  // T003 / R003: tag every write with schema_version: 2 so a v1 ledger
+  // auto-upgrades on the next normal update.
+  ledger.schema_version = 2;
   fs.writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2));
   return ledger;
 }
@@ -1545,10 +1548,22 @@ function readLedger(forgeDir) {
   if (!ledger.per_spec || typeof ledger.per_spec !== 'object') ledger.per_spec = {};
   if (typeof ledger.last_transcript_tokens !== 'number') ledger.last_transcript_tokens = 0;
   if (!ledger.tasks || typeof ledger.tasks !== 'object') ledger.tasks = {};
+  // T003 / R003: token-ledger v2 shape stability. We don't force-write the
+  // upgrade here (readers don't need to mutate disk); we only ensure the
+  // returned in-memory object has stable shape for callers that reach into
+  // ledger.usage_actual directly. Note: schema_version is intentionally NOT
+  // synthesized in this readLedger -- the explicit forge-budget.loadLedger
+  // helper owns that detection so callers know whether they read a v1 file.
   return ledger;
 }
 
 function writeLedgerAtomic(forgeDir, ledger) {
+  // T003 / R003: every write tags the ledger with schema_version: 2 so the
+  // file on disk auto-upgrades on the next write. Existing v1 fields are
+  // preserved verbatim -- this is purely additive.
+  if (ledger && typeof ledger === 'object' && ledger.schema_version !== 2) {
+    ledger.schema_version = 2;
+  }
   const ledgerPath = path.join(forgeDir, 'token-ledger.json');
   const tmpPath = ledgerPath + '.tmp.' + process.pid;
   fs.writeFileSync(tmpPath, JSON.stringify(ledger, null, 2));
@@ -5942,6 +5957,25 @@ if (require.main === module) {
       process.stdout.write('pct=0 used=0 budget=0 warn=0 escalated=0\n');
     }
     return;
+  }
+
+  // T003 / R003: explicit token-ledger v1 -> v2 migration.
+  // Usage:
+  //   node scripts/forge-tools.cjs upgrade-ledger --forge-dir .forge
+  // Prints a one-line JSON result with `status` ("upgraded"|"no-op"|
+  // "created"|"recovered"|"skipped"). Exit 0 in every non-error case
+  // including "no-op" -- the operation is idempotent by design.
+  if (command === 'upgrade-ledger') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    try {
+      const budget = require('./forge-budget.cjs');
+      const result = budget.upgradeLedger(forgeDir);
+      process.stdout.write(JSON.stringify(result) + '\n');
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write('upgrade-ledger error: ' + (e && e.message || e) + '\n');
+      process.exit(1);
+    }
   }
 
   // R001: report per-task token budgets. Optionally scope to a single task

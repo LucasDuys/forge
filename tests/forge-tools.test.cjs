@@ -328,4 +328,82 @@ total_tasks: 2
   console.log('PASS: buildTaskPrompt');
 }
 
+// === T003 / R003: upgrade-ledger CLI subcommand =============================
+//
+// Spawns `node scripts/forge-tools.cjs upgrade-ledger --forge-dir <tmp>` and
+// asserts the dispatch lands in budget.upgradeLedger and that exit code is 0
+// for both "upgraded" and "no-op" outcomes.
+
+const { spawnSync } = require('child_process');
+const TOOLS_PATH = path.resolve(__dirname, '..', 'scripts', 'forge-tools.cjs');
+
+// Test: upgrade-ledger CLI on v1 ledger -> "upgraded", exit 0
+{
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-test-'));
+  const forgeDir = path.join(tmpDir, '.forge');
+  fs.mkdirSync(forgeDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(forgeDir, 'token-ledger.json'),
+    JSON.stringify({ total: 100, iterations: 1, per_spec: {}, tasks: {} })
+  );
+  const r = spawnSync('node', [TOOLS_PATH, 'upgrade-ledger', '--forge-dir', forgeDir], {
+    encoding: 'utf8',
+    timeout: 15000,
+  });
+  assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr=${r.stderr}`);
+  const out = JSON.parse(r.stdout.trim());
+  assert.strictEqual(out.status, 'upgraded');
+  const onDisk = JSON.parse(fs.readFileSync(path.join(forgeDir, 'token-ledger.json'), 'utf8'));
+  assert.strictEqual(onDisk.schema_version, 2);
+  assert.strictEqual(onDisk.total, 100, 'v1 fields preserved through CLI migration');
+  fs.rmSync(tmpDir, { recursive: true });
+  console.log('PASS: upgrade-ledger CLI v1 -> upgraded');
+}
+
+// Test: upgrade-ledger CLI on already-v2 -> "no-op", exit 0
+{
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-test-'));
+  const forgeDir = path.join(tmpDir, '.forge');
+  fs.mkdirSync(forgeDir, { recursive: true });
+  // Run once to create the v2 ledger.
+  spawnSync('node', [TOOLS_PATH, 'upgrade-ledger', '--forge-dir', forgeDir], {
+    encoding: 'utf8',
+    timeout: 15000,
+  });
+  // Run again -- must be no-op.
+  const r = spawnSync('node', [TOOLS_PATH, 'upgrade-ledger', '--forge-dir', forgeDir], {
+    encoding: 'utf8',
+    timeout: 15000,
+  });
+  assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}`);
+  const out = JSON.parse(r.stdout.trim());
+  assert.strictEqual(out.status, 'no-op');
+  fs.rmSync(tmpDir, { recursive: true });
+  console.log('PASS: upgrade-ledger CLI already-v2 -> no-op');
+}
+
+// Test: upgrade-ledger CLI with FORGE_TOKEN_OPT=0 -> "skipped", exit 0
+{
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-test-'));
+  const forgeDir = path.join(tmpDir, '.forge');
+  fs.mkdirSync(forgeDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(forgeDir, 'token-ledger.json'),
+    JSON.stringify({ total: 50, iterations: 1, per_spec: {}, tasks: {} })
+  );
+  const r = spawnSync('node', [TOOLS_PATH, 'upgrade-ledger', '--forge-dir', forgeDir], {
+    encoding: 'utf8',
+    timeout: 15000,
+    env: Object.assign({}, process.env, { FORGE_TOKEN_OPT: '0' }),
+  });
+  assert.strictEqual(r.status, 0);
+  const out = JSON.parse(r.stdout.trim());
+  assert.strictEqual(out.status, 'skipped');
+  // v1 ledger left untouched on disk.
+  const onDisk = JSON.parse(fs.readFileSync(path.join(forgeDir, 'token-ledger.json'), 'utf8'));
+  assert.strictEqual(typeof onDisk.schema_version, 'undefined');
+  fs.rmSync(tmpDir, { recursive: true });
+  console.log('PASS: upgrade-ledger CLI FORGE_TOKEN_OPT=0 -> skipped');
+}
+
 console.log('\n=== ALL TESTS PASSED ===');
