@@ -46,6 +46,18 @@ function _getReadStatHelpers() {
   }
 }
 
+// R004 (T006): Lazy resolver for getHeadSha. Same circular-dependency reasoning
+// as the helpers above. Returns null on any failure so callers fall back to
+// the v1 hash + class='volatile' behavior. NEVER throws.
+function _getHeadShaHelper() {
+  try {
+    const mod = require('../scripts/forge-head-cache.cjs');
+    return typeof mod.getHeadSha === 'function' ? mod.getHeadSha : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 const MAX_CACHED_OUTPUT = 8000;
 
 // Rolling-log retention: target last N lines. We append on every event and
@@ -181,6 +193,31 @@ if (require.main === module) {
             cls = 'read_stat_pinned';
             hash = computeReadCacheKey(toolInput, statResult);
           }
+        }
+      }
+
+      // R004 (T006): For Bash commands classified as head_pinned in v2 path,
+      // fold the current HEAD SHA into the cache filename so the writer's key
+      // matches the reader's. Falls back to v1 hash + class='volatile' if the
+      // helper is unavailable, getHeadSha returns source!='git', or anything
+      // throws. NEVER throws.
+      if (toolName === 'Bash' && process.env.FORGE_TOKEN_OPT !== '0' && cls === 'head_pinned') {
+        const getHeadSha = _getHeadShaHelper();
+        if (typeof getHeadSha === 'function') {
+          let res = null;
+          try { res = getHeadSha(process.cwd()); } catch (_) {}
+          if (res && res.source === 'git' && typeof res.sha === 'string' && /^[0-9a-f]{40}$/i.test(res.sha)) {
+            hash = hashInput(toolName, toolInput) + '_head_' + res.sha;
+            // cls stays 'head_pinned'
+          } else {
+            // No git HEAD available -> demote to volatile so the entry's TTL
+            // resolves to 120s on read, and the bare hash matches what the
+            // PreToolUse hook computes in the same fallback condition.
+            cls = 'volatile';
+          }
+        } else {
+          // Helper unreachable; demote to volatile.
+          cls = 'volatile';
         }
       }
 

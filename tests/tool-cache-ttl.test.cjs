@@ -12,8 +12,10 @@
 //   - FORGE_TOKEN_OPT=0: TTL collapses to flat v1 120s regardless of class;
 //     stored class field is 'volatile' for forward compat
 //   - Cache-write integration: tool-cache-store writes entry.class
-//   - head_pinned STUB: T004 treats it like volatile (120s); a regression
-//     marker test that T006 will replace once per-HEAD invalidation lands
+//   - head_pinned: T006 wires per-HEAD invalidation. The 24h safety-cap TTL
+//     and the HEAD-aware key shape are exercised in tool-cache-head-pinning;
+//     this file's head_pinned tests cover only the class-routing + default
+//     TTL constant, not the end-to-end key/invalidation behavior.
 //
 // Note on file location:
 //   Top-level tests/ per scripts/run-tests.cjs:32 (non-recursive readdir).
@@ -157,11 +159,14 @@ suite('R002 TTL_BY_CLASS defaults', () => {
   test('volatile = 120000 ms (2 min, status quo)', () => {
     assert.strictEqual(TTL_BY_CLASS.volatile, 120000);
   });
-  test('head_pinned = 120000 ms (STUB matching volatile; T006 will swap)', () => {
-    // STUB MARKER: T006 will rewire head_pinned TTL behavior to per-HEAD
-    // invalidation. When that lands, this assertion will need to be updated
-    // (likely to test invalidation-on-HEAD-change rather than a flat ms).
-    assert.strictEqual(TTL_BY_CLASS.head_pinned, 120000);
+  test('head_pinned = 86400000 ms (24h safety cap; T006 per-HEAD invalidation)', () => {
+    // T006 wired per-HEAD invalidation: head_pinned entries fold the current
+    // HEAD SHA into the cache filename, so a HEAD move produces a brand-new
+    // key (natural invalidation, no time-based check needed). The 24h TTL is
+    // a safety bound only -- under normal use, HEAD invalidation fires long
+    // before this cap. End-to-end key/invalidation behavior is exercised in
+    // tests/tool-cache-head-pinning.test.cjs.
+    assert.strictEqual(TTL_BY_CLASS.head_pinned, 86400000);
   });
 });
 
@@ -171,7 +176,7 @@ suite('R002 getTtl', () => {
   test('with no overrides, returns TTL_BY_CLASS values', () => {
     assert.strictEqual(getTtl('stable'), 1800000);
     assert.strictEqual(getTtl('volatile'), 120000);
-    assert.strictEqual(getTtl('head_pinned'), 120000);
+    assert.strictEqual(getTtl('head_pinned'), 86400000);
   });
 
   test('unknown class falls back to volatile default', () => {
@@ -189,8 +194,8 @@ suite('R002 getTtl', () => {
   test('partial override only affects specified class', () => {
     const ov = { stable: 7200000 };  // 2h override for stable only
     assert.strictEqual(getTtl('stable', ov), 7200000);
-    assert.strictEqual(getTtl('volatile', ov), 120000);   // default
-    assert.strictEqual(getTtl('head_pinned', ov), 120000); // default
+    assert.strictEqual(getTtl('volatile', ov), 120000);     // default
+    assert.strictEqual(getTtl('head_pinned', ov), 86400000); // default 24h
   });
 });
 
@@ -373,7 +378,12 @@ suite('R002 cache-write stores class field (PostToolUse)', () => {
     try { fs.rmSync(cacheDir, { recursive: true, force: true }); } catch (_) {}
   });
 
-  test('head_pinned command writes entry with class=head_pinned', () => {
+  test('head_pinned command writes entry with class=head_pinned (or volatile if not in a git repo)', () => {
+    // T006: the writer folds HEAD SHA into the cache filename when in a git
+    // repo. When not in a git repo, the class demotes to 'volatile' and the
+    // bare hash is used. The test runner's process.cwd() is the repo root
+    // (a real git repo), so we expect the 'head_pinned' branch normally; we
+    // tolerate the volatile fallback for environments without git on PATH.
     const sessionId = 'ttl-e2e-headpin-' + Date.now();
     const cacheDir = path.join(os.tmpdir(), 'forge-tool-cache-' + sessionId);
     try { fs.rmSync(cacheDir, { recursive: true, force: true }); } catch (_) {}
@@ -384,9 +394,23 @@ suite('R002 cache-write stores class field (PostToolUse)', () => {
       session_id: sessionId,
     });
     assert.strictEqual(r.status, 0);
-    const hash = hashOf('Bash', { command: 'git ls-files' });
-    const entry = JSON.parse(fs.readFileSync(path.join(cacheDir, hash + '.json'), 'utf8'));
-    assert.strictEqual(entry.class, 'head_pinned');
+    // Find whatever file the post-hook wrote (we don't assume the head
+    // suffix because that depends on whether git is reachable from cwd).
+    const files = fs.readdirSync(cacheDir).filter(f => f.endsWith('.json'));
+    assert.strictEqual(files.length, 1, 'exactly one cache file written');
+    const entry = JSON.parse(fs.readFileSync(path.join(cacheDir, files[0]), 'utf8'));
+    assert.ok(
+      entry.class === 'head_pinned' || entry.class === 'volatile',
+      'entry.class must be head_pinned (git OK) or volatile (fallback); got ' + entry.class
+    );
+    if (entry.class === 'head_pinned') {
+      // Filename must include the _head_<sha> suffix.
+      assert.match(files[0], /_head_[0-9a-f]{40}\.json$/i);
+    } else {
+      // Volatile fallback: bare hash filename.
+      const baseHash = hashOf('Bash', { command: 'git ls-files' });
+      assert.strictEqual(files[0], baseHash + '.json');
+    }
     try { fs.rmSync(cacheDir, { recursive: true, force: true }); } catch (_) {}
   });
 
@@ -574,57 +598,23 @@ suite('R002 cache-read TTL resolution', () => {
     try { fs.rmSync(cacheDir, { recursive: true, force: true }); } catch (_) {}
   });
 
-  // --- STUB BEHAVIOR MARKER ---
-  // T004 establishes the head_pinned class boundary but treats it like
-  // volatile (120s TTL) until T006 wires per-HEAD invalidation. When T006
-  // lands, this assertion will need to change: a head_pinned entry should
-  // remain valid as long as HEAD has not moved (regardless of age) and
-  // expire immediately when HEAD changes.
-  test('STUB: head_pinned currently behaves like volatile (T006 will rewire)', () => {
-    const cwd = makeWorkdir();
-    const sessionId = 'ttl-e2e-headpin-stub-' + Date.now();
-    const cacheDir = path.join(os.tmpdir(), 'forge-tool-cache-' + sessionId);
-    fs.mkdirSync(cacheDir, { recursive: true });
-    const toolInput = { command: 'git ls-files' };
-    const hash = hashOf('Bash', toolInput);
-
-    // Entry @ 1s old → hit (within 120s stub window).
-    fs.writeFileSync(
-      path.join(cacheDir, hash + '.json'),
-      JSON.stringify({
-        timestamp: Date.now() - 1000,
-        output: 'src/a.js\nsrc/b.js',
-        class: 'head_pinned',
-      })
-    );
-    let r = spawnPreHook({
-      tool_name: 'Bash', tool_input: toolInput, session_id: sessionId,
-    }, {}, cwd);
-    assert.strictEqual(r.status, 0);
-    assert.ok((r.stdout || '').trim().length > 0, 'fresh head_pinned should hit');
-
-    // Entry @ 130s old → miss (volatile-like 120s stub TTL). T006 will
-    // change this: head_pinned should hit if HEAD has not moved, miss
-    // otherwise -- regardless of age.
-    fs.writeFileSync(
-      path.join(cacheDir, hash + '.json'),
-      JSON.stringify({
-        timestamp: Date.now() - 130000,
-        output: 'src/a.js\nsrc/b.js',
-        class: 'head_pinned',
-      })
-    );
-    r = spawnPreHook({
-      tool_name: 'Bash', tool_input: toolInput, session_id: sessionId,
-    }, {}, cwd);
-    assert.strictEqual(r.status, 0);
-    assert.strictEqual(
-      (r.stdout || '').trim(),
-      '',
-      'STUB: head_pinned @ 130s must miss until T006 rewires per-HEAD invalidation'
-    );
-
-    try { fs.rmSync(cacheDir, { recursive: true, force: true }); } catch (_) {}
+  // --- T006: head_pinned now uses key-based invalidation, not time-based ---
+  // T006 wired per-HEAD invalidation: head_pinned entries fold HEAD SHA into
+  // the cache filename, so a HEAD move produces a brand-new key (natural
+  // invalidation, no time-based check). The TTL constant is now a 24h
+  // safety cap only -- end-to-end git-mutation coverage and key-based
+  // invalidation tests live in tests/tool-cache-head-pinning.test.cjs to
+  // keep this file focused on R002 TTL semantics. See that file for the
+  // T006 acceptance criteria.
+  test('T006 head_pinned TTL constant: 24h (was 120s in T004 stub)', () => {
+    // Sanity: TTL_BY_CLASS.head_pinned is now 24h. Past T004 callers that
+    // assumed a 120s expiry must have been updated; if any survive, they
+    // will fail here loudly rather than silently rotting.
+    assert.strictEqual(TTL_BY_CLASS.head_pinned, 86400000);
+    // Without overrides, getTtl mirrors TTL_BY_CLASS.
+    assert.strictEqual(getTtl('head_pinned'), 86400000);
+    // With override, override wins.
+    assert.strictEqual(getTtl('head_pinned', { head_pinned: 60000 }), 60000);
   });
 });
 

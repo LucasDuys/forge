@@ -42,13 +42,41 @@ try {
   recordCacheEvent = function () { return { written: false, error: 'store-unavailable' }; };
 }
 
+// --- R004 (T006): HEAD-SHA helper resolver ---
+// Lazy-loaded so a missing/broken helper module never breaks the hook's
+// primary deny/allow path. The helper is at scripts/forge-head-cache.cjs,
+// imported via a relative require from this hook file. If require fails
+// (typo, deleted file, syntax error in the helper), getHeadSha is null and
+// callers fall through to volatile. Same module-resolution caching as the
+// other helpers in this file.
+let _getHeadSha = null;
+let _headHelperLoaded = false;
+function _resolveHeadHelper() {
+  if (_headHelperLoaded) return _getHeadSha;
+  _headHelperLoaded = true;
+  try {
+    const mod = require('../scripts/forge-head-cache.cjs');
+    if (mod && typeof mod.getHeadSha === 'function') {
+      _getHeadSha = mod.getHeadSha;
+    }
+  } catch (e) {
+    // Helper unavailable; head_pinned will demote to volatile.
+  }
+  return _getHeadSha;
+}
+
 // --- R002: tiered TTL classes (defaults, in milliseconds) ---
 // stable:           30 minutes -- version queries, immutable git refs (sha-pinned).
 // volatile:         2 minutes  -- ls/find/git status/git diff/gh views/cat/...
-// head_pinned:      2 minutes  -- STUB matching volatile until T006 wires the
-//                                 per-HEAD invalidation check (depends on T001
-//                                 HEAD helper). Class boundary is established now
-//                                 so T006 only needs to swap the TTL resolver.
+// head_pinned:      24 hours   -- T006: HEAD SHA folded into the cache key, so a
+//                                 HEAD move produces a brand-new key (natural
+//                                 invalidation, no time-based check needed). The
+//                                 24h cap is a safety bound to prevent an
+//                                 entry from a long-abandoned HEAD lingering
+//                                 forever; under normal use HEAD invalidation
+//                                 fires long before this cap. Falls back to
+//                                 'volatile' (120s) when getHeadSha() returns
+//                                 source: 'fallback' or 'disabled' (R004.AC4).
 // read_stat_pinned: 10 minutes -- Read-tool entries keyed on (path, mtime, size).
 //                                 Long TTL is safe because the (mtime, size) tuple
 //                                 in the cache key changes whenever the file
@@ -58,7 +86,7 @@ try {
 const TTL_BY_CLASS = Object.freeze({
   stable: 1800000,            // 30 min
   volatile: 120000,           // 2 min
-  head_pinned: 120000,        // 2 min (stub; T006 → per-HEAD invalidation)
+  head_pinned: 86400000,      // 24 hr safety cap; real invalidation is key-based (T006)
   read_stat_pinned: 600000,   // 10 min (R003 / T005)
 });
 
@@ -309,6 +337,44 @@ function computeReadCacheKey(toolInput, statResult) {
   return baseHash;
 }
 
+// --- R004 (T006): head_pinned cache-key resolver ---
+//
+// resolveHeadPinnedKey(toolName, toolInput, cwd)
+//   For a command classified as head_pinned, attempt to compute a HEAD-aware
+//   cache key. Returns one of:
+//     { key: '<md5>_head_<sha>', class: 'head_pinned', sha: '<40-char>' }
+//       -- when getHeadSha returns source: 'git' with a 40-char hex sha. The
+//       sha is folded into the cache filename so a HEAD move produces a
+//       brand-new key (natural invalidation, no entry-side check required).
+//     { key: '<md5>',           class: 'volatile',    sha: null }
+//       -- when getHeadSha returns source: 'fallback' (not a git repo,
+//       detached HEAD with no commits, command failure) or source: 'disabled'
+//       (FORGE_TOKEN_OPT=0; not actually reachable here because the caller
+//       gates this whole branch on !killSwitchOff, but we handle it
+//       defensively anyway). The class is demoted to volatile (120s TTL,
+//       per R004.AC4). Also returned when the helper module itself is
+//       unavailable.
+//
+// MUST NEVER throw -- caller relies on the demote-to-volatile fallback.
+function resolveHeadPinnedKey(toolName, toolInput, cwd) {
+  const baseHash = hashInput(toolName, toolInput);
+  const getHeadSha = _resolveHeadHelper();
+  if (typeof getHeadSha !== 'function') {
+    return { key: baseHash, class: 'volatile', sha: null };
+  }
+  let res;
+  try {
+    res = getHeadSha(cwd);
+  } catch (e) {
+    // The helper documents NEVER throws, but be defensive anyway.
+    return { key: baseHash, class: 'volatile', sha: null };
+  }
+  if (res && res.source === 'git' && typeof res.sha === 'string' && /^[0-9a-f]{40}$/i.test(res.sha)) {
+    return { key: baseHash + '_head_' + res.sha, class: 'head_pinned', sha: res.sha };
+  }
+  return { key: baseHash, class: 'volatile', sha: null };
+}
+
 function safeRecord(event) {
   try {
     recordCacheEvent(event, { forgeDir: '.forge' });
@@ -355,6 +421,14 @@ function main() {
       // entries are naturally invalidated without any entry-side check at
       // read time. Stat errors fall back to v1 hashing + volatile/120s TTL.
       // FORGE_TOKEN_OPT=0 short-circuits to v1 behavior (no stat call).
+      //
+      // R004 (T006): For Bash commands classified as head_pinned in v2 path,
+      // fold the current HEAD SHA into the cache filename. A HEAD move
+      // produces a brand-new key, naturally invalidating stale entries (no
+      // entry-side HEAD comparison at read time). When getHeadSha falls back
+      // (not a git repo, detached HEAD with no commits, helper unavailable),
+      // the class is demoted to volatile and the v1 hash is used. Per AC4,
+      // we never throw out of this branch.
       let cacheFileKey;
       if (toolName === 'Read' && !killSwitchOff) {
         const filePath = toolInput && toolInput.file_path;
@@ -366,6 +440,10 @@ function main() {
           patternClass = 'volatile';
           cacheFileKey = hashInput(toolName, toolInput);
         }
+      } else if (toolName === 'Bash' && !killSwitchOff && patternClass === 'head_pinned') {
+        const resolved = resolveHeadPinnedKey(toolName, toolInput, process.cwd());
+        patternClass = resolved.class;  // 'head_pinned' on success, 'volatile' on fallback
+        cacheFileKey = resolved.key;
       } else {
         cacheFileKey = hashInput(toolName, toolInput);
       }
@@ -458,6 +536,7 @@ module.exports = {
   hashInput,
   getReadFileStat,
   computeReadCacheKey,
+  resolveHeadPinnedKey,
   _resetCacheConfig,
 };
 
