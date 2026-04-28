@@ -6,11 +6,31 @@
 // Wave 2 / R005: also exposes `recordCacheEvent` for the cache-stats rolling
 // log. Required by scripts/forge-tools.cjs::aggregateCacheStats and (in T003)
 // by hooks/tool-cache.js itself once pattern broadening lands.
+//
+// Wave 2 / R002: writes the per-entry `class` field (stable | volatile |
+// head_pinned) into the cache JSON so the PreToolUse hook can resolve the
+// correct TTL on read. Classification is delegated to tool-cache.js's
+// classifyPattern() to keep the boundary logic in one place. Entries written
+// by older versions (no `class` field) are treated as 'volatile' on read.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+
+// Lazy resolver for classifyPattern: tool-cache.js itself requires this
+// module (recordCacheEvent), so a top-level require() here would create a
+// circular dependency that fires a node warning and may return an empty
+// exports object on first load. We resolve on-demand inside the hook's
+// stdin handler, by which point both modules are fully initialized.
+function _getClassifyPattern() {
+  try {
+    const mod = require('./tool-cache.js');
+    return typeof mod.classifyPattern === 'function' ? mod.classifyPattern : null;
+  } catch (e) {
+    return null;
+  }
+}
 
 const MAX_CACHED_OUTPUT = 8000;
 
@@ -120,9 +140,22 @@ if (require.main === module) {
       if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
 
       const hash = hashInput(toolName, toolInput);
+      // R002: classify the command so the PreToolUse hook can resolve the
+      // correct TTL on read. Only Bash commands are classified (Grep/Glob/
+      // Read default to volatile). When FORGE_TOKEN_OPT=0, force volatile so
+      // the kill-switch path stays at v1's flat 120s TTL behavior.
+      let cls = 'volatile';
+      if (toolName === 'Bash' && process.env.FORGE_TOKEN_OPT !== '0') {
+        const classifyPattern = _getClassifyPattern();
+        if (typeof classifyPattern === 'function') {
+          try {
+            cls = classifyPattern(toolInput.command || '');
+          } catch (_) { cls = 'volatile'; }
+        }
+      }
       fs.writeFileSync(
         path.join(cacheDir, `${hash}.json`),
-        JSON.stringify({ timestamp: Date.now(), output })
+        JSON.stringify({ timestamp: Date.now(), output, class: cls })
       );
     } catch (e) { /* silent */ }
     process.exit(0);
