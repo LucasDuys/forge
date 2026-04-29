@@ -1,0 +1,36 @@
+{
+  "description": "Reference v1 cache behavior. T007 (R006) verifies that with FORGE_TOKEN_OPT=0, hooks/tool-cache.js + hooks/tool-cache-store.js produce these characteristics. This fixture documents the parity contract; tests/tool-cache-kill-switch.test.cjs asserts each invariant directly rather than doing a byte-for-byte JSON comparison (the cache entry is allowed to carry a forward-compat `class: 'volatile'` field, see note below).",
+  "version": "v1",
+  "spec": "spec-token-cache.md R006",
+  "characteristics": {
+    "cacheable_patterns": [
+      "^git (status|log|diff|branch|ls-files|show)",
+      "^(ls|find|which|wc)\\b"
+    ],
+    "non_cacheable_under_kill_switch": [
+      "cat README.md",
+      "head -n 5 package.json",
+      "tail file.log",
+      "tree src",
+      "node --version",
+      "gh repo view",
+      "npm list",
+      "pip list"
+    ],
+    "flat_ttl_ms": 120000,
+    "cache_key_components_bash": ["tool_name", "tool_input"],
+    "cache_key_components_read": ["tool_name", "tool_input"],
+    "no_mtime_keying": true,
+    "no_head_pinning": true,
+    "no_stats_log": true
+  },
+  "forward_compat_notes": {
+    "class_field": "Cache entries written under FORGE_TOKEN_OPT=0 by post-T004 code may include `class: 'volatile'` for forward compat; the test treats this as parity-equivalent to no-class v1 entries because the read-side TTL resolves to flat 120s either way (entry.class || 'volatile' -> 120s)."
+  },
+  "guard_audit": {
+    "hooks/tool-cache.js": "process.env.FORGE_TOKEN_OPT === '0' gates: (a) isCacheableCommand 2-pattern path, (b) classifyPattern bypass (forces volatile), (c) Read mtime-keying skip, (d) Bash head-pinned key resolution skip, (e) flat 120s TTL on lookup",
+    "hooks/tool-cache-store.js": "recordCacheEvent returns {written:false,disabled:true} early; classifyPattern + Read mtime-keying + head_pinned key suffix all gated by !=='0'",
+    "scripts/forge-tools.cjs::aggregateCacheStats": "returns {hits:0,misses:0,savings_estimate_tokens:0} without reading the file",
+    "scripts/forge-head-cache.cjs::getHeadSha": "returns {sha:null,source:'disabled'} without spawning git"
+  }
+}

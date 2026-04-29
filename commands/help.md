@@ -47,3 +47,7 @@ Display the following help text to the user:
 
 ## Configuration
 Edit `.forge/config.json` to customize autonomy, depth, token budget, multi-repo setup, and circuit breaker thresholds.
+
+## Token Reduction Kill Switch
+
+Set `FORGE_TOKEN_OPT=0` to disable Wave 2 cache extensions and revert to the original 6-pattern, flat-120s-TTL behavior. All other Wave 2 additions (mtime keying, HEAD pinning, stats logging) also disable. Default is on.
