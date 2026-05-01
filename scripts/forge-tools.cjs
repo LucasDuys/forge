@@ -118,7 +118,9 @@ function _reEscape(s) {
 }
 
 function parseFrontmatter(text) {
-  const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  // CRLF-tolerant: every literal `\n` in the frontmatter regexes is `\r?\n`
+  // so Windows-checkout specs (CRLF line endings) parse identically to LF.
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
   if (!match) return { data: {}, content: text };
 
   const data = _parseYamlLines(match[1]);
@@ -129,8 +131,8 @@ function parseFrontmatter(text) {
   // most recent write).
   while (true) {
     const lstripped = remainder.replace(/^\s*\n+/, '');
-    if (!lstripped.startsWith('---\n')) break;
-    const next = lstripped.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+    if (!/^---\r?\n/.test(lstripped)) break;
+    const next = lstripped.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
     if (!next) break;
     const moreData = _parseYamlLines(next[1]);
     Object.assign(data, moreData);
@@ -1918,7 +1920,10 @@ function parseVisualAcs(specPath) {
   catch (_) { return []; }
 
   const { content } = parseFrontmatter(text);
-  const lines = content.split('\n');
+  // CRLF-tolerant split: a Windows-checkout spec has `\r\n` line endings, and
+  // a `'\n'` split would leave a trailing `\r` on every line, breaking the
+  // checkbox regex (JS `.` does not match `\r`).
+  const lines = content.split(/\r?\n/);
   const out = [];
 
   let currentR = null;        // e.g. "R001"
