@@ -23,6 +23,98 @@ const DEFAULT_ROLE_BASELINES = {
 const TIER_RANK = { haiku: 0, sonnet: 1, opus: 2 };
 const TIER_BY_RANK = ['haiku', 'sonnet', 'opus'];
 
+// === R002: Per-Phase Effort and max_tokens Policy ===
+//
+// Each role has a default effort + max_tokens hint. forge-executor branches
+// on the classified task score (the same score classifyTask() emits):
+//   score <= 4   -> medium / 6000
+//   score 5..10  -> medium / 10000
+//   score > 10   -> high / 14000
+//
+// All other roles use a flat default. Overridable via
+// .forge/config.json::model_routing.effort_policy.{role}, missing/malformed
+// falls back to the bake-in.
+//
+// FORGE_TOKEN_OPT=0 disables this layer end-to-end: selectModel reverts to
+// the legacy 3-field shape `{ model, reasoning, cost_weight }`, no effort
+// fields surface, and downstream consumers see exactly the pre-spec shape.
+const EFFORT_POLICY = {
+  'forge-speccer':    { effort: 'high',   max_tokens: 16000 },
+  'forge-planner':    { effort: 'high',   max_tokens: 12000 },
+  'forge-reviewer':   { effort: 'high',   max_tokens: 12000 },
+  'forge-verifier':   { effort: 'high',   max_tokens: 12000 },
+  'forge-researcher': { effort: 'low',    max_tokens: 4000  },
+  'forge-complexity': { effort: 'low',    max_tokens: 2000  },
+  // forge-executor is computed from score via getEffortPolicy().
+};
+
+const EXECUTOR_EFFORT_BY_SCORE = [
+  { maxScore: 4,        effort: 'medium', max_tokens: 6000  },
+  { maxScore: 10,       effort: 'medium', max_tokens: 10000 },
+  { maxScore: Infinity, effort: 'high',   max_tokens: 14000 },
+];
+
+// Memoized per-forgeDir override map. The router is required once per process,
+// then called many times; loading the config file each call would dwarf the
+// router's own cost. The cache is keyed by forgeDir so multi-repo flows still
+// see the right overrides.
+const _effortPolicyConfigCache = new Map();
+
+function loadEffortPolicyConfig(forgeDir) {
+  if (!forgeDir) return {};
+  if (_effortPolicyConfigCache.has(forgeDir)) {
+    return _effortPolicyConfigCache.get(forgeDir);
+  }
+  let merged = {};
+  try {
+    const cfgPath = path.join(forgeDir, 'config.json');
+    if (fs.existsSync(cfgPath)) {
+      const raw = fs.readFileSync(cfgPath, 'utf8');
+      const cfg = JSON.parse(raw);
+      const policy = cfg && cfg.model_routing && cfg.model_routing.effort_policy;
+      if (policy && typeof policy === 'object' && !Array.isArray(policy)) {
+        merged = policy;
+      }
+    }
+  } catch (_) {
+    merged = {};
+  }
+  _effortPolicyConfigCache.set(forgeDir, merged);
+  return merged;
+}
+
+// Test hook: reset memoized override map. Used by unit tests that mutate a
+// temp .forge/config.json across cases.
+function _resetEffortPolicyCache() {
+  _effortPolicyConfigCache.clear();
+}
+
+function getEffortPolicy(role, score, configOverrides) {
+  let baseline;
+  if (role === 'forge-executor') {
+    const numericScore = (typeof score === 'number' && !Number.isNaN(score)) ? score : 0;
+    const bucket = EXECUTOR_EFFORT_BY_SCORE.find((b) => numericScore <= b.maxScore);
+    baseline = { effort: bucket.effort, max_tokens: bucket.max_tokens };
+  } else if (EFFORT_POLICY[role]) {
+    baseline = { effort: EFFORT_POLICY[role].effort, max_tokens: EFFORT_POLICY[role].max_tokens };
+  } else {
+    // Unknown role -> conservative middle ground. Same intent as
+    // "no policy specified", picked to match forge-executor's middle bucket.
+    baseline = { effort: 'medium', max_tokens: 10000 };
+  }
+
+  // Config override on top. Only effort/max_tokens fields are honored;
+  // unknown keys ignored.
+  if (configOverrides && typeof configOverrides === 'object') {
+    const override = configOverrides[role];
+    if (override && typeof override === 'object') {
+      if (typeof override.effort === 'string') baseline.effort = override.effort;
+      if (typeof override.max_tokens === 'number') baseline.max_tokens = override.max_tokens;
+    }
+  }
+  return baseline;
+}
+
 // Task type keywords for classification
 const TYPE_KEYWORDS = {
   scaffolding:    /scaffold|boilerplate|template|stub|init|setup/i,
@@ -127,9 +219,27 @@ function classifyTask(task) {
   };
 }
 
+// selectModel(role, taskClassification, budgetState, config)
+//
+// Returns an object describing the model choice and the per-phase effort
+// hint. Callers that previously read the string return value should switch
+// to result.model (only buildModelAdvisory in this repo today; updated
+// alongside this change).
+//
+// Shape:
+//   { model, effort, max_tokens, reasoning, cost_weight }
+//
+// FORGE_TOKEN_OPT=0 reverts to the legacy 3-field shape:
+//   { model, reasoning, cost_weight }
+// (no effort, no max_tokens).
 function selectModel(role, taskClassification, budgetState, config) {
-  const routingConfig = config.model_routing || {};
-  if (routingConfig.enabled === false) return 'sonnet';
+  const routingConfig = (config && config.model_routing) || {};
+  // Routing fully disabled -> match historical behavior (string 'sonnet')
+  // but wrap in an object so the new contract holds. The old caller reads
+  // result.model.
+  if (routingConfig.enabled === false) {
+    return _buildLegacyResult('sonnet', 'routing disabled by config');
+  }
 
   const baselines = routingConfig.role_baselines || DEFAULT_ROLE_BASELINES;
   const baseline = baselines[role] || { min: 'haiku', preferred: 'sonnet', max: 'opus' };
@@ -153,7 +263,51 @@ function selectModel(role, taskClassification, budgetState, config) {
     selectedRank = Math.max(minRank, selectedRank - 1);
   }
 
-  return TIER_BY_RANK[selectedRank] || 'sonnet';
+  const modelName = TIER_BY_RANK[selectedRank] || 'sonnet';
+  const reasoning = taskClassification.reasoning || '';
+  const tierObj = Object.values(TIERS).find((t) => t.name === modelName);
+  const costWeight = tierObj ? tierObj.cost_weight : 5;
+
+  // FORGE_TOKEN_OPT=0 short-circuits to the legacy 3-field shape.
+  if (process.env.FORGE_TOKEN_OPT === '0') {
+    return { model: modelName, reasoning, cost_weight: costWeight };
+  }
+
+  // Resolve effort policy: defaults + optional config override.
+  // Config overrides come from .forge/config.json; we accept them either
+  // pre-resolved on routingConfig.effort_policy (cheap path used by tests)
+  // or by reading from disk via routingConfig._forgeDir hint.
+  let overrides = routingConfig.effort_policy;
+  if (!overrides && routingConfig._forgeDir) {
+    overrides = loadEffortPolicyConfig(routingConfig._forgeDir);
+  }
+  const { effort, max_tokens } = getEffortPolicy(role, taskClassification.score, overrides);
+
+  return {
+    model: modelName,
+    effort,
+    max_tokens,
+    reasoning,
+    cost_weight: costWeight,
+  };
+}
+
+function _buildLegacyResult(modelName, reasoning) {
+  const tierObj = Object.values(TIERS).find((t) => t.name === modelName);
+  const costWeight = tierObj ? tierObj.cost_weight : 5;
+  if (process.env.FORGE_TOKEN_OPT === '0') {
+    return { model: modelName, reasoning, cost_weight: costWeight };
+  }
+  // Routing disabled but token-opt on: still surface effort/max_tokens
+  // so downstream plumbing has a stable shape. Use conservative defaults
+  // (medium/10000) — same as the unknown-role fallback in getEffortPolicy.
+  return {
+    model: modelName,
+    effort: 'medium',
+    max_tokens: 10000,
+    reasoning,
+    cost_weight: costWeight,
+  };
 }
 
 // Escalation: when a task fails, try a higher-tier model
@@ -174,11 +328,12 @@ function deescalateModel(currentModel, consecutiveSuccesses) {
 // Build a model advisory string for inclusion in task prompts
 function buildModelAdvisory(task, role, config, budgetState) {
   const classification = classifyTask(task);
-  const model = selectModel(role, classification, budgetState, config);
+  const result = selectModel(role, classification, budgetState, config);
+  const modelName = (result && typeof result === 'object') ? result.model : result;
   return {
-    model,
+    model: modelName,
     classification,
-    advisory: `Model: ${model} (${classification.reasoning})`,
+    advisory: `Model: ${modelName} (${classification.reasoning})`,
   };
 }
 
@@ -188,7 +343,12 @@ module.exports = {
   escalateModel,
   deescalateModel,
   buildModelAdvisory,
+  getEffortPolicy,
+  loadEffortPolicyConfig,
+  _resetEffortPolicyCache,
   DEFAULT_ROLE_BASELINES,
+  EFFORT_POLICY,
+  EXECUTOR_EFFORT_BY_SCORE,
   TIERS,
   TIER_RANK,
   TIER_BY_RANK,
