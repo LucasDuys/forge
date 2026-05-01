@@ -337,12 +337,100 @@ function buildModelAdvisory(task, role, config, budgetState) {
   };
 }
 
+// === R003: Handoff JSON Writer for Router Hints ===
+//
+// writeHandoff(forgeDir, taskId, role, complexity)
+//
+// Resolves the model/effort/max_tokens hint via the same policy used by
+// selectModel and writes a single JSON file at:
+//   {forgeDir}/handoff.{taskId}.json
+// containing:
+//   { model, effort, max_tokens, role, task_id }
+//
+// The orchestrator invokes this BEFORE every Agent dispatch. The handoff
+// file is the authoritative record of what hint was sent to the agent;
+// when the Agent tool eventually accepts an `effort` parameter, the
+// orchestrator can pick the value back up from the handoff file (or pass
+// the writeHandoff return value directly).
+//
+// Arguments:
+//   forgeDir   abs or rel path to the .forge/ directory. Created if missing.
+//   taskId     short task id (e.g. "T004"); used as the filename suffix.
+//   role       one of the EFFORT_POLICY keys, e.g. "forge-executor".
+//   complexity either a classification object (with .tier/.score/.reasoning,
+//              as returned by classifyTask) OR a raw task object (with
+//              .name/.description) which will be classified internally.
+//              May also be null/undefined; falls back to a minimal stub
+//              that lands in the executor low-score bucket.
+//
+// Behavior:
+//   - Idempotent. Writing the same handoff twice overwrites cleanly.
+//   - FORGE_TOKEN_OPT=0 -> handoff JSON is still written, but the effort
+//     and max_tokens fields are omitted (legacy 3-field-equivalent shape:
+//     { model, role, task_id }). This keeps the file present for audit
+//     while honoring the kill switch's contract that no effort/max_tokens
+//     leaks downstream.
+//   - Returns the parsed handoff object that was written, so the caller
+//     can pass `result.model` to the Agent tool's `model` parameter.
+//   - Tolerates a missing forgeDir by mkdir -p; tolerates a malformed
+//     classification by falling back to classifyTask on a stub task.
+function writeHandoff(forgeDir, taskId, role, complexity) {
+  if (!forgeDir || typeof forgeDir !== 'string') {
+    throw new TypeError('writeHandoff: forgeDir must be a non-empty string');
+  }
+  if (!taskId || typeof taskId !== 'string') {
+    throw new TypeError('writeHandoff: taskId must be a non-empty string');
+  }
+  if (!role || typeof role !== 'string') {
+    throw new TypeError('writeHandoff: role must be a non-empty string');
+  }
+
+  // Resolve a classification. Accept three shapes:
+  //   1. classification-like object (has .tier and .score)
+  //   2. task-like object (has .name)
+  //   3. null/undefined
+  let classification;
+  if (complexity && typeof complexity === 'object' && complexity.tier && typeof complexity.score === 'number') {
+    classification = complexity;
+  } else if (complexity && typeof complexity === 'object' && typeof complexity.name === 'string') {
+    classification = classifyTask(complexity);
+  } else {
+    // Fallback: minimal stub that lands in low/sonnet bucket. Same defaults
+    // as classifyTask on an unknown task.
+    classification = classifyTask({ name: taskId, description: '' });
+  }
+
+  // Synthesize a config that points selectModel at the on-disk override
+  // file (if any). This preserves the cache + override semantics added in
+  // T002 without requiring the caller to pass config explicitly.
+  const cfg = { model_routing: { enabled: true, _forgeDir: forgeDir } };
+  const result = selectModel(role, classification, null, cfg);
+
+  // Build handoff payload. Under FORGE_TOKEN_OPT=0, selectModel returns
+  // the legacy 3-field shape (no effort/max_tokens). Mirror that here:
+  // we write the file regardless (auditability), but omit the missing
+  // hint fields so downstream consumers can't accidentally read stale
+  // values.
+  const handoff = { model: result.model, role, task_id: taskId };
+  if ('effort' in result) handoff.effort = result.effort;
+  if ('max_tokens' in result) handoff.max_tokens = result.max_tokens;
+
+  // Ensure forgeDir exists. mkdir -p semantics.
+  if (!fs.existsSync(forgeDir)) {
+    fs.mkdirSync(forgeDir, { recursive: true });
+  }
+  const outPath = path.join(forgeDir, `handoff.${taskId}.json`);
+  fs.writeFileSync(outPath, JSON.stringify(handoff, null, 2));
+  return handoff;
+}
+
 module.exports = {
   classifyTask,
   selectModel,
   escalateModel,
   deescalateModel,
   buildModelAdvisory,
+  writeHandoff,
   getEffortPolicy,
   loadEffortPolicyConfig,
   _resetEffortPolicyCache,
