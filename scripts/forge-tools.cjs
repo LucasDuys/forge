@@ -1986,12 +1986,30 @@ function parseVisualAcs(specPath) {
       } catch (_) { /* keep checks = [] */ }
     }
 
+    // Wave 4 R003: occlusion probe opt-in tokens. Both default safely so
+    // existing specs are unaffected.
+    //
+    //   occluded_check=true|false  -> AC opts in to verifyVisible(). Accepts
+    //                                 the alt spelling occlusion_check= for
+    //                                 author convenience.
+    //   selector="<css>"           -> CSS selector verifyVisible probes.
+    //                                 Accepts double or single quotes.
+    let occludedCheck = false;
+    const occMatch = body.match(/\bocclu(?:ded|sion)_check=(true|false)/i);
+    if (occMatch) occludedCheck = occMatch[1].toLowerCase() === 'true';
+
+    let selector = null;
+    const selMatch = body.match(/\bselector=(?:"([^"]*)"|'([^']*)')/);
+    if (selMatch) selector = selMatch[1] != null ? selMatch[1] : selMatch[2];
+
     out.push({
       requirementId: currentR,
       acId: currentR + '.AC' + acCounterForR,
       path: pathVal,
       viewport,
       checks,
+      occludedCheck,
+      selector,
       line: i + 1,
       raw: line
     });
@@ -2185,6 +2203,85 @@ async function awaitVisualReady(evaluateFn, timeoutMs) {
   };
 }
 
+// === Wave 4 R003: Occlusion Probe via elementFromPoint ===
+// verifyVisible probes whether a CSS selector is actually painted at its
+// rect's centre point in the page. DOM presence (`querySelector` returning
+// non-null) and even `isVisible()` are not enough: a sticky banner or
+// modal can overlay the asserted element and fool both checks.
+//
+// Contract (returned shape, all branches):
+//   { visible: true }                                     -- target is the topmost element
+//                                                            (or contains the topmost element).
+//   { visible: false, reason: 'not_found' }               -- selector matched nothing,
+//                                                            or elementFromPoint returned null.
+//   { visible: false, reason: 'offscreen' }               -- centre point falls outside
+//                                                            the viewport (negative or > vw/vh).
+//   { visible: false, occludedBy: '<outerHTML head>' }    -- something else is on top;
+//                                                            occludedBy is the topmost element's
+//                                                            outerHTML, sliced to 200 chars to
+//                                                            keep AC `detail` strings tractable.
+//
+// `evaluateFn(scriptStr) => Promise<any>` is the same browser bridge used
+// by `awaitVisualReady`. The Node side only generates a script string and
+// awaits its result -- no browser API is touched at this layer, so the
+// helper is unit-testable with a plain stub.
+//
+// **Not auto-invoked.** Callers opt in via spec syntax
+// `[visual] path=… occluded_check=true selector="#mybtn" checks=[…]`. When
+// the AC carries `occludedCheck === true` and a `selector`, runVisualVerifier
+// invokes verifyVisible after readiness and before the screenshot; otherwise
+// the call is skipped (zero behaviour change for existing specs).
+async function verifyVisible(evaluateFn, selector) {
+  if (typeof evaluateFn !== 'function') {
+    return { visible: false, reason: 'not_found' };
+  }
+  if (typeof selector !== 'string' || selector.length === 0) {
+    return { visible: false, reason: 'not_found' };
+  }
+
+  // Browser-side script. JSON.stringify(selector) escapes any quote/backslash
+  // safely so we can never inject DOM-altering source from a spec string.
+  const script = [
+    '(() => {',
+    '  const sel = ' + JSON.stringify(selector) + ';',
+    '  const el = document.querySelector(sel);',
+    '  if (!el) return { visible: false, reason: "not_found" };',
+    '  const r = el.getBoundingClientRect();',
+    '  const cx = r.left + r.width / 2;',
+    '  const cy = r.top + r.height / 2;',
+    '  const vw = window.innerWidth;',
+    '  const vh = window.innerHeight;',
+    '  if (cx < 0 || cy < 0 || cx > vw || cy > vh) {',
+    '    return { visible: false, reason: "offscreen" };',
+    '  }',
+    '  const top = document.elementFromPoint(cx, cy);',
+    '  if (!top) return { visible: false, reason: "not_found" };',
+    '  if (top === el || el.contains(top)) return { visible: true };',
+    '  const html = (top.outerHTML || "").slice(0, 200);',
+    '  return { visible: false, occludedBy: html };',
+    '})()'
+  ].join('\n');
+
+  let result;
+  try {
+    result = await Promise.resolve(evaluateFn(script));
+  } catch (err) {
+    // A bridge failure is treated as not_found rather than crashing the
+    // verifier; the AC will fail with a clear "occluded: not_found" detail
+    // which the agent can investigate. Symmetric with the awaitVisualReady
+    // bridge-throw path.
+    return { visible: false, reason: 'not_found' };
+  }
+  if (!result || typeof result !== 'object') {
+    return { visible: false, reason: 'not_found' };
+  }
+  // Trust-but-narrow: pass the bridge's response through unchanged so tests
+  // can stub any branch directly. Defensive normalisation only on missing
+  // visible flag.
+  if (result.visible === true) return { visible: true };
+  return result;
+}
+
 // Orchestration entry point for the `forge-visual-verifier` agent. Pure
 // (no network, no Playwright invocation) so it can be unit-tested
 // deterministically. The agent is responsible for the actual
@@ -2330,6 +2427,36 @@ async function runVisualVerifier(forgeDir, opts) {
         const stage = (err && err.stage) || 'unknown';
         result.status = 'blocked';
         result.detail = 'readiness_timeout: ' + stage;
+        results.push(result);
+        continue;
+      }
+    }
+
+    // Wave 4 R003: opt-in occlusion probe. Only runs when the AC declared
+    // `occluded_check=true` AND a `selector=`, AND the caller wired an
+    // evaluate bridge. On a non-visible result the AC fails with a detail
+    // string starting `occluded:`; on visible the call is silent and the
+    // normal screenshot/compare flow continues. Other ACs are unaffected.
+    if (
+      ac.occludedCheck === true &&
+      typeof ac.selector === 'string' && ac.selector.length > 0 &&
+      typeof opts.evaluateBridge === 'function'
+    ) {
+      let probe;
+      try {
+        probe = await verifyVisible(opts.evaluateBridge, ac.selector);
+      } catch (err) {
+        // verifyVisible's own contract is non-throwing; if a future change
+        // ever raises, treat it as occluded with the error string so the
+        // run continues.
+        probe = { visible: false, reason: 'probe_error: ' + (err && err.message || String(err)) };
+      }
+      if (!probe || probe.visible !== true) {
+        const detail = probe && probe.reason
+          ? 'occluded: ' + probe.reason
+          : 'occluded: ' + ((probe && probe.occludedBy) || 'unknown');
+        result.status = 'fail';
+        result.detail = detail;
         results.push(result);
         continue;
       }
@@ -7963,6 +8090,8 @@ module.exports = {
   writeVisualProgress, runVisualVerifier,
   // Wave 4 R002: deterministic browser readiness recipe.
   awaitVisualReady,
+  // Wave 4 R003: opt-in occlusion probe via elementFromPoint.
+  verifyVisible,
   detectFileConflicts, serializeConflictingTasks, logConflictEvent, planTierExecution, detectParallelConflicts,
   writeParallelConstraints, readParallelConstraints, isBlockedByParallelConstraint,
   readLedger, writeLedgerAtomic, resolveTaskBudget,
