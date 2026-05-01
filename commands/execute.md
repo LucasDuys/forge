@@ -1,10 +1,18 @@
 ---
 description: "Run the autonomous implementation loop"
 argument-hint: "[--autonomy full|gated|supervised] [--max-iterations N] [--token-budget N] [--depth quick|standard|thorough] [--filter NAME] [--record-baselines]"
-allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tui-attach.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Bash(*)", "Agent(*)"]
+allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tui-attach.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-wizard.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Bash(*)", "Agent(*)"]
 ---
 
 # Forge Execute
+
+## First-Run Wizard (R004.AC3)
+
+Before anything else, fire the one-shot token-reduction wizard. Idempotent — prints once on first install, then no-ops forever. Suppressed when `/forge:watch` is rendering its own banner (R004.AC6).
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-wizard.cjs" --forge-dir .forge
+```
 
 Launch the autonomous implementation loop. Reads the frontier, implements tasks one by one, and relies on the Stop hook state machine to drive iteration until all tasks are complete.
 
