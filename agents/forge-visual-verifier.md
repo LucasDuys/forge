@@ -27,6 +27,8 @@ Tokens:
 - `path=` — mandatory. Root-relative route in the running dev server.
 - `viewport=` — optional `WxH`, default `1280x800`.
 - `checks=` — JSON-ish array of free-text perceptual claims. Each claim becomes one LLM-vision query against the screenshot.
+- `occluded_check=` — optional `true|false`. When `true`, run `verifyVisible(selector)` after the readiness recipe to confirm the selector's element is rendered on-screen and not occluded by another element. Failure → AC `fail` with `detail: "occluded: …"`.
+- `selector=` — optional CSS selector. Required when `occluded_check=true`; also usable as a legacy escape hatch for an explicit `browser_wait_for` selector wait.
 
 `parseVisualAcs` in `scripts/forge-tools.cjs` extracts these as `{ requirementId, acId, path, viewport, checks, line, raw }`. Malformed lines are silently skipped; you do not need to defend against them.
 
@@ -70,15 +72,17 @@ Baseline path schema (do not invent your own):
 
 ### Step 4: Screenshot + vision loop
 
-For each AC returned by `parseVisualAcs`:
+For each AC returned by `parseVisualAcs`, run the readiness recipe before capturing the screenshot. The recipe replaces the previous `networkidle`/500-ms fallback with a deterministic three-stage gate so animation-driven flake and slow web-font swaps stop producing noisy diffs:
 
 1. `mcp__playwright__browser_resize` to the declared viewport.
 2. `mcp__playwright__browser_navigate` to `http://<host>:<port><ac.path>` — the host/port comes from the running dev server (see `capabilities.sandbox` and `.forge/config.json#sandbox.wait_url`).
-3. `mcp__playwright__browser_wait_for` on a short network-idle or a known selector if the spec declares one. If none declared, wait 500 ms for layout to settle.
-4. `mcp__playwright__browser_take_screenshot` — full-page PNG. Save the buffer.
-5. **Record mode**: write the buffer to the baseline path and report `pass`.
-6. **Compare mode**: load the baseline PNG, run an LLM-vision comparison with the AC's `checks` array as the query, receive `{ status, detail }`, and report.
-7. Optionally `mcp__playwright__browser_evaluate` to cross-check structural invariants that live alongside the visual claim (e.g. "scale is not near-zero" can be confirmed by reading the SVG transform directly). Structural ACs are NOT your responsibility — the existing forge-verifier handles `[structural]` ACs — but you may use `evaluate` as an extra signal if it sharpens a vision result.
+3. **`awaitVisualReady`** — runs the readiness recipe via `mcp__playwright__browser_evaluate`: await `document.fonts.ready`, inject the animation-disable style tag (`#forge-visual-disable-anim`, which sets `animation` and `transition` to `none !important` and pauses CSS animations), then await two `requestAnimationFrame` ticks so the disabled-animation style has been applied for at least one paint. Rejects with `{ reason: 'readiness_timeout', stage }` after `timeoutMs` (where `stage` is `fonts`, `disable_anim`, or `raf`). Replaces the old `networkidle`/500-ms fallback.
+4. **Optional**: `mcp__playwright__browser_wait_for` on the AC's `selector=` value if it declared one (legacy escape hatch for ACs that need a specific element before screenshotting).
+5. `mcp__playwright__browser_take_screenshot` — full-page PNG. Save the buffer.
+6. **Optional**: when the AC has `occluded_check=true selector="…"`, call `verifyVisible(selector)` (which uses `document.elementFromPoint` against the element's centroid) to confirm the element is on-screen and not covered by another element. Failure → record this AC as `fail` with `detail: "occluded: <reason>"` (e.g. `out_of_viewport`, `zero_size`, `display_none`, or `occludedBy: <preview>`) and skip the compare step for this AC.
+7. **Record mode**: write the buffer to the baseline path and report `pass` (`baseline-recorded` or `baseline-rerecorded`). **Compare mode**: load the baseline PNG, run an LLM-vision comparison with the AC's `checks` array as the query, receive `{ status, detail }`, and report.
+
+You may still use `mcp__playwright__browser_evaluate` as an extra signal to cross-check structural invariants that live alongside a visual claim (e.g. "scale is not near-zero" can be confirmed by reading the SVG transform directly). Structural ACs are NOT your responsibility — the existing forge-verifier handles `[structural]` ACs — but you may use `evaluate` as an auxiliary check if it sharpens a vision result.
 
 Record one result per AC:
 
@@ -130,6 +134,8 @@ Return one of:
 - **`capabilities.sandbox.browser: false`** → every AC `blocked` with `detail: "browser_cap_disabled"`.
 - **`FORGE_DISABLE_PLAYWRIGHT=1`** → every AC `blocked` with `detail: "playwright_unavailable"`. Used by CI and unit tests.
 - **Dev server unreachable at the declared `path`** → that AC `blocked` with a screenshot-error detail. Other ACs continue.
+- **Readiness timeout** → that AC `blocked` with `detail: "readiness_timeout: <stage>"`. Other ACs continue.
+- **Occluded element (`occluded_check=true`)** → that AC `fail` with `detail: "occluded: <reason or occludedBy preview>"`. Other ACs continue.
 - **Vision step returns malformed JSON** → that AC `blocked` with `detail: "vision_error: <message>"`. Do not guess the status.
 - **Baseline missing in compare mode** → record the baseline and pass this run. Subsequent runs compare.
 
