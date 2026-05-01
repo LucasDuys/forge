@@ -2080,6 +2080,111 @@ function writeVisualProgress(forgeDir, taskId, visualAcResults) {
   return obj;
 }
 
+// === Wave 4 R002: Stable Browser Readiness Recipe ===
+// awaitVisualReady runs a deterministic readiness recipe in the browser
+// page context via a caller-supplied evaluate bridge. This replaces the
+// old `networkidle` / 500-ms fallback with three concrete signals:
+//
+//   1. `await document.fonts.ready` -- web-font load, kills FOUT/FOIT flake.
+//   2. Inject a <style> tag (id `forge-visual-disable-anim`) that disables
+//      transitions, animations, and caret blink globally. This holds the
+//      DOM still for the screenshot duration. The caller is responsible
+//      for removing the tag after the screenshot if it wants to re-enable
+//      animations on the same page; the verifier loop here screenshots
+//      and moves on, so we leave the tag in place.
+//   3. Two `requestAnimationFrame` ticks so the browser actually paints
+//      the now-stable DOM before the screenshot fires.
+//
+// `evaluateFn(scriptStr) => Promise<any>` is the seam: in production the
+// agent passes `mcp__playwright__browser_evaluate` (or a thin wrapper
+// that returns the eval result). In tests we stub it.
+//
+// Resolves with `{ ready: true }` when all three stages succeed.
+// Rejects with `{ reason: 'readiness_timeout', stage: 'fonts'|'animations'|'paint'|'overall'|'unknown' }`
+// when any stage fails, when evaluateFn throws, or when the whole
+// recipe takes longer than `timeoutMs` (default 3000 ms).
+//
+// The script string is generated at the Node level and shipped to the
+// browser as one IIFE. The Node side never imports a browser API.
+async function awaitVisualReady(evaluateFn, timeoutMs) {
+  if (typeof evaluateFn !== 'function') {
+    throw { reason: 'readiness_timeout', stage: 'unknown', error: 'evaluateFn_not_callable' };
+  }
+  const ms = (typeof timeoutMs === 'number' && timeoutMs > 0) ? timeoutMs : 3000;
+
+  // Browser-side recipe. Order matters and is asserted in tests:
+  //   fonts -> animation disable (style injection) -> 2x rAF.
+  // Each stage returns `{ ok: false, stage, error }` on failure so the
+  // Node side can surface a structured rejection. A successful run
+  // returns `{ ok: true }`.
+  const script = [
+    '(async () => {',
+    '  // Stage 1: fonts',
+    '  try {',
+    '    if (document && document.fonts && document.fonts.ready) {',
+    '      await document.fonts.ready;',
+    '    }',
+    '  } catch (e) {',
+    '    return { ok: false, stage: "fonts", error: String(e && e.message || e) };',
+    '  }',
+    '  // Stage 2: animation disable',
+    '  try {',
+    '    var existing = document.getElementById("forge-visual-disable-anim");',
+    '    if (!existing) {',
+    '      var style = document.createElement("style");',
+    '      style.id = "forge-visual-disable-anim";',
+    '      style.textContent = "*, *::before, *::after { transition: none !important; animation: none !important; caret-color: transparent !important; }";',
+    '      document.head.appendChild(style);',
+    '    }',
+    '  } catch (e) {',
+    '    return { ok: false, stage: "animations", error: String(e && e.message || e) };',
+    '  }',
+    '  // Stage 3: 2x rAF',
+    '  try {',
+    '    await new Promise(function (r) { requestAnimationFrame(r); });',
+    '    await new Promise(function (r) { requestAnimationFrame(r); });',
+    '  } catch (e) {',
+    '    return { ok: false, stage: "paint", error: String(e && e.message || e) };',
+    '  }',
+    '  return { ok: true };',
+    '})()'
+  ].join('\n');
+
+  let timeoutHandle = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject({ reason: 'readiness_timeout', stage: 'overall' });
+    }, ms);
+  });
+
+  let evalPromise;
+  try {
+    evalPromise = Promise.resolve(evaluateFn(script));
+  } catch (err) {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    throw { reason: 'readiness_timeout', stage: 'unknown', error: String(err && err.message || err) };
+  }
+
+  let result;
+  try {
+    result = await Promise.race([evalPromise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+
+  if (!result || typeof result !== 'object') {
+    throw { reason: 'readiness_timeout', stage: 'unknown', error: 'no_result' };
+  }
+  if (result.ok === true) {
+    return { ready: true };
+  }
+  throw {
+    reason: 'readiness_timeout',
+    stage: (result && result.stage) || 'unknown',
+    error: result && result.error
+  };
+}
+
 // Orchestration entry point for the `forge-visual-verifier` agent. Pure
 // (no network, no Playwright invocation) so it can be unit-tested
 // deterministically. The agent is responsible for the actual
@@ -2103,6 +2208,17 @@ function writeVisualProgress(forgeDir, taskId, visualAcResults) {
 //                     production. Unit tests pass a stub.
 //   visionCompare     async (screenshotPng, baselinePng, checks) => { status, detail }.
 //                     Only used when baselines exist and we're in compare-mode.
+//   evaluateBridge    async (scriptStr) => any. Caller-supplied bridge to
+//                     Playwright MCP's `browser_evaluate`. When provided
+//                     and `takeScreenshot` is also provided, the verifier
+//                     calls awaitVisualReady(evaluateBridge) before each
+//                     screenshot. On readiness timeout the AC is reported
+//                     `blocked` with detail `readiness_timeout: <stage>`
+//                     and the loop continues to the next AC. Optional --
+//                     when omitted the verifier behaves as before
+//                     (the agent is expected to have already settled the
+//                     page by other means).
+//   readinessTimeoutMs  override the 3000-ms default for awaitVisualReady.
 //
 // Return shape:
 //   {
@@ -2201,6 +2317,22 @@ async function runVisualVerifier(forgeDir, opts) {
       result.checks = ac.checks;
       results.push(result);
       continue;
+    }
+
+    // Wave 4 R002: deterministic readiness recipe runs before every
+    // screenshot when the caller wires an evaluate bridge. A timeout
+    // here marks the AC blocked and continues -- the rest of the run
+    // is not poisoned.
+    if (typeof opts.evaluateBridge === 'function') {
+      try {
+        await awaitVisualReady(opts.evaluateBridge, opts.readinessTimeoutMs);
+      } catch (err) {
+        const stage = (err && err.stage) || 'unknown';
+        result.status = 'blocked';
+        result.detail = 'readiness_timeout: ' + stage;
+        results.push(result);
+        continue;
+      }
     }
 
     let shot;
@@ -7829,6 +7961,8 @@ module.exports = {
   // T020 / R007: visual verifier plumbing.
   parseVisualAcs, checkVisualCapabilities, baselinePath,
   writeVisualProgress, runVisualVerifier,
+  // Wave 4 R002: deterministic browser readiness recipe.
+  awaitVisualReady,
   detectFileConflicts, serializeConflictingTasks, logConflictEvent, planTierExecution, detectParallelConflicts,
   writeParallelConstraints, readParallelConstraints, isBlockedByParallelConstraint,
   readLedger, writeLedgerAtomic, resolveTaskBudget,
