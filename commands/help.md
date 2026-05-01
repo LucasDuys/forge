@@ -51,3 +51,5 @@ Edit `.forge/config.json` to customize autonomy, depth, token budget, multi-repo
 ## Token Reduction Kill Switch
 
 Set `FORGE_TOKEN_OPT=0` to disable Wave 2 cache extensions and revert to the original 6-pattern, flat-120s-TTL behavior. All other Wave 2 additions (mtime keying, HEAD pinning, stats logging) also disable. Default is on.
+
+The same `FORGE_TOKEN_OPT=0` flag also disables the Wave 3 token-reduction surfaces: the broader output filter, the router's per-phase `effort`/`max_tokens` policy, and the first-run wizard banner. Wave 1 instrumentation extras (capture, `usage_actual.*` ledger keys) bypass too, leaving the v1-shape ledger. This is the single end-to-end rollback contract across all three waves; the wizard prints the same flag on first run.
