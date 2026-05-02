@@ -1,12 +1,20 @@
 ---
 description: "Decompose specs into task frontiers with dependency tracking"
 argument-hint: "[--filter NAME] [--depth quick|standard|thorough] [--repos REPO1,REPO2]"
-allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Agent(*)"]
+allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-wizard.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Agent(*)"]
 ---
 
 # Forge Plan
 
 Decompose approved specifications into ordered task frontiers with dependency DAGs, token estimates, and repo tags.
+
+## First-Run Wizard (R004.AC3)
+
+Before anything else, fire the one-shot token-reduction wizard. Idempotent — prints once on first install, then no-ops forever. Suppressed when `/forge:watch` is rendering its own banner (R004.AC6).
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-wizard.cjs" --forge-dir .forge
+```
 
 ## Pre-flight Check
 
@@ -84,6 +92,19 @@ Interpret the exit code and JSON output:
 - **Exit 1 / fatal error** — surface the validator error to the user and stop. Do not plan against an unreadable spec.
 
 This gate is mandatory. Skipping it risks a frontier whose tasks point at nonexistent files.
+
+## Router Hint Dispatch (R003)
+
+Before each `Agent` tool invocation during planning (forge-complexity for depth detection, forge-speccer-validator replan passes, forge-planner per spec), the orchestrator MUST resolve the per-phase model + effort hint via `scripts/forge-router.cjs::writeHandoff` and pass the resulting `model` to the Agent tool.
+
+For every Agent dispatch:
+
+1. Call `writeHandoff(forgeDir, taskId, role, complexityOrTask)`. Use the spec domain or planning step id as `taskId` (e.g. `plan-spec-auth`, `complexity-detect`). This writes `.forge/handoff.{task_id}.json` containing `{ model, effort, max_tokens, role, task_id }` (or the legacy 3-field shape `{ model, role, task_id }` when `FORGE_TOKEN_OPT=0`).
+2. Read the returned object's `model` field and pass it to the Agent tool's `model` parameter where the harness supports it.
+3. The `effort` and `max_tokens` hints are recorded in the handoff file for forward-compat. If the Agent tool does not currently accept an `effort` parameter, behavior is unchanged from today — when the harness adds support, downstream tooling picks the hint up automatically by reading the handoff file.
+4. The handoff file is idempotent: re-dispatching the same planning step overwrites cleanly.
+
+Do NOT modify `agents/forge-*.md`, `skills/*/SKILL.md`, or `CLAUDE.md` to surface the hint — the handoff JSON is the only plumbing point for this spec.
 
 ## Invoke Planning
 

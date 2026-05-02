@@ -1509,6 +1509,9 @@ function updateTokenLedger(forgeDir, iterationTokens, lastTranscriptTokens) {
   if (lastTranscriptTokens !== undefined) {
     ledger.last_transcript_tokens = lastTranscriptTokens;
   }
+  // T003 / R003: tag every write with schema_version: 2 so a v1 ledger
+  // auto-upgrades on the next normal update.
+  ledger.schema_version = 2;
   fs.writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2));
   return ledger;
 }
@@ -1545,10 +1548,22 @@ function readLedger(forgeDir) {
   if (!ledger.per_spec || typeof ledger.per_spec !== 'object') ledger.per_spec = {};
   if (typeof ledger.last_transcript_tokens !== 'number') ledger.last_transcript_tokens = 0;
   if (!ledger.tasks || typeof ledger.tasks !== 'object') ledger.tasks = {};
+  // T003 / R003: token-ledger v2 shape stability. We don't force-write the
+  // upgrade here (readers don't need to mutate disk); we only ensure the
+  // returned in-memory object has stable shape for callers that reach into
+  // ledger.usage_actual directly. Note: schema_version is intentionally NOT
+  // synthesized in this readLedger -- the explicit forge-budget.loadLedger
+  // helper owns that detection so callers know whether they read a v1 file.
   return ledger;
 }
 
 function writeLedgerAtomic(forgeDir, ledger) {
+  // T003 / R003: every write tags the ledger with schema_version: 2 so the
+  // file on disk auto-upgrades on the next write. Existing v1 fields are
+  // preserved verbatim -- this is purely additive.
+  if (ledger && typeof ledger === 'object' && ledger.schema_version !== 2) {
+    ledger.schema_version = 2;
+  }
   const ledgerPath = path.join(forgeDir, 'token-ledger.json');
   const tmpPath = ledgerPath + '.tmp.' + process.pid;
   fs.writeFileSync(tmpPath, JSON.stringify(ledger, null, 2));
@@ -4608,11 +4623,180 @@ function _readLastError(forgeDir, state) {
 // Headless status JSON schema version. Bump only on backward-incompatible
 // changes (removed/renamed fields, changed value types). Additive fields do
 // not require a bump. See references/headless-status-schema.md.
-const HEADLESS_STATUS_SCHEMA_VERSION = '1.0';
+//
+// T004 / R004: bumped 1 -> 2 alongside the additive top-level `tokens` block.
+// The bump is a code-version increment; the existing 17 v1 fields remain
+// unchanged in name, shape, and semantics.
+const HEADLESS_STATUS_SCHEMA_VERSION = 2;
+
+// Wave 2 / R005 -- aggregateCacheStats(forgeDir)
+//   Reads <forgeDir>/cache-stats.jsonl (rolling log written by
+//   hooks/tool-cache-store.js::recordCacheEvent) and returns the aggregate
+//   counters surfaced under `tokens.cache` on queryHeadlessState.
+//
+//   Returns { hits, misses, savings_estimate_tokens } where:
+//     - hits = count of events with event.hit === true
+//     - misses = count of events with event.hit === false
+//     - savings_estimate_tokens = sum over hits of
+//         min(floor(event.output_bytes / 4), 4000)
+//       (rough chars-to-tokens ratio of 4, capped at 4000 per call.)
+//
+//   Defensive:
+//     - Missing file -> { hits: 0, misses: 0, savings_estimate_tokens: 0 }
+//     - Corrupted / non-JSON / empty lines are silently skipped (the loop
+//       continues over the rest of the log).
+//     - Never throws.
+//
+//   FORGE_TOKEN_OPT=0 short-circuits to all-zero without reading the file.
+//
+//   Perf budget: <= 2ms on a full 1000-line log. Implementation uses a single
+//   readFileSync + split('\n') + per-line JSON.parse with a try/catch around
+//   each parse. No regex, no recursion, no async.
+function aggregateCacheStats(forgeDir) {
+  const empty = { hits: 0, misses: 0, savings_estimate_tokens: 0 };
+  if (process.env.FORGE_TOKEN_OPT === '0') return empty;
+  const dir = forgeDir || '.forge';
+  const target = path.join(dir, 'cache-stats.jsonl');
+  let buf;
+  try {
+    if (!fs.existsSync(target)) return empty;
+    buf = fs.readFileSync(target, 'utf8');
+  } catch (_e) {
+    return empty;
+  }
+  if (!buf) return empty;
+
+  let hits = 0;
+  let misses = 0;
+  let savings = 0;
+  // split('\n') preserves a trailing empty entry if the file ends with \n;
+  // the empty-line guard inside the loop handles it without an explicit pop.
+  const lines = buf.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    let ev;
+    try { ev = JSON.parse(line); } catch (_e) { continue; }
+    if (!ev || typeof ev !== 'object' || Array.isArray(ev)) continue;
+    if (ev.hit) {
+      hits++;
+      const bytes = Number(ev.output_bytes) || 0;
+      const est = Math.min(Math.floor(bytes / 4), 4000);
+      if (est > 0) savings += est;
+    } else {
+      misses++;
+    }
+  }
+  return { hits, misses, savings_estimate_tokens: savings };
+}
+
+// T004 / R004 -- buildTokensBlock(forgeDir)
+//   Produces the additive `tokens` block surfaced on queryHeadlessState.
+//   Shape:
+//     {
+//       schema_version: 2,
+//       actual: { input, output, cache_read, cache_write },
+//       buckets: { instructions, tool_definitions, tool_results, repo_reads, prose },
+//       cache: { hits, misses, savings_estimate_tokens },
+//       source: "transcript" | "estimate"
+//     }
+//
+//   Semantics:
+//     - On v2 ledger with usage_actual.session populated: hydrated from the
+//       session block. source = "transcript" iff session.source === 'transcript'.
+//     - On v1 ledger (no usage_actual block): all numeric fields zero-filled,
+//       source = "estimate".
+//     - FORGE_TOKEN_OPT=0: schema_version still bumps (code-version), but
+//       actual/buckets are zero-filled and source = "estimate".
+//     - cache.{hits,misses,savings_estimate_tokens} are populated by
+//       aggregateCacheStats from <forgeDir>/cache-stats.jsonl (Wave 2 / R005).
+//       The cache field is independent of the ledger -- it reflects the
+//       rolling cache-event log regardless of ledger version or session
+//       presence. FORGE_TOKEN_OPT=0 still zero-fills cache (aggregator
+//       short-circuits on the kill-switch).
+//
+//   Defensive: never throws. Returns the canonical shape with safe defaults
+//   on any failure path.
+//
+//   Optional `preloaded` argument lets callers (queryHeadlessState) pass in a
+//   loadLedger() result they already have, avoiding a second parse of the
+//   same file. Shape: { ledger, was_v1, was_corrupted } as returned by
+//   forge-budget.loadLedger.
+function buildTokensBlock(forgeDir, preloaded) {
+  // Cache field is shared across all return branches below. The aggregator
+  // already honors FORGE_TOKEN_OPT=0 (returns zeros without I/O), so we can
+  // call it unconditionally and rely on its own kill-switch.
+  const cache = aggregateCacheStats(forgeDir);
+  const empty = {
+    schema_version: 2,
+    actual: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+    buckets: {
+      instructions: 0,
+      tool_definitions: 0,
+      tool_results: 0,
+      repo_reads: 0,
+      prose: 0,
+    },
+    cache,
+    source: 'estimate',
+  };
+  // FORGE_TOKEN_OPT=0: bypass any ledger read; emit the zero-filled shape.
+  // (cache is already zeroed by aggregateCacheStats in this branch.)
+  if (process.env.FORGE_TOKEN_OPT === '0') return empty;
+
+  let loaded = preloaded;
+  if (!loaded) {
+    try {
+      const budget = require('./forge-budget.cjs');
+      loaded = budget.loadLedger(forgeDir);
+    } catch (_e) {
+      return empty;
+    }
+  }
+  if (!loaded || !loaded.ledger) return empty;
+  const ledger = loaded.ledger;
+  // V1 ledger: no transcript ever captured -> zero-filled with source = "estimate".
+  if (loaded.was_v1) return empty;
+
+  const session = (ledger.usage_actual && ledger.usage_actual.session) || null;
+  if (!session) return empty;
+
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : 0;
+  const buckets = (session.buckets && typeof session.buckets === 'object') ? session.buckets : {};
+  return {
+    schema_version: 2,
+    actual: {
+      input: num(session.input),
+      output: num(session.output),
+      cache_read: num(session.cache_read),
+      cache_write: num(session.cache_write),
+    },
+    buckets: {
+      instructions: num(buckets.instructions),
+      tool_definitions: num(buckets.tool_definitions),
+      tool_results: num(buckets.tool_results),
+      repo_reads: num(buckets.repo_reads),
+      prose: num(buckets.prose),
+    },
+    cache,
+    source: session.source === 'transcript' ? 'transcript' : 'estimate',
+  };
+}
 
 function queryHeadlessState(forgeDir) {
   const state = readState(forgeDir);
-  const ledger = readLedger(forgeDir);
+  // T004 / R004 -- load the ledger once via forge-budget.loadLedger so we
+  // can pass the same parsed object into buildTokensBlock and skip a second
+  // disk read + JSON.parse on large ledgers (perf budget < 5ms on 1000-task
+  // fixtures). The returned object is shape-compatible with readLedger's
+  // output (total/iterations/per_spec/tasks all present), so existing reads
+  // below keep working.
+  let preloaded = null;
+  try {
+    const budget = require('./forge-budget.cjs');
+    preloaded = budget.loadLedger(forgeDir);
+  } catch (_e) { /* fall back to readLedger below */ }
+  const ledger = (preloaded && preloaded.ledger) ? preloaded.ledger : readLedger(forgeDir);
   const lockRaw = readLock(forgeDir);
   let lockStatus = 'free';
   let lastHeartbeat = null;
@@ -4674,7 +4858,10 @@ function queryHeadlessState(forgeDir) {
     last_error: _readLastError(forgeDir, state),
     lock_status: lockStatus,
     last_heartbeat: lastHeartbeat,
-    active_checkpoints: activeCheckpoints
+    active_checkpoints: activeCheckpoints,
+    // T004 / R004 -- additive top-level `tokens` block. v1 fields above
+    // remain unchanged; consumers reading only v1 fields keep working.
+    tokens: buildTokensBlock(forgeDir, preloaded)
   };
 }
 
@@ -5942,6 +6129,25 @@ if (require.main === module) {
       process.stdout.write('pct=0 used=0 budget=0 warn=0 escalated=0\n');
     }
     return;
+  }
+
+  // T003 / R003: explicit token-ledger v1 -> v2 migration.
+  // Usage:
+  //   node scripts/forge-tools.cjs upgrade-ledger --forge-dir .forge
+  // Prints a one-line JSON result with `status` ("upgraded"|"no-op"|
+  // "created"|"recovered"|"skipped"). Exit 0 in every non-error case
+  // including "no-op" -- the operation is idempotent by design.
+  if (command === 'upgrade-ledger') {
+    const forgeDir = args.find((a, i) => args[i - 1] === '--forge-dir') || '.forge';
+    try {
+      const budget = require('./forge-budget.cjs');
+      const result = budget.upgradeLedger(forgeDir);
+      process.stdout.write(JSON.stringify(result) + '\n');
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write('upgrade-ledger error: ' + (e && e.message || e) + '\n');
+      process.exit(1);
+    }
   }
 
   // R001: report per-task token budgets. Optionally scope to a single task
@@ -7845,6 +8051,8 @@ module.exports = {
   getProgressSnapshot, checkProgress, getNoProgressCount,
   verifyStateConsistency,
   runHeadless, queryHeadlessState, HEADLESS_EXIT, HEADLESS_STATUS_SCHEMA_VERSION,
+  buildTokensBlock,
+  aggregateCacheStats,
   performForensicRecovery,
   validateWorkflowPrerequisites,
   truncateGraphOutput,

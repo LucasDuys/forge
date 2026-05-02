@@ -1,10 +1,18 @@
 ---
 description: "Run the autonomous implementation loop"
 argument-hint: "[--autonomy full|gated|supervised] [--max-iterations N] [--token-budget N] [--depth quick|standard|thorough] [--filter NAME] [--record-baselines]"
-allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tui-attach.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Bash(*)", "Agent(*)"]
+allowed-tools: ["Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tui-attach.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-wizard.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Bash(*)", "Agent(*)"]
 ---
 
 # Forge Execute
+
+## First-Run Wizard (R004.AC3)
+
+Before anything else, fire the one-shot token-reduction wizard. Idempotent — prints once on first install, then no-ops forever. Suppressed when `/forge:watch` is rendering its own banner (R004.AC6).
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-wizard.cjs" --forge-dir .forge
+```
 
 Launch the autonomous implementation loop. Reads the frontier, implements tasks one by one, and relies on the Stop hook state machine to drive iteration until all tasks are complete.
 
@@ -136,6 +144,19 @@ The helper always exits 0; `/forge:execute` never stalls waiting on it. If `tmux
 2. Parse the frontier to find the first unblocked task (Tier 1, first entry).
 3. Update `.forge/state.md` with `current_task: {task-id}` and `task_status: pending`.
 4. Update the "What's Next" section in state.md with all remaining tasks.
+
+## Router Hint Dispatch (R003)
+
+Before each `Agent` tool invocation during execution, the orchestrator MUST resolve the per-phase model + effort hint via `scripts/forge-router.cjs::writeHandoff` and pass the resulting `model` to the Agent tool.
+
+For every Agent dispatch (executor, researcher, reviewer, verifier, complexity, planner sub-tasks), do this immediately before the call:
+
+1. Call `writeHandoff(forgeDir, taskId, role, complexityOrTask)`. Pass either a pre-classified object (from `classifyTask`) or the raw task object — `writeHandoff` accepts both. This writes `.forge/handoff.{task_id}.json` containing `{ model, effort, max_tokens, role, task_id }` (or the legacy 3-field shape `{ model, role, task_id }` when `FORGE_TOKEN_OPT=0`).
+2. Read the returned object's `model` field and pass it to the Agent tool's `model` parameter where the harness supports it.
+3. The `effort` and `max_tokens` hints are recorded in the handoff file for forward-compat. If the Agent tool does not currently accept an `effort` parameter, behavior is unchanged from today — when the harness adds support, downstream tooling picks the hint up automatically by reading the handoff file.
+4. The handoff file is idempotent: re-dispatching the same task overwrites cleanly. Do not delete handoff files between iterations; they are the audit trail for what hint was sent.
+
+Do NOT modify `agents/forge-*.md`, `skills/*/SKILL.md`, or `CLAUDE.md` to surface the hint — the handoff JSON is the only plumbing point for this spec. The R003 acceptance criteria explicitly forbid touching those files.
 
 ## Begin Execution
 

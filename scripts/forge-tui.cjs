@@ -451,6 +451,14 @@ class StatePoller {
       perTaskBudgets: null,      // { quick, standard, thorough } from config
       currentDepth: 'standard',  // .forge/config.json depth (drives currentTaskBudget)
       taskTotalTokens: 0,        // sum of token_usage across ALL .forge/progress/*.json
+      // R005 (T005): v2 token instrumentation block from queryHeadlessState.
+      // null when the headless query is unavailable; otherwise the canonical
+      // shape produced by buildTokensBlock() in forge-tools.cjs:
+      //   { schema_version, actual, buckets: { instructions, tool_definitions,
+      //     tool_results, repo_reads, prose }, cache, source }
+      // The bucket-bar renderer feeds off `tokens.buckets` and only draws when
+      // schema_version === 2 AND any bucket > 0.
+      tokens: null,
     };
   }
 
@@ -521,6 +529,10 @@ class StatePoller {
           }
           if (q.lock_status) s.lockStatus = q.lock_status;
           if (q.last_error) s.lastError = q.last_error;
+          // R005 (T005): pass through the v2 tokens block. Renderer reads
+          // s.tokens.buckets to draw the bucket-bar mini-bar below the token
+          // line; null/missing means no bar (zero visual regression on v1).
+          if (q.tokens && typeof q.tokens === 'object') s.tokens = q.tokens;
           headlessOk = true;
         }
       } catch (e) {
@@ -845,6 +857,12 @@ class Renderer {
       }
     }
     lines.push(this._tokenLine(snap, cols));
+    // R005 (T005): bucket-bar mini-bar BELOW the budget/token line. Only emits
+    // when v2 ledger is present, at least one bucket has measurable spend, and
+    // FORGE_TOKEN_OPT is not explicitly disabled. _bucketBarLine returns null
+    // in any other case so v1 ledgers render byte-identically to today.
+    const bucketBar = this._bucketBarLine(snap, cols);
+    if (bucketBar !== null) lines.push(bucketBar);
     lines.push(this._meterLine(snap, cols));
     lines.push(this._sep(cols));
     // Auto-backprop pending banner takes precedence over countdown but coexists
@@ -1017,6 +1035,98 @@ class Renderer {
       line += `   ${this._color('gray', `task-tot ${this._fmtTokens(snap.taskTotalTokens)}`)}`;
     }
     return line;
+  }
+
+  // R005 (T005): "tokens by source" mini-bar. Five fixed segments correspond
+  // to the v2 ledger buckets in this canonical order:
+  //   I  instructions      (system prompts, agent defs, skills, CLAUDE.md)
+  //   T  tool_definitions  (tool schemas/descriptions)
+  //   R  tool_results      (tool result blocks)
+  //   F  repo_reads        (Read/Grep/Glob file contents)
+  //   P  prose             (assistant text + remaining prose)
+  //
+  // Render gate (all three required, in order of cheapest check first):
+  //   1. process.env.FORGE_TOKEN_OPT !== "0"   — opt-out kill switch
+  //   2. snap.tokens.schema_version === 2      — only v2 ledgers carry buckets
+  //   3. sum of all five buckets > 0           — fresh project after migration
+  //                                              but before any usage capture
+  //                                              would emit schema_version === 2
+  //                                              with all zeros; spec says NO bar
+  //
+  // Fail-closed on any missing/malformed input -> return null (no bar). This
+  // is what guarantees the "byte-for-byte identical to today" v1 contract.
+  //
+  // Width: bar body is 40 chars, matching the progress bar above (visual line
+  // up). Segment widths are computed by largest-remainder rounding so they
+  // sum exactly to 40 — never 39, never 41 — which the test asserts. Empty
+  // buckets get width 0; fractional remainders are awarded to the largest
+  // bucket(s) first.
+  _bucketBarLine(snap, cols) {
+    if (process.env.FORGE_TOKEN_OPT === '0') return null;
+    const t = snap && snap.tokens;
+    if (!t || typeof t !== 'object') return null;
+    if (t.schema_version !== 2) return null;
+    const b = t.buckets;
+    if (!b || typeof b !== 'object') return null;
+    const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0) ? v : 0;
+    const vals = [
+      num(b.instructions),
+      num(b.tool_definitions),
+      num(b.tool_results),
+      num(b.repo_reads),
+      num(b.prose),
+    ];
+    const total = vals.reduce((s, v) => s + v, 0);
+    if (total <= 0) return null;
+
+    const BAR_WIDTH = 40;
+    const fillChar = this.caps.utf8 ? '█' : '#';
+    const emptyChar = this.caps.utf8 ? '░' : '-';
+
+    // Largest-remainder allocation: floor(prop * width) for each, then award
+    // the leftover slots to the buckets with the largest fractional parts.
+    // Guarantees segments sum to BAR_WIDTH and every nonzero bucket gets at
+    // least 0 chars (zero buckets stay zero).
+    const exact = vals.map((v) => (v / total) * BAR_WIDTH);
+    const widths = exact.map((x) => Math.floor(x));
+    let used = widths.reduce((s, w) => s + w, 0);
+    const remainders = exact
+      .map((x, i) => ({ i, frac: x - Math.floor(x) }))
+      .sort((a, b2) => b2.frac - a.frac);
+    let r = 0;
+    while (used < BAR_WIDTH && r < remainders.length) {
+      // Only award leftover slots to buckets that actually have spend; keeps
+      // a zero bucket at width 0 rather than padding it artificially.
+      if (vals[remainders[r].i] > 0) {
+        widths[remainders[r].i]++;
+        used++;
+      }
+      r++;
+    }
+    // Defensive: if everything was zero (can't happen here — total > 0) or
+    // rounding lost a slot, fill any remaining with the first nonzero bucket.
+    while (used < BAR_WIDTH) {
+      const idx = vals.findIndex((v) => v > 0);
+      if (idx < 0) break;
+      widths[idx]++;
+      used++;
+    }
+
+    const labels = ['I', 'T', 'R', 'F', 'P'];
+    const palette = ['cyan', 'magenta', 'yellow', 'blue', 'green'];
+    const segs = widths.map((w, i) => this._color(palette[i], fillChar.repeat(w)));
+    // If somehow used < BAR_WIDTH (shouldn't), pad with empty cells so visual
+    // width is constant.
+    const pad = BAR_WIDTH - used > 0 ? emptyChar.repeat(BAR_WIDTH - used) : '';
+    const bar = segs.join('') + pad;
+
+    // Legend: " I:12% T:8% R:34% F:40% P:6%". Percentages floor for stability;
+    // a 0% bucket appears as "X:0%" which keeps the legend column-stable.
+    const legend = labels
+      .map((l, i) => `${this._color(palette[i], l)}:${Math.floor((vals[i] / total) * 100)}%`)
+      .join(' ');
+
+    return `  Source: [${bar}] ${legend}`;
   }
 
   _meterLine(snap, cols) {

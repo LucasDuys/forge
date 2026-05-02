@@ -1,10 +1,18 @@
 ---
 description: "Turn an idea into concrete specs with testable requirements"
 argument-hint: "[TOPIC] [--from-code] [--from-docs PATH]"
-allowed-tools: ["Bash(${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Agent(*)"]
+allowed-tools: ["Bash(${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-wizard.cjs:*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Agent(*)"]
 ---
 
 # Forge Brainstorm
+
+## First-Run Wizard (R004.AC3)
+
+Before anything else, fire the one-shot token-reduction wizard. Idempotent — prints once on first install, then no-ops forever. Suppressed when `/forge:watch` is rendering its own banner (R004.AC6).
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-wizard.cjs" --forge-dir .forge
+```
 
 ## Step 1: Initialize project state
 

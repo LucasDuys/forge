@@ -2,45 +2,230 @@
 // PostToolUse hook -- stores results of cacheable tool calls
 // Companion to tool-cache.js (PreToolUse)
 // Matcher: "Bash|Grep|Glob|Read"
+//
+// Wave 2 / R005: also exposes `recordCacheEvent` for the cache-stats rolling
+// log. Required by scripts/forge-tools.cjs::aggregateCacheStats and (in T003)
+// by hooks/tool-cache.js itself once pattern broadening lands.
+//
+// Wave 2 / R002: writes the per-entry `class` field (stable | volatile |
+// head_pinned) into the cache JSON so the PreToolUse hook can resolve the
+// correct TTL on read. Classification is delegated to tool-cache.js's
+// classifyPattern() to keep the boundary logic in one place. Entries written
+// by older versions (no `class` field) are treated as 'volatile' on read.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
+// Lazy resolver for classifyPattern: tool-cache.js itself requires this
+// module (recordCacheEvent), so a top-level require() here would create a
+// circular dependency that fires a node warning and may return an empty
+// exports object on first load. We resolve on-demand inside the hook's
+// stdin handler, by which point both modules are fully initialized.
+function _getClassifyPattern() {
+  try {
+    const mod = require('./tool-cache.js');
+    return typeof mod.classifyPattern === 'function' ? mod.classifyPattern : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// R003 (T005): Lazy resolver for the Read-tool stat helpers. Same circular-
+// dependency reasoning as _getClassifyPattern above.
+function _getReadStatHelpers() {
+  try {
+    const mod = require('./tool-cache.js');
+    return {
+      getReadFileStat: typeof mod.getReadFileStat === 'function' ? mod.getReadFileStat : null,
+      computeReadCacheKey: typeof mod.computeReadCacheKey === 'function' ? mod.computeReadCacheKey : null,
+    };
+  } catch (e) {
+    return { getReadFileStat: null, computeReadCacheKey: null };
+  }
+}
+
+// R004 (T006): Lazy resolver for getHeadSha. Same circular-dependency reasoning
+// as the helpers above. Returns null on any failure so callers fall back to
+// the v1 hash + class='volatile' behavior. NEVER throws.
+function _getHeadShaHelper() {
+  try {
+    const mod = require('../scripts/forge-head-cache.cjs');
+    return typeof mod.getHeadSha === 'function' ? mod.getHeadSha : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 const MAX_CACHED_OUTPUT = 8000;
+
+// Rolling-log retention: target last N lines. We append on every event and
+// compact (rewrite) only when the file grows past N + slack. The slack avoids
+// a rewrite on every single append while keeping the file bounded in practice.
+const CACHE_STATS_TARGET_LINES = 1000;
+const CACHE_STATS_COMPACT_THRESHOLD = 1100;
 
 function hashInput(toolName, toolInput) {
   const key = JSON.stringify({ toolName, toolInput });
   return crypto.createHash('md5').update(key).digest('hex');
 }
 
-let input = '';
-const timeout = setTimeout(() => process.exit(0), 3000);
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', chunk => input += chunk);
-process.stdin.on('end', () => {
-  clearTimeout(timeout);
+// recordCacheEvent({ tool, pattern_class, hit, age_ms, output_bytes }, options)
+//
+// Appends a single JSON line to <forgeDir>/cache-stats.jsonl describing one
+// cache lookup. If the file exceeds CACHE_STATS_COMPACT_THRESHOLD lines after
+// the append, it is rewritten with only the last CACHE_STATS_TARGET_LINES
+// lines preserved.
+//
+// Defensive: never throws. On any error returns { written: false, error }.
+// FORGE_TOKEN_OPT=0 short-circuits to a no-op return { written: false,
+// disabled: true } before touching the filesystem.
+//
+// Returns { written: true, compacted: bool } on success.
+function recordCacheEvent(event, options) {
+  if (process.env.FORGE_TOKEN_OPT === '0') {
+    return { written: false, disabled: true };
+  }
+  const opts = options || {};
+  const forgeDir = opts.forgeDir || '.forge';
+
+  const ev = event || {};
+  const record = {
+    ts: Date.now(),
+    tool: typeof ev.tool === 'string' ? ev.tool : '',
+    pattern_class: typeof ev.pattern_class === 'string' ? ev.pattern_class : '',
+    hit: !!ev.hit,
+    age_ms: Number(ev.age_ms) || 0,
+    output_bytes: Number(ev.output_bytes) || 0,
+  };
+  const line = JSON.stringify(record) + '\n';
+  const target = path.join(forgeDir, 'cache-stats.jsonl');
+
   try {
-    const data = JSON.parse(input);
-    const sessionId = data.session_id || 'default';
-    const toolName = data.tool_name;
-    const toolInput = data.tool_input || {};
-    const output = typeof data.tool_output === 'string'
-      ? data.tool_output
-      : JSON.stringify(data.tool_output);
+    if (!fs.existsSync(forgeDir)) {
+      fs.mkdirSync(forgeDir, { recursive: true });
+    }
+    fs.appendFileSync(target, line);
+  } catch (e) {
+    process.stderr.write('[tool-cache-store] failed to append cache-stats: ' + (e && e.message) + '\n');
+    return { written: false, error: (e && e.message) || String(e) };
+  }
 
-    if (!output || output.length > MAX_CACHED_OUTPUT) process.exit(0);
-    if (!['Bash', 'Grep', 'Glob', 'Read'].includes(toolName)) process.exit(0);
+  // Compaction: read back, count lines, trim if over threshold. We only do
+  // the trim on overage so the hot path stays at one append in steady state.
+  let compacted = false;
+  try {
+    const buf = fs.readFileSync(target, 'utf8');
+    // Split on \n, drop the trailing empty entry produced by the final newline.
+    const all = buf.split('\n');
+    if (all.length && all[all.length - 1] === '') all.pop();
+    if (all.length > CACHE_STATS_COMPACT_THRESHOLD) {
+      const kept = all.slice(all.length - CACHE_STATS_TARGET_LINES);
+      fs.writeFileSync(target, kept.join('\n') + '\n');
+      compacted = true;
+    }
+  } catch (e) {
+    // Compaction failure is non-fatal: the append already succeeded.
+    process.stderr.write('[tool-cache-store] compaction skipped: ' + (e && e.message) + '\n');
+  }
 
-    const cacheDir = path.join(os.tmpdir(), `forge-tool-cache-${sessionId}`);
-    if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+  return { written: true, compacted };
+}
 
-    const hash = hashInput(toolName, toolInput);
-    fs.writeFileSync(
-      path.join(cacheDir, `${hash}.json`),
-      JSON.stringify({ timestamp: Date.now(), output })
-    );
-  } catch (e) { /* silent */ }
-  process.exit(0);
-});
+module.exports = {
+  recordCacheEvent,
+  CACHE_STATS_TARGET_LINES,
+  CACHE_STATS_COMPACT_THRESHOLD,
+};
+
+// Hook entry point: only run the stdin handler when this file is invoked
+// directly (e.g. by Claude Code's PostToolUse hook). When required as a
+// module from tests or scripts/forge-tools.cjs, skip the stdin block so the
+// process does not block on stdin.
+if (require.main === module) {
+  let input = '';
+  const timeout = setTimeout(() => process.exit(0), 3000);
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', chunk => input += chunk);
+  process.stdin.on('end', () => {
+    clearTimeout(timeout);
+    try {
+      const data = JSON.parse(input);
+      const sessionId = data.session_id || 'default';
+      const toolName = data.tool_name;
+      const toolInput = data.tool_input || {};
+      const output = typeof data.tool_output === 'string'
+        ? data.tool_output
+        : JSON.stringify(data.tool_output);
+
+      if (!output || output.length > MAX_CACHED_OUTPUT) process.exit(0);
+      if (!['Bash', 'Grep', 'Glob', 'Read'].includes(toolName)) process.exit(0);
+
+      const cacheDir = path.join(os.tmpdir(), `forge-tool-cache-${sessionId}`);
+      if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+
+      // R002: classify the command so the PreToolUse hook can resolve the
+      // correct TTL on read. Only Bash commands are classified (Grep/Glob/
+      // Read default to volatile). When FORGE_TOKEN_OPT=0, force volatile so
+      // the kill-switch path stays at v1's flat 120s TTL behavior.
+      let cls = 'volatile';
+      if (toolName === 'Bash' && process.env.FORGE_TOKEN_OPT !== '0') {
+        const classifyPattern = _getClassifyPattern();
+        if (typeof classifyPattern === 'function') {
+          try {
+            cls = classifyPattern(toolInput.command || '');
+          } catch (_) { cls = 'volatile'; }
+        }
+      }
+
+      // R003 (T005): For Read tool calls in v2 path, mirror the PreToolUse
+      // hook's stat-keyed filename so writer and reader agree on the key.
+      // FORGE_TOKEN_OPT=0 short-circuits to v1 hashing.
+      let hash = hashInput(toolName, toolInput);
+      if (toolName === 'Read' && process.env.FORGE_TOKEN_OPT !== '0') {
+        const { getReadFileStat, computeReadCacheKey } = _getReadStatHelpers();
+        if (typeof getReadFileStat === 'function' && typeof computeReadCacheKey === 'function') {
+          const filePath = toolInput && toolInput.file_path;
+          let statResult = { mtime_ms: null, size_bytes: null };
+          try { statResult = getReadFileStat(filePath); } catch (_) {}
+          if (statResult.mtime_ms != null && statResult.size_bytes != null) {
+            cls = 'read_stat_pinned';
+            hash = computeReadCacheKey(toolInput, statResult);
+          }
+        }
+      }
+
+      // R004 (T006): For Bash commands classified as head_pinned in v2 path,
+      // fold the current HEAD SHA into the cache filename so the writer's key
+      // matches the reader's. Falls back to v1 hash + class='volatile' if the
+      // helper is unavailable, getHeadSha returns source!='git', or anything
+      // throws. NEVER throws.
+      if (toolName === 'Bash' && process.env.FORGE_TOKEN_OPT !== '0' && cls === 'head_pinned') {
+        const getHeadSha = _getHeadShaHelper();
+        if (typeof getHeadSha === 'function') {
+          let res = null;
+          try { res = getHeadSha(process.cwd()); } catch (_) {}
+          if (res && res.source === 'git' && typeof res.sha === 'string' && /^[0-9a-f]{40}$/i.test(res.sha)) {
+            hash = hashInput(toolName, toolInput) + '_head_' + res.sha;
+            // cls stays 'head_pinned'
+          } else {
+            // No git HEAD available -> demote to volatile so the entry's TTL
+            // resolves to 120s on read, and the bare hash matches what the
+            // PreToolUse hook computes in the same fallback condition.
+            cls = 'volatile';
+          }
+        } else {
+          // Helper unreachable; demote to volatile.
+          cls = 'volatile';
+        }
+      }
+
+      fs.writeFileSync(
+        path.join(cacheDir, `${hash}.json`),
+        JSON.stringify({ timestamp: Date.now(), output, class: cls })
+      );
+    } catch (e) { /* silent */ }
+    process.exit(0);
+  });
+}

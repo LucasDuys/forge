@@ -21,6 +21,7 @@ const SUBDIR_TESTS = [
   'fallback-test.cjs',
   'render-test.cjs',
   'v21-integration-test.cjs',
+  'bucket-bar-test.cjs',
 ];
 
 for (const file of SUBDIR_TESTS) {

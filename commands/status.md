@@ -1,9 +1,17 @@
 ---
 description: "Show Forge progress and status"
-allowed-tools: ["Read(*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)"]
+allowed-tools: ["Read(*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-tools.cjs:*)", "Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/forge-wizard.cjs:*)"]
 ---
 
 # Forge Status
+
+## First-Run Wizard (R004.AC3)
+
+Before anything else, fire the one-shot token-reduction wizard. Idempotent — prints once on first install, then no-ops forever. Suppressed when `/forge:watch` is rendering its own banner (R004.AC6).
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/forge-wizard.cjs" --forge-dir .forge
+```
 
 Present a unified Forge dashboard. If the user passed `--json` anywhere in the
 command arguments, emit machine-readable JSON instead of the formatted view.
