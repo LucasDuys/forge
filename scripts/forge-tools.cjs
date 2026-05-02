@@ -118,7 +118,9 @@ function _reEscape(s) {
 }
 
 function parseFrontmatter(text) {
-  const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  // CRLF-tolerant: every literal `\n` in the frontmatter regexes is `\r?\n`
+  // so Windows-checkout specs (CRLF line endings) parse identically to LF.
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
   if (!match) return { data: {}, content: text };
 
   const data = _parseYamlLines(match[1]);
@@ -129,8 +131,8 @@ function parseFrontmatter(text) {
   // most recent write).
   while (true) {
     const lstripped = remainder.replace(/^\s*\n+/, '');
-    if (!lstripped.startsWith('---\n')) break;
-    const next = lstripped.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+    if (!/^---\r?\n/.test(lstripped)) break;
+    const next = lstripped.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
     if (!next) break;
     const moreData = _parseYamlLines(next[1]);
     Object.assign(data, moreData);
@@ -1933,7 +1935,10 @@ function parseVisualAcs(specPath) {
   catch (_) { return []; }
 
   const { content } = parseFrontmatter(text);
-  const lines = content.split('\n');
+  // CRLF-tolerant split: a Windows-checkout spec has `\r\n` line endings, and
+  // a `'\n'` split would leave a trailing `\r` on every line, breaking the
+  // checkbox regex (JS `.` does not match `\r`).
+  const lines = content.split(/\r?\n/);
   const out = [];
 
   let currentR = null;        // e.g. "R001"
@@ -1996,12 +2001,30 @@ function parseVisualAcs(specPath) {
       } catch (_) { /* keep checks = [] */ }
     }
 
+    // Wave 4 R003: occlusion probe opt-in tokens. Both default safely so
+    // existing specs are unaffected.
+    //
+    //   occluded_check=true|false  -> AC opts in to verifyVisible(). Accepts
+    //                                 the alt spelling occlusion_check= for
+    //                                 author convenience.
+    //   selector="<css>"           -> CSS selector verifyVisible probes.
+    //                                 Accepts double or single quotes.
+    let occludedCheck = false;
+    const occMatch = body.match(/\bocclu(?:ded|sion)_check=(true|false)/i);
+    if (occMatch) occludedCheck = occMatch[1].toLowerCase() === 'true';
+
+    let selector = null;
+    const selMatch = body.match(/\bselector=(?:"([^"]*)"|'([^']*)')/);
+    if (selMatch) selector = selMatch[1] != null ? selMatch[1] : selMatch[2];
+
     out.push({
       requirementId: currentR,
       acId: currentR + '.AC' + acCounterForR,
       path: pathVal,
       viewport,
       checks,
+      occludedCheck,
+      selector,
       line: i + 1,
       raw: line
     });
@@ -2090,6 +2113,190 @@ function writeVisualProgress(forgeDir, taskId, visualAcResults) {
   return obj;
 }
 
+// === Wave 4 R002: Stable Browser Readiness Recipe ===
+// awaitVisualReady runs a deterministic readiness recipe in the browser
+// page context via a caller-supplied evaluate bridge. This replaces the
+// old `networkidle` / 500-ms fallback with three concrete signals:
+//
+//   1. `await document.fonts.ready` -- web-font load, kills FOUT/FOIT flake.
+//   2. Inject a <style> tag (id `forge-visual-disable-anim`) that disables
+//      transitions, animations, and caret blink globally. This holds the
+//      DOM still for the screenshot duration. The caller is responsible
+//      for removing the tag after the screenshot if it wants to re-enable
+//      animations on the same page; the verifier loop here screenshots
+//      and moves on, so we leave the tag in place.
+//   3. Two `requestAnimationFrame` ticks so the browser actually paints
+//      the now-stable DOM before the screenshot fires.
+//
+// `evaluateFn(scriptStr) => Promise<any>` is the seam: in production the
+// agent passes `mcp__playwright__browser_evaluate` (or a thin wrapper
+// that returns the eval result). In tests we stub it.
+//
+// Resolves with `{ ready: true }` when all three stages succeed.
+// Rejects with `{ reason: 'readiness_timeout', stage: 'fonts'|'animations'|'paint'|'overall'|'unknown' }`
+// when any stage fails, when evaluateFn throws, or when the whole
+// recipe takes longer than `timeoutMs` (default 3000 ms).
+//
+// The script string is generated at the Node level and shipped to the
+// browser as one IIFE. The Node side never imports a browser API.
+async function awaitVisualReady(evaluateFn, timeoutMs) {
+  if (typeof evaluateFn !== 'function') {
+    throw { reason: 'readiness_timeout', stage: 'unknown', error: 'evaluateFn_not_callable' };
+  }
+  const ms = (typeof timeoutMs === 'number' && timeoutMs > 0) ? timeoutMs : 3000;
+
+  // Browser-side recipe. Order matters and is asserted in tests:
+  //   fonts -> animation disable (style injection) -> 2x rAF.
+  // Each stage returns `{ ok: false, stage, error }` on failure so the
+  // Node side can surface a structured rejection. A successful run
+  // returns `{ ok: true }`.
+  const script = [
+    '(async () => {',
+    '  // Stage 1: fonts',
+    '  try {',
+    '    if (document && document.fonts && document.fonts.ready) {',
+    '      await document.fonts.ready;',
+    '    }',
+    '  } catch (e) {',
+    '    return { ok: false, stage: "fonts", error: String(e && e.message || e) };',
+    '  }',
+    '  // Stage 2: animation disable',
+    '  try {',
+    '    var existing = document.getElementById("forge-visual-disable-anim");',
+    '    if (!existing) {',
+    '      var style = document.createElement("style");',
+    '      style.id = "forge-visual-disable-anim";',
+    '      style.textContent = "*, *::before, *::after { transition: none !important; animation: none !important; caret-color: transparent !important; }";',
+    '      document.head.appendChild(style);',
+    '    }',
+    '  } catch (e) {',
+    '    return { ok: false, stage: "animations", error: String(e && e.message || e) };',
+    '  }',
+    '  // Stage 3: 2x rAF',
+    '  try {',
+    '    await new Promise(function (r) { requestAnimationFrame(r); });',
+    '    await new Promise(function (r) { requestAnimationFrame(r); });',
+    '  } catch (e) {',
+    '    return { ok: false, stage: "paint", error: String(e && e.message || e) };',
+    '  }',
+    '  return { ok: true };',
+    '})()'
+  ].join('\n');
+
+  let timeoutHandle = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject({ reason: 'readiness_timeout', stage: 'overall' });
+    }, ms);
+  });
+
+  let evalPromise;
+  try {
+    evalPromise = Promise.resolve(evaluateFn(script));
+  } catch (err) {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    throw { reason: 'readiness_timeout', stage: 'unknown', error: String(err && err.message || err) };
+  }
+
+  let result;
+  try {
+    result = await Promise.race([evalPromise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+
+  if (!result || typeof result !== 'object') {
+    throw { reason: 'readiness_timeout', stage: 'unknown', error: 'no_result' };
+  }
+  if (result.ok === true) {
+    return { ready: true };
+  }
+  throw {
+    reason: 'readiness_timeout',
+    stage: (result && result.stage) || 'unknown',
+    error: result && result.error
+  };
+}
+
+// === Wave 4 R003: Occlusion Probe via elementFromPoint ===
+// verifyVisible probes whether a CSS selector is actually painted at its
+// rect's centre point in the page. DOM presence (`querySelector` returning
+// non-null) and even `isVisible()` are not enough: a sticky banner or
+// modal can overlay the asserted element and fool both checks.
+//
+// Contract (returned shape, all branches):
+//   { visible: true }                                     -- target is the topmost element
+//                                                            (or contains the topmost element).
+//   { visible: false, reason: 'not_found' }               -- selector matched nothing,
+//                                                            or elementFromPoint returned null.
+//   { visible: false, reason: 'offscreen' }               -- centre point falls outside
+//                                                            the viewport (negative or > vw/vh).
+//   { visible: false, occludedBy: '<outerHTML head>' }    -- something else is on top;
+//                                                            occludedBy is the topmost element's
+//                                                            outerHTML, sliced to 200 chars to
+//                                                            keep AC `detail` strings tractable.
+//
+// `evaluateFn(scriptStr) => Promise<any>` is the same browser bridge used
+// by `awaitVisualReady`. The Node side only generates a script string and
+// awaits its result -- no browser API is touched at this layer, so the
+// helper is unit-testable with a plain stub.
+//
+// **Not auto-invoked.** Callers opt in via spec syntax
+// `[visual] path=… occluded_check=true selector="#mybtn" checks=[…]`. When
+// the AC carries `occludedCheck === true` and a `selector`, runVisualVerifier
+// invokes verifyVisible after readiness and before the screenshot; otherwise
+// the call is skipped (zero behaviour change for existing specs).
+async function verifyVisible(evaluateFn, selector) {
+  if (typeof evaluateFn !== 'function') {
+    return { visible: false, reason: 'not_found' };
+  }
+  if (typeof selector !== 'string' || selector.length === 0) {
+    return { visible: false, reason: 'not_found' };
+  }
+
+  // Browser-side script. JSON.stringify(selector) escapes any quote/backslash
+  // safely so we can never inject DOM-altering source from a spec string.
+  const script = [
+    '(() => {',
+    '  const sel = ' + JSON.stringify(selector) + ';',
+    '  const el = document.querySelector(sel);',
+    '  if (!el) return { visible: false, reason: "not_found" };',
+    '  const r = el.getBoundingClientRect();',
+    '  const cx = r.left + r.width / 2;',
+    '  const cy = r.top + r.height / 2;',
+    '  const vw = window.innerWidth;',
+    '  const vh = window.innerHeight;',
+    '  if (cx < 0 || cy < 0 || cx > vw || cy > vh) {',
+    '    return { visible: false, reason: "offscreen" };',
+    '  }',
+    '  const top = document.elementFromPoint(cx, cy);',
+    '  if (!top) return { visible: false, reason: "not_found" };',
+    '  if (top === el || el.contains(top)) return { visible: true };',
+    '  const html = (top.outerHTML || "").slice(0, 200);',
+    '  return { visible: false, occludedBy: html };',
+    '})()'
+  ].join('\n');
+
+  let result;
+  try {
+    result = await Promise.resolve(evaluateFn(script));
+  } catch (err) {
+    // A bridge failure is treated as not_found rather than crashing the
+    // verifier; the AC will fail with a clear "occluded: not_found" detail
+    // which the agent can investigate. Symmetric with the awaitVisualReady
+    // bridge-throw path.
+    return { visible: false, reason: 'not_found' };
+  }
+  if (!result || typeof result !== 'object') {
+    return { visible: false, reason: 'not_found' };
+  }
+  // Trust-but-narrow: pass the bridge's response through unchanged so tests
+  // can stub any branch directly. Defensive normalisation only on missing
+  // visible flag.
+  if (result.visible === true) return { visible: true };
+  return result;
+}
+
 // Orchestration entry point for the `forge-visual-verifier` agent. Pure
 // (no network, no Playwright invocation) so it can be unit-tested
 // deterministically. The agent is responsible for the actual
@@ -2113,6 +2320,17 @@ function writeVisualProgress(forgeDir, taskId, visualAcResults) {
 //                     production. Unit tests pass a stub.
 //   visionCompare     async (screenshotPng, baselinePng, checks) => { status, detail }.
 //                     Only used when baselines exist and we're in compare-mode.
+//   evaluateBridge    async (scriptStr) => any. Caller-supplied bridge to
+//                     Playwright MCP's `browser_evaluate`. When provided
+//                     and `takeScreenshot` is also provided, the verifier
+//                     calls awaitVisualReady(evaluateBridge) before each
+//                     screenshot. On readiness timeout the AC is reported
+//                     `blocked` with detail `readiness_timeout: <stage>`
+//                     and the loop continues to the next AC. Optional --
+//                     when omitted the verifier behaves as before
+//                     (the agent is expected to have already settled the
+//                     page by other means).
+//   readinessTimeoutMs  override the 3000-ms default for awaitVisualReady.
 //
 // Return shape:
 //   {
@@ -2211,6 +2429,52 @@ async function runVisualVerifier(forgeDir, opts) {
       result.checks = ac.checks;
       results.push(result);
       continue;
+    }
+
+    // Wave 4 R002: deterministic readiness recipe runs before every
+    // screenshot when the caller wires an evaluate bridge. A timeout
+    // here marks the AC blocked and continues -- the rest of the run
+    // is not poisoned.
+    if (typeof opts.evaluateBridge === 'function') {
+      try {
+        await awaitVisualReady(opts.evaluateBridge, opts.readinessTimeoutMs);
+      } catch (err) {
+        const stage = (err && err.stage) || 'unknown';
+        result.status = 'blocked';
+        result.detail = 'readiness_timeout: ' + stage;
+        results.push(result);
+        continue;
+      }
+    }
+
+    // Wave 4 R003: opt-in occlusion probe. Only runs when the AC declared
+    // `occluded_check=true` AND a `selector=`, AND the caller wired an
+    // evaluate bridge. On a non-visible result the AC fails with a detail
+    // string starting `occluded:`; on visible the call is silent and the
+    // normal screenshot/compare flow continues. Other ACs are unaffected.
+    if (
+      ac.occludedCheck === true &&
+      typeof ac.selector === 'string' && ac.selector.length > 0 &&
+      typeof opts.evaluateBridge === 'function'
+    ) {
+      let probe;
+      try {
+        probe = await verifyVisible(opts.evaluateBridge, ac.selector);
+      } catch (err) {
+        // verifyVisible's own contract is non-throwing; if a future change
+        // ever raises, treat it as occluded with the error string so the
+        // run continues.
+        probe = { visible: false, reason: 'probe_error: ' + (err && err.message || String(err)) };
+      }
+      if (!probe || probe.visible !== true) {
+        const detail = probe && probe.reason
+          ? 'occluded: ' + probe.reason
+          : 'occluded: ' + ((probe && probe.occludedBy) || 'unknown');
+        result.status = 'fail';
+        result.detail = detail;
+        results.push(result);
+        continue;
+      }
     }
 
     let shot;
@@ -8030,6 +8294,10 @@ module.exports = {
   // T020 / R007: visual verifier plumbing.
   parseVisualAcs, checkVisualCapabilities, baselinePath,
   writeVisualProgress, runVisualVerifier,
+  // Wave 4 R002: deterministic browser readiness recipe.
+  awaitVisualReady,
+  // Wave 4 R003: opt-in occlusion probe via elementFromPoint.
+  verifyVisible,
   detectFileConflicts, serializeConflictingTasks, logConflictEvent, planTierExecution, detectParallelConflicts,
   writeParallelConstraints, readParallelConstraints, isBlockedByParallelConstraint,
   readLedger, writeLedgerAtomic, resolveTaskBudget,
