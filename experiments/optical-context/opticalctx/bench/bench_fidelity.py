@@ -17,8 +17,8 @@ import os
 import tempfile
 import time
 
-from ..ocr import certify
-from ..renderer import RenderConfig, render_batch
+from ..ocr import certify, wrap_truth
+from ..renderer import RenderConfig, page_geometry, render_batch
 
 KIND_FILES = {
     "prose": "war-and-peace.txt",
@@ -47,7 +47,8 @@ def run(corpus_dir: str, out_dir: str) -> list[dict]:
                 pages = render_batch([(f"bench-{kind}", text)], td, cfg, kind=kind)
                 render_s = time.monotonic() - t0
                 p = pages[0]   # first (full) page only
-                truth = p.rendered_text
+                cols, _rows = page_geometry(cfg)
+                truth = wrap_truth(p.rendered_text, cols)
                 t0 = time.monotonic()
                 cert = certify(p.png_path, truth, gate=0.001)
                 ocr_s = time.monotonic() - t0

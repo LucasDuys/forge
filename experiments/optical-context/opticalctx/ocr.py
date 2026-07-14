@@ -39,6 +39,16 @@ def cer(ocr_text: str, truth: str) -> float:
     return 1.0 - _lev_ratio(_normalize(ocr_text), _normalize(truth))
 
 
+def wrap_truth(rendered_text: str, cols: int) -> str:
+    """Ground truth as the page actually draws it: the packed stream hard-
+    wrapped every `cols` chars. Certifying against the UNWRAPPED stream
+    inflates CER — OCR emits a line break (-> space after normalization) at
+    every mid-word wrap, costing ~1 phantom edit per row (~0.6% CER on a
+    full 1092px page), the same magnitude as the certification gate."""
+    return "\n".join(rendered_text[i:i + cols]
+                     for i in range(0, len(rendered_text), cols))
+
+
 def _run_tesseract(png_path: str) -> str:
     import pytesseract
     from PIL import Image

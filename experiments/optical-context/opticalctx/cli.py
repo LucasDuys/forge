@@ -15,8 +15,8 @@ from pathlib import Path
 
 from .constants import text_tokens_est
 from .index import BM25Index
-from .ocr import certify, update_manifest_cert
-from .renderer import RenderConfig, render_batch
+from .ocr import certify, update_manifest_cert, wrap_truth
+from .renderer import RenderConfig, page_geometry, render_batch
 from .sectionizer import extract_meta, split
 from .store import CanonicalStore
 from .transforms import terse
@@ -121,11 +121,12 @@ def cmd_flush(args) -> int:
         if not unpaged:
             continue
         sections = [(m["id"], store.get(m["id"])) for m in unpaged]
+        cols, _rows = page_geometry(cfg)
         for page in render_batch(sections, pages_dir, cfg, kind=kind):
             secs = page.sections
-            truth = (page.rendered_text[secs[0]["char_start"]:
-                                        secs[-1]["char_end"]]
-                     if secs else page.rendered_text)
+            # truth = what the page draws: full stream slice (separators
+            # included), hard-wrapped at cols (see ocr.wrap_truth)
+            truth = wrap_truth(page.rendered_text, cols)
             status = "uncertified"
             try:
                 cert = certify(page.png_path, truth, gate)

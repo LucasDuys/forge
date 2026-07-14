@@ -21,8 +21,8 @@ import statistics
 import time
 
 from ..index import BM25Index
-from ..ocr import certify
-from ..renderer import RenderConfig, render_batch
+from ..ocr import certify, wrap_truth
+from ..renderer import RenderConfig, page_geometry, render_batch
 from ..sectionizer import extract_meta, split
 from ..store import CanonicalStore
 from ..window import build_window
@@ -105,11 +105,12 @@ def run(corpus_dir, root, out_dir, cert_sample=6, gate=0.005, font_px=11):
     by_kind = {}
     for kind, p in all_pages:
         by_kind.setdefault(kind, []).append(p)
+    cols, _rows = page_geometry(RenderConfig(font_px=font_px))
     for kind, pages in by_kind.items():
         sample = rng.sample(pages, min(cert_sample, len(pages)))
         cers = []
         for p in sample:
-            cert = certify(p.png_path, p.rendered_text, gate=gate)
+            cert = certify(p.png_path, wrap_truth(p.rendered_text, cols), gate=gate)
             _stamp(p.manifest_path, cert.best_cer, cert.best_cer <= gate,
                    gate, extrapolated=False)
             cers.append(cert.best_cer)
