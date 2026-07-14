@@ -6,3 +6,4 @@ __pycache__/
 
 bench.log
 bench-results*/store/
+bench-b.log
