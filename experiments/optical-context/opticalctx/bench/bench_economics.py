@@ -76,18 +76,25 @@ def run(out_dir):
     rows = []
     for model in MODELS:
         base = session_cost(model, profile, effective_ratio=1.0)
-        ratio = scale["window"].get(model, {}).get("effective_ratio", 1.0)
-        opt = session_cost(model, profile, effective_ratio=max(ratio, 1.0))
         nocache = session_cost(model, SessionProfile(cache_enabled=False),
                                effective_ratio=1.0)
+        w = scale["window"].get(model)
+        if w is None:   # model was not simulated by bench_scale — say so
+            rows.append((model, f"${nocache['total_usd']}",
+                         f"${base['total_usd']}", "n/a", "not simulated", "n/a"))
+            continue
+        ratio = max(w.get("effective_ratio", 1.0), 1.0)
+        opt = session_cost(model, profile, effective_ratio=ratio)
         rows.append((model, f"${nocache['total_usd']}", f"${base['total_usd']}",
-                     f"${opt['total_usd']}", f"{max(ratio,1.0)}x",
+                     f"${opt['total_usd']}", f"{ratio}x",
                      f"{(1 - opt['total_usd']/base['total_usd'])*100:.0f}%"))
     md.append(table(rows, ["model", "text, no cache", "text + cache",
                            "optical + cache", "ratio used",
                            "saving vs text+cache"]))
-    md.append("\nNote: on standard-tier models the ratio collapses to <=1 "
-              "(silent downscale) — optical pages are high-res-tier only.\n")
+    md.append("\nNote: 1092x1092 pages survive every model tier undistorted "
+              "(1,521 visual tokens). Standard-tier models simply price the "
+              "same tokens differently; larger 1568px pages would be silently "
+              "downscaled there.\n")
 
     # certification verdict
     md.append("## Certification verdict\n")

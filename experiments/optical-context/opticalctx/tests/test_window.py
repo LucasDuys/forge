@@ -174,8 +174,12 @@ class BuildWindowTest(WindowFixture):
         for b in plan.blocks:
             exp_real += b.tokens
             if b.type == "page_image":
-                exp_equiv += text_tokens_est(self.good_page_chars, "prose")
-                exp_chars += self.good_page_chars
+                # text-equivalent counts CANONICAL section chars (per
+                # section, prorated by on-page portion) — NOT the manifest
+                # stream chars, which include NL_MARK/separator overhead
+                exp_equiv += (text_tokens_est(len(self.paged1_text), "prose")
+                              + text_tokens_est(len(self.paged2_text), "prose"))
+                exp_chars += len(self.paged1_text) + len(self.paged2_text)
             else:
                 exp_equiv += b.tokens
                 exp_chars += len(b.content)

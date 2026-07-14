@@ -52,12 +52,14 @@ def _load_font(cfg: RenderConfig) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(cfg.font_path, cfg.font_px * cfg.supersample)
 
 
-def _measure(font: ImageFont.FreeTypeFont) -> tuple[int, int]:
-    """(char_width, line_height) for a monospace font — same math as
-    ../render.py so PIL pixel metrics match the prototype exactly."""
-    bbox = font.getbbox("M")
+def _measure(font: ImageFont.FreeTypeFont) -> tuple[float, int]:
+    """(char_advance, line_height) for a monospace font. Char width MUST be
+    the advance width (getlength), not the glyph ink width (getbbox): ink
+    width under-measures by ~2%, which overfills lines past the right
+    margin and clips ~1 char per row — an artificial ~0.6% CER."""
+    advance = font.getlength("M")
     ascent, descent = font.getmetrics()
-    return bbox[2] - bbox[0], ascent + descent
+    return advance, ascent + descent
 
 
 def page_geometry(cfg: RenderConfig) -> tuple[int, int]:
@@ -66,12 +68,12 @@ def page_geometry(cfg: RenderConfig) -> tuple[int, int]:
     font = _load_font(cfg)
     cw, lh = _measure(font)
     lh += cfg.line_spacing * ss
-    cols = (cfg.page_w * ss - 2 * cfg.margin * ss) // cw
-    rows = (cfg.page_h * ss - 2 * cfg.margin * ss) // lh
+    cols = int((cfg.page_w * ss - 2 * cfg.margin * ss) // cw)
+    rows = int((cfg.page_h * ss - 2 * cfg.margin * ss) // lh)
     if cols < 10 or rows < 3:
         raise ValueError(
             f"font_px={cfg.font_px} too large for page {cfg.page_w}x{cfg.page_h}")
-    return int(cols), int(rows)
+    return cols, rows
 
 
 def _section_separator(section_id: str) -> str:

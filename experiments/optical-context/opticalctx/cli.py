@@ -13,7 +13,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from .constants import text_tokens_est
+from .constants import MODELS, text_tokens_est
 from .index import BM25Index
 from .ocr import certify, update_manifest_cert, wrap_truth
 from .renderer import RenderConfig, page_geometry, render_batch
@@ -285,7 +285,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("window", help="assemble a window plan for a budget")
     add_root(p)
     p.add_argument("--budget", type=int, required=True)
-    p.add_argument("--model", required=True)
+    p.add_argument("--model", required=True, choices=sorted(MODELS))
     p.add_argument("--query", default=None)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_window)

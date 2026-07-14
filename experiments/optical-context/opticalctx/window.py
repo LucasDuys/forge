@@ -120,11 +120,48 @@ def build_window(store, index, *, token_budget: int, model: str,
 
     # ---- (3) certified pages (label + image pairs) ---------------------
     manifests = _load_manifests(pages_dir)
-    certified_page_ids = {m["page_id"] for m in manifests
-                          if (m.get("cert") or {}).get("passed")}
-    image_n = 0
+    # A section may span pages, and its store record only keeps the LAST
+    # page_id — so page membership comes from the manifests' section lists,
+    # never from meta["page_id"] (review finding: last-wins overwrite let a
+    # certified tail page suppress the text fallback for content that
+    # actually lived on an uncertified earlier page).
+    sec_pages: dict[str, list[tuple[str, int]]] = {}
     for man in manifests:
-        if man["page_id"] not in certified_page_ids:
+        for sec in man.get("sections", []):
+            span = max(0, sec.get("char_end", 0) - sec.get("char_start", 0))
+            sec_pages.setdefault(sec["id"], []).append((man["page_id"], span))
+
+    # order pages by first appearance of their sections in the store
+    # (append order, per SCALE.md §5 cache-churn rule); page_id ties.
+    def _page_order(man):
+        positions = [jsonl_pos[s["id"]] for s in man.get("sections", [])
+                     if s["id"] in jsonl_pos]
+        return (min(positions) if positions else len(jsonl_pos),
+                man["page_id"])
+
+    def _page_equiv(man) -> tuple[int, int]:
+        """(text-equivalent tokens, canonical chars) for a page: canonical
+        section chars prorated by the portion rendered on this page —
+        NL_MARK/separator overhead must not inflate the ratio."""
+        equiv_tokens = equiv_chars = 0
+        kind = man.get("kind", "prose")
+        for sec in man.get("sections", []):
+            on_page = max(0, sec.get("char_end", 0) - sec.get("char_start", 0))
+            total = sum(n for _, n in sec_pages.get(sec["id"], [])) or on_page
+            try:
+                canonical = store.meta(sec["id"]).get("chars", on_page)
+            except KeyError:
+                canonical = on_page
+            frac = on_page / total if total else 0.0
+            chars = round(canonical * frac)
+            equiv_chars += chars
+            equiv_tokens += text_tokens_est(chars, kind)
+        return equiv_tokens, equiv_chars
+
+    carried_page_ids: set[str] = set()
+    image_n = 0
+    for man in sorted(manifests, key=_page_order):
+        if not (man.get("cert") or {}).get("passed"):
             continue
         png_path = pages_dir / f"{man['page_id']}.png"
         if not png_path.exists():
@@ -141,22 +178,26 @@ def build_window(store, index, *, token_budget: int, model: str,
         label_tokens = text_tokens_est(len(label), "prose")
         if label_tokens + img_tokens > remaining:
             continue  # pair does not fit; keep pair atomic
-        page_chars = man.get("chars", 0)
-        page_equiv = text_tokens_est(page_chars, man.get("kind", "prose"))
+        page_equiv, page_chars = _page_equiv(man)
         try_add(WindowBlock("page_label", label, label_tokens),
                 label_tokens, len(label))
         try_add(WindowBlock("page_image", str(png_path), img_tokens),
                 page_equiv, page_chars)
+        carried_page_ids.add(man["page_id"])
         image_n += 1
         stats.n_pages += 1
 
-    # ---- (4) uncertified/unpaged sections as text ----------------------
+    # ---- (4) text fallback ----------------------------------------------
+    # Carry canonical text for every section not already in the window:
+    # unpaged, on an uncertified page, on a page dropped for budget, or on
+    # a page whose PNG is missing. Only sections whose EVERY page was
+    # actually carried as an image are skipped.
     for m in metas:
         if m["id"] in carried_ids:
             continue
-        page_id = m.get("page_id")
-        if page_id is not None and page_id in certified_page_ids:
-            continue  # lives on a certified page; the image is its carrier
+        pages_of = sec_pages.get(m["id"])
+        if pages_of and all(pid in carried_page_ids for pid, _ in pages_of):
+            continue  # fully carried as image(s)
         try:
             text = store.get(m["id"])
         except KeyError:

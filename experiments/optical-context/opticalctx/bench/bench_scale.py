@@ -112,7 +112,9 @@ def run(corpus_dir, root, out_dir, cert_sample=6, gate=0.005, font_px=11):
         for p in sample:
             cert = certify(p.png_path, wrap_truth(p.rendered_text, cols), gate=gate)
             _stamp(p.manifest_path, cert.best_cer, cert.best_cer <= gate,
-                   gate, extrapolated=False)
+                   gate, extrapolated=False,
+                   tesseract_cer=cert.tesseract_cer,
+                   rapidocr_cer=cert.rapidocr_cer)
             cers.append(cert.best_cer)
             n_certified += 1
         kind_cer = statistics.median(cers)
@@ -144,7 +146,8 @@ def run(corpus_dir, root, out_dir, cert_sample=6, gate=0.005, font_px=11):
 
     # -- window assembly ------------------------------------------------------
     windows = {}
-    for model, budget in [("sonnet-5", 180_000), ("haiku-4.5", 180_000)]:
+    for model, budget in [("sonnet-5", 180_000), ("opus-4.8", 180_000),
+                          ("haiku-4.5", 180_000)]:
         t0 = time.monotonic()
         plan = build_window(store, index, token_budget=budget, model=model,
                             pages_dir=pages_dir)
@@ -172,9 +175,11 @@ def run(corpus_dir, root, out_dir, cert_sample=6, gate=0.005, font_px=11):
     return report
 
 
-def _stamp(manifest_path, cer_value, passed, gate, extrapolated):
+def _stamp(manifest_path, cer_value, passed, gate, extrapolated,
+           tesseract_cer=None, rapidocr_cer=None):
     m = json.load(open(manifest_path))
-    m["cert"] = {"best_cer": round(cer_value, 5), "passed": passed,
+    m["cert"] = {"tesseract_cer": tesseract_cer, "rapidocr_cer": rapidocr_cer,
+                 "best_cer": round(cer_value, 5), "passed": passed,
                  "gate": gate, "extrapolated": extrapolated}
     json.dump(m, open(manifest_path, "w"), indent=1)
 

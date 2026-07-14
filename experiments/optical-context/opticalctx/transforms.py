@@ -90,6 +90,7 @@ def pack(text: str) -> str:
     Reversible via unpack() for text without trailing whitespace and
     without literal NL_MARK occurrences.
     """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+\n", "\n", text)
     return text.replace("\n", NL_MARK)
 

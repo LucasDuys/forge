@@ -50,9 +50,9 @@ def downscaled_dims(w: int, h: int, tier: str) -> tuple[int, int]:
     long_edge = max(w, h)
     if long_edge > max_edge:
         scale = max_edge / long_edge
-    while image_tokens(int(w * scale), int(h * scale)) > max_tokens:
+    while image_tokens(max(1, int(w * scale)), max(1, int(h * scale))) > max_tokens:
         scale *= 0.99
-    return int(w * scale), int(h * scale)
+    return max(1, int(w * scale)), max(1, int(h * scale))
 
 
 def text_tokens_est(chars: int, kind: str = "prose") -> int:
