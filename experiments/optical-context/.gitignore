@@ -1,0 +1,5 @@
+e2e-out/
+sweep-out/
+pages/
+__pycache__/
+*.pyc
