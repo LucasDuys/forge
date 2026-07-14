@@ -15,7 +15,7 @@ plan is **text-first with an optical tier**, not optical-first.
 | Deterministic token-efficient translation? | Yes, but not gzip (tokenizers shred binary) and not stopword-stripping (costs 12–20% accuracy). Winners: TOON/compact-JSON serialization (40–60% on tabular), TSCG-style schema compilation (50–72%, zero-dep JS, *improves* accuracy), n-gram abbreviation with legend (~1.4x) |
 | Pages → sections with metadata for search? | Converged industry pattern: tiny always-hot text index + lazy hydration by ID (Anthropic memory tool: 84% savings; claude-mem: ~10x from filter-before-fetch). **Index must stay text — never pixels** |
 | Model for interpretation? | Only high-res-tier Claude models (Fable/Mythos 5, Opus 4.7/4.8, Sonnet 5) see full-res pages. Haiku silently downscales to illegibility. Dollar math: text-on-Haiku can beat image-on-Sonnet |
-| Colibri? | No such repo found in this space. Almost certainly **ColPali** (arXiv 2407.01449): retrieval over page *images* via VLM multi-vector embeddings + ColBERT-style late interaction. High relevance for retrieval, zero for compression. Optional Phase-4 overlay. If you meant a different repo, send the link and I'll re-research |
+| Colibri? | Identified: [JustVugg/colibri](https://github.com/JustVugg/colibri) — pure-C engine running GLM-5.2 (744B MoE) in ~25GB RAM via disk-streamed experts, ~0.3–1.2 tok/s warm. Too slow for the interactive read path; viable as a $0 offline "librarian" for metadata generation, and its memory-hierarchy design is the blueprint for ours. Full assessment: `SCALE.md` §4 |
 
 Killer constraints discovered (each can erase the saving):
 1. **Quote-back**: output tokens ≈ 5x input price; an agent echoing exact

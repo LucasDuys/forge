@@ -144,3 +144,14 @@ No system named "Colibri" appears in the optical-compression or agent-memory lit
 ## 9. Recommended Architecture
 
 Build the memory backend **text-first with an optional optical tier, not optical-first**: keep a hot, always-text index (SQLite FTS5/BM25 over section metadata — titles, symbols, paths, 1–2-line summaries, page IDs) plus agent-driven hydration tools, apply deterministic transforms (TOON/compact-JSON serialization, TSCG-style schema compilation, n-gram abbreviation) to everything structured for a fidelity-free 20–70% cut, and store fidelity-critical cold content (code, diffs, identifiers) as plain text files hydrated by path exactly as Claude Code microcompact does; reserve rendered-image pages (PNG, grayscale AA, 10–12px monospace, >20px line pitch, ≤1568×1568, immutable append-only blocks with cache_control, high-res-tier models only, ≤3× effective compression) for genuinely cold, approximate-tolerance prose — old transcripts, logs, reference docs — where a misread word is recoverable by re-hydrating the canonical text file that must always exist as ground truth behind every image; gate the optical path behind a config flag and an empirical CER benchmark at your exact rendering parameters before enabling it by default, because the verified economics say the 2.4–3× saving is real but only inside a narrow regime that agentic coding workloads exit constantly.
+---
+
+## Correction (2026-07-14, post-brief)
+
+Section 7's ColPali identification was wrong. The user meant
+**[JustVugg/colibri](https://github.com/JustVugg/colibri)**: a ~2,400-line
+pure-C inference engine running GLM-5.2 (744B MoE) in ~25GB RAM by
+streaming routed experts from NVMe (dense ~17B core resident at int4
+~9.9GB; 21,504 experts on ~370GB disk; MLA compressed KV 576 floats/token;
+MTP speculative decoding 2.2–2.8 tok/forward; measured ~0.05–1.2 tok/s).
+Corrected assessment and at-scale architecture: see `SCALE.md`.
