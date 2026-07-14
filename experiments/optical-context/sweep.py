@@ -4,7 +4,8 @@
 For each font size, renders the corpus, OCRs it back, and reports:
   - chars per page and pages needed
   - estimated text tokens (chars/4 for prose, chars/3.5 for code)
-  - Claude image tokens per page ((w*h)/750, page kept under 1.15 MP)
+  - Claude image tokens per page (patch formula ceil(w/28)*ceil(h/28);
+    default 1092x1092 page = 1521 tokens, safe on every model tier)
   - compression ratio (text tokens / image tokens)
   - tesseract char accuracy
 
@@ -21,7 +22,7 @@ from ocr_check import check_pages
 from render import render_pages
 
 
-def sweep(text, work_dir, sizes, page_w=1072, page_h=1072, kind="prose",
+def sweep(text, work_dir, sizes, page_w=1092, page_h=1092, kind="prose",
           pack=True, ascii_safe=True):
     chars_per_token = 3.5 if kind == "code" else 4.0
     rows = []

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Render text into OCR-readable PNG 'pages' for optical context compression.
 
-Pages default to 1072x1072 px. This is deliberate: the Claude API downscales
-any image over ~1.15 megapixels (and over 1568px on the long edge), so a page
-rendered larger than that arrives at the model smaller than you drew it and
-readability silently degrades. 1072x1072 = 1.149 MP = the largest square page
-that reaches the model at full resolution, costing (1072*1072)/750 ~= 1533
-image tokens.
+Claude image token cost (verified against live docs 2026-07-14) is
+patch-based: ceil(w/28) * ceil(h/28), one token per 28x28px patch.
+  - standard-tier models (e.g. Haiku 4.5): hard cap 1568 visual tokens and
+    1568px long edge -> largest useful square page is 1092x1092 (=39^2=1521
+    tokens). Anything bigger is SILENTLY downscaled and your text shrinks.
+  - high-res-tier models (Fable/Mythos 5, Opus 4.7/4.8, Sonnet 5): cap
+    4784 tokens / 2576px -> a 1568x1568 page costs 56^2 = 3136 tokens.
+Pages default to 1092x1092 so they survive every tier undistorted; pass
+--page-w/--page-h 1568 when targeting high-res-tier models only.
 
 Text is rendered at SUPERSAMPLE x the target size and downscaled with Lanczos,
 which gives cleaner glyph edges than direct small-size rendering.
@@ -59,6 +62,11 @@ def asciify(text):
     return text.encode("ascii", "replace").decode()
 
 
+def claude_image_tokens(w, h):
+    """Patch-based formula: 1 token per 28x28px patch (current Claude API)."""
+    return -(-w // 28) * -(-h // 28)
+
+
 def load_font(path, px):
     return ImageFont.truetype(path, px)
 
@@ -86,7 +94,7 @@ def wrap_text(text, cols):
 
 
 def render_pages(text, out_dir, font_path=DEFAULT_FONT, font_px=11,
-                 page_w=1072, page_h=1072, margin=12, line_spacing=2,
+                 page_w=1092, page_h=1092, margin=12, line_spacing=2,
                  pack=False, ascii_safe=False):
     if ascii_safe:
         text = asciify(text)
@@ -140,7 +148,7 @@ def render_pages(text, out_dir, font_path=DEFAULT_FONT, font_px=11,
         "cols": int(cols), "rows_per_page": int(rows),
         "chars_capacity_per_page": int(cols * rows),
         "source_chars": len(text),
-        "claude_image_tokens_per_page": round(page_w * page_h / 750),
+        "claude_image_tokens_per_page": claude_image_tokens(page_w, page_h),
         "pages": pages,
     }
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
@@ -154,8 +162,8 @@ def main():
     ap.add_argument("-o", "--out", default="pages", help="output directory")
     ap.add_argument("--font-px", type=int, default=11)
     ap.add_argument("--font", default=DEFAULT_FONT)
-    ap.add_argument("--page-w", type=int, default=1072)
-    ap.add_argument("--page-h", type=int, default=1072)
+    ap.add_argument("--page-w", type=int, default=1092)
+    ap.add_argument("--page-h", type=int, default=1092)
     ap.add_argument("--pack", action="store_true",
                     help="reflow newlines to fill every row (reversible)")
     ap.add_argument("--ascii", action="store_true",

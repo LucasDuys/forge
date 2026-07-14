@@ -34,16 +34,24 @@ ANTHROPIC_API_KEY=... ./run_e2e.sh   # adds the real Claude round trip
 
 ## The three numbers that matter
 
-1. **Page cost is fixed**: a 1072×1072 page = `(w*h)/750` ≈ **1533 Claude
-   image tokens**, full or empty. Anything above ~1.15 MP gets downscaled
-   by the API before the model sees it, so bigger pages don't help.
+1. **Page cost is fixed**: Claude charges `ceil(w/28) × ceil(h/28)` tokens
+   per image (one per 28×28px patch), full or empty. Default 1092×1092
+   page = **1,521 tokens** — the largest square that survives every model
+   tier. Standard-tier models (Haiku) silently downscale anything bigger;
+   high-res-tier models (Fable/Mythos 5, Opus 4.7/4.8, Sonnet 5) accept
+   1568×1568 = 3,136 tokens if you can guarantee the tier.
 2. **Break-even density**: a page must carry > ~6,100 chars of prose
-   (1533 tokens × ~4 chars/token) to beat raw text. Packed 11px mono fits
-   ~11,100 chars/page → **~1.8x compression ceiling** with this renderer.
+   (1521 tokens × ~4 chars/token) to beat raw text. Packed 11px mono fits
+   ~11,600 chars/page → **~1.9x compression ceiling** here, ~2.4–3.0x on
+   high-res-tier pages.
 3. **Fidelity is the gate**: tesseract reads packed prose at 12px at
    ~99.8%, but punctuation-dense technical text plateaus ~94%. The VLM
    round trip (`claude_roundtrip.py`) is the number that actually decides
-   viability — run it before believing anything.
+   viability — run it before believing anything. Research warning: VLM
+   reading collapses when line pitch gets tight, and there is no published
+   accuracy floor for Claude on dense rendered text.
+
+Full research brief with sources: `RESEARCH.md`. Project plan: `PLAN.md`.
 
 ## Key findings so far (2026-07, this container)
 

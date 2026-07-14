@@ -1,9 +1,15 @@
 # Optical Context — measured results (2026-07-14, Linux container)
 
 All numbers produced by this harness (`./run_e2e.sh`), tesseract 5.3.4,
-DejaVu Sans Mono, pages 1072×1072 px (largest square page the Claude API
-accepts without downscaling; ≈1533 image tokens each), 4x supersampled
-Lanczos rendering.
+DejaVu Sans Mono, pages 1092×1092 px, 4x supersampled Lanczos rendering.
+
+Token formula (verified against live Anthropic docs via the research pass):
+`ceil(w/28) × ceil(h/28)` — one token per 28×28px patch. A 1092×1092 page
+= 39² = **1,521 image tokens** and survives every model tier undistorted.
+Standard-tier models (Haiku 4.5) cap at 1,568 visual tokens and silently
+downscale anything bigger; high-res-tier models (Fable/Mythos 5, Opus
+4.7/4.8, Sonnet 5) accept up to 1568×1568 = 3,136 tokens per page, which
+raises the ceiling by ~2x page area if you can guarantee the tier.
 
 ## 1. The economics only work if you pack
 
@@ -13,8 +19,8 @@ Corpus: forge CLAUDE.md + state-machine.md (21.7k chars of markdown).
 |---|---|
 | naive (line-per-row) @ 10px | **0.59x — loses** |
 | naive @ 14px | 0.44x — loses badly |
-| packed reflow @ 10px | **1.77x — wins** |
-| packed @ 12px | 1.18x |
+| packed reflow @ 10px | **1.78x — wins** |
+| packed @ 12px | 1.19x |
 
 Markdown's short lines waste ~70% of every row. `--pack` reflows the text
 into a full-width stream with reversible ` @@ ` newline markers and flips
@@ -41,12 +47,14 @@ cold context must be batched until pages fill.
 
 ## 3. Compression ceiling with this renderer
 
-Packed 11px mono: 161 cols × 69 rows = 11,109 chars/page.
+Packed 11px mono on a 1092×1092 page: 164 cols × 71 rows = 11,644 chars.
 
-- Prose (~4 chars/token): 11,109/4 ≈ 2,777 text tokens vs 1,533 image
-  tokens → **1.81x**
-- Code (~3.5 chars/token): ≈ 3,174 vs 1,533 → **2.07x**
-- 10px (12,876 chars/page) pushes prose to 2.1x if fidelity holds.
+- Prose (~4 chars/token): 11,644/4 ≈ 2,911 text tokens vs 1,521 image
+  tokens → **1.91x**
+- Code (~3.5 chars/token): ≈ 3,327 vs 1,521 → **2.19x**
+- 10px (13,528 chars/page) pushes prose to 2.2x if fidelity holds.
+- High-res-tier only (1568×1568 = 3,136 tok): same density scales to
+  ~2.4–3.0x, matching the research brief's independent arithmetic.
 
 Adding the terse transform (`translate.py --mode terse`, 16.4% chars saved
 on forge docs, deterministic) stacks multiplicatively: ~1.8x × 1.16 ≈ 2.1x
