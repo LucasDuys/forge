@@ -4,3 +4,4 @@ pages/
 __pycache__/
 *.pyc
 bench-results/store/
+bench.log
