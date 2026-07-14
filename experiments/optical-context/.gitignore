@@ -3,3 +3,4 @@ sweep-out/
 pages/
 __pycache__/
 *.pyc
+bench-results/store/
